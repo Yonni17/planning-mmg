@@ -1,3 +1,4 @@
+// app/admin/slots/page.tsx
 'use client';
 
 import { useState } from 'react';
@@ -7,8 +8,8 @@ type Payload = {
   startDate: string;   // YYYY-MM-DD
   endDate: string;     // YYYY-MM-DD
   openAt: string;      // YYYY-MM-DDTHH:mm
-  closeAt: string;     // YYYY-MM-DDTHH:mm
-  generateAt: string;  // YYYY-MM-DDTHH:mm
+  closeAt?: string;    // optionnel
+  generateAt?: string; // optionnel
   timezone?: string;   // ex: Europe/Paris
   holidays?: string[]; // YYYY-MM-DD (un par ligne côté UI)
   autoHolidays?: boolean;
@@ -83,7 +84,7 @@ export default function AdminSlotsPage() {
           </label>
 
           <label className="block">
-            <span className="text-sm text-gray-600">Fuseau horaire</span>
+            <span className="text-sm text-gray-600">Fuseau horaire (info)</span>
             <input
               name="timezone"
               value={payload.timezone}
@@ -130,26 +131,24 @@ export default function AdminSlotsPage() {
           </label>
 
           <label className="block">
-            <span className="text-sm text-gray-600">Clôture saisie</span>
+            <span className="text-sm text-gray-600">Clôture saisie (info)</span>
             <input
               type="datetime-local"
               name="closeAt"
               value={payload.closeAt}
               onChange={onChange}
               className="border rounded p-2 w-full"
-              required
             />
           </label>
 
           <label className="block sm:col-span-2">
-            <span className="text-sm text-gray-600">Date/heure de génération</span>
+            <span className="text-sm text-gray-600">Date/heure de génération (info)</span>
             <input
               type="datetime-local"
               name="generateAt"
               value={payload.generateAt}
               onChange={onChange}
               className="border rounded p-2 w-full"
-              required
             />
           </label>
         </div>
