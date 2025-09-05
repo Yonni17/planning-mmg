@@ -1,0 +1,16 @@
+name: ping vercel cron endpoint
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # tous les jours 06:00 UTC
+  workflow_dispatch: {}    # bouton "Run workflow" manuel
+
+jobs:
+  call:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call the endpoint
+        run: |
+          curl -fsS "https://planning-mmg-y716.vercel.app/api/admin/cron?key=$CRON_SECRET"
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
