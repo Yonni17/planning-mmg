@@ -105,11 +105,24 @@ export async function GET(req: NextRequest) {
       if (p0?.id) continue;
 
       // Créer la période
-      const { data: insP, error: pErr } = await supa
-        .from('periods')
-        .insert([{ label: cand.label, open_at: cand.start.toISOString() }])
-        .select('id')
-        .maybeSingle();
+      // close_at = dernier jour du trimestre à 23:59:59.999Z
+	const closeAt = new Date(Date.UTC(
+  		cand.end.getUTCFullYear(),
+  		cand.end.getUTCMonth(),
+  		cand.end.getUTCDate(),
+  		23, 59, 59, 999
+	)).toISOString();
+
+const { data: insP, error: pErr } = await supa
+  .from('periods')
+  .insert([{
+    label:   cand.label,
+    open_at: cand.start.toISOString(), // 1er jour du trimestre
+    close_at: closeAt                   // fin de trimestre
+  }])
+  .select('id')
+  .maybeSingle();
+
       if (pErr || !insP?.id) {
         return NextResponse.json({ error: pErr?.message || 'insert period failed' }, { status: 500 });
       }
