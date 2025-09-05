@@ -5,13 +5,13 @@ import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-// Si tu veux déclencher à la main : /api/admin/cron?key=TA_CLE
+// Pour déclencher à la main : /api/admin/cron?key=TA_CLE
 const CRON_SECRET = process.env.CRON_SECRET ?? '';
 
 // ------------------ utils dates (UTC) ------------------
 function startOfQuarter(d: Date) {
-  const m = d.getUTCMonth();            // 0..11
-  const q = Math.floor(m / 3);          // 0..3
+  const m = d.getUTCMonth(); // 0..11
+  const q = Math.floor(m / 3); // 0..3
   const m0 = q * 3;
   return new Date(Date.UTC(d.getUTCFullYear(), m0, 1, 0, 0, 0));
 }
@@ -29,7 +29,7 @@ function ymdUTC(d: Date) {
   return d.toISOString().slice(0, 10);
 }
 function dayOfWeekUTC(d: Date) {
-  return d.getUTCDay(); // 0=dim..6=sam
+  return d.getUTCDay(); // 0=dim,..6=sam
 }
 // -------------------------------------------------------
 
@@ -59,7 +59,7 @@ function isoUTC(ymd: string, hhmm: string) {
 }
 
 export async function GET(req: NextRequest) {
-  // Autorise :
+  // Autoriser :
   // - les jobs planifiés Vercel (header x-vercel-cron)
   // - OU l'appel manuel avec ?key=CRON_SECRET
   const hasVercelHeader = req.headers.get('x-vercel-cron') !== null;
@@ -80,12 +80,11 @@ export async function GET(req: NextRequest) {
       .maybeSingle();
     const val = (data as any)?.settings?.open_lead_days;
     if (Number.isFinite(val)) openLeadDays = Number(val);
-  } catch {
-    // ignore, on garde 45
-  }
+  } catch {}
 
   const now = new Date(); // UTC
-  // Candidats = trimestre courant + 3 suivants
+
+  // Trimestre courant + 3 suivants
   const candidates: { start: Date; end: Date; label: string }[] = [];
   const q0 = startOfQuarter(now);
   for (let i = 0; i < 4; i++) {
@@ -100,16 +99,12 @@ export async function GET(req: NextRequest) {
   for (const cand of candidates) {
     const openFrom = addDaysUTC(cand.start, -openLeadDays);
 
-    // Créer si : pas encore existant ET on est dans la fenêtre [J-45 ; J0[
+    // Crée si non existant ET on est dans la fenêtre [J-45 ; J0[
     if (now >= openFrom && now < cand.start) {
-      const { data: p0 } = await supa
-        .from('periods')
-        .select('id')
-        .eq('label', cand.label)
-        .maybeSingle();
+      const { data: p0 } = await supa.from('periods').select('id').eq('label', cand.label).maybeSingle();
       if (p0?.id) continue;
 
-      // Crée la période
+      // Créer la période
       const { data: insP, error: pErr } = await supa
         .from('periods')
         .insert([{ label: cand.label, open_at: cand.start.toISOString() }])
@@ -120,7 +115,7 @@ export async function GET(req: NextRequest) {
       }
       const period_id = String(insP.id);
 
-      // Génère les slots
+      // Générer les slots
       const rows: SlotInsert[] = [];
       for (let d = new Date(cand.start); d <= cand.end; d = addDaysUTC(d, 1)) {
         const ymd = ymdUTC(d);
