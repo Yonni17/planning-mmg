@@ -1,77 +1,127 @@
 // app/api/availability/validate-month/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
-import { createClient } from '@supabase/supabase-js';
+import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
 
+export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+/* -------------------- Auth helpers (Bearer / Cookies) -------------------- */
+function getAccessTokenFromReq(req: NextRequest): string | null {
+  // 1) Authorization: Bearer <jwt>
+  const auth = req.headers.get('authorization');
+  if (auth && auth.toLowerCase().startsWith('bearer ')) {
+    return auth.slice(7).trim();
+  }
 
-const supabaseAnon = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false } });
-const supabaseService = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
+  // 2) Cookie direct sb-access-token (supabase-js côté client)
+  const c = cookies();
+  const direct = c.get('sb-access-token')?.value;
+  if (direct) return direct;
 
-async function getAccessTokenFromCookies(): Promise<string | null> {
-  const store = await cookies();
-  const ref = new URL(SUPABASE_URL).host.split('.')[0];
-  const base = `sb-${ref}-auth-token`;
-  const c0 = store.get(`${base}.0`)?.value ?? '';
-  const c1 = store.get(`${base}.1`)?.value ?? '';
-  const c = store.get(base)?.value ?? '';
-  const raw = c0 || c1 ? `${c0}${c1}` : c;
-  if (!raw) return null;
-  let txt = raw;
-  try { txt = decodeURIComponent(raw); } catch {}
+  // 3) Cookie objet sb-<ref>-auth-token (Helpers) éventuellement splitté .0/.1
+  const supabaseUrl =
+    process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || '';
   try {
+    const ref = new URL(supabaseUrl).host.split('.')[0];
+    const base = `sb-${ref}-auth-token`;
+    const c0 = c.get(`${base}.0`)?.value ?? '';
+    const c1 = c.get(`${base}.1`)?.value ?? '';
+    const cj = c.get(base)?.value ?? '';
+    const raw = c0 || c1 ? `${c0}${c1}` : cj;
+    if (!raw) return null;
+
+    let txt = raw;
+    try { txt = decodeURIComponent(raw); } catch {}
     const parsed = JSON.parse(txt);
-    if (parsed?.access_token) return parsed.access_token as string;
-    if (parsed?.currentSession?.access_token) return parsed.currentSession.access_token as string;
-  } catch {}
+    if (parsed?.access_token) return String(parsed.access_token);
+    if (parsed?.currentSession?.access_token)
+      return String(parsed.currentSession.access_token);
+  } catch {
+    // ignore
+  }
   return null;
 }
 
+/* ------------------------------ Handler --------------------------------- */
 export async function POST(req: NextRequest) {
   try {
-    const { period_id, month, validated } = await req.json();
+    const supabase = getSupabaseAdmin();
+
+    const payload = await req.json().catch(() => ({}));
+    const period_id = String((payload as any)?.period_id ?? '').trim();
+    const month = String((payload as any)?.month ?? '').trim(); // YYYY-MM
+    const validated = (payload as any)?.validated;
+
     if (!period_id || !month || typeof validated !== 'boolean') {
-      return NextResponse.json({ error: 'period_id, month (YYYY-MM) et validated requis' }, { status: 400 });
+      return NextResponse.json(
+        { error: 'period_id, month (YYYY-MM) et validated requis' },
+        { status: 400 }
+      );
     }
 
-    // Auth (Bearer header OU cookies)
-    const authHeader = req.headers.get('authorization') || '';
-    let access_token: string | null = null;
-    if (authHeader.toLowerCase().startsWith('bearer ')) {
-      access_token = authHeader.slice(7).trim();
+    // Auth (Bearer ou cookies)
+    const token = getAccessTokenFromReq(req);
+    if (!token) {
+      return NextResponse.json({ error: 'Auth session missing!' }, { status: 401 });
     }
-    if (!access_token) access_token = await getAccessTokenFromCookies();
-    if (!access_token) return NextResponse.json({ error: 'Auth session missing!' }, { status: 401 });
 
-    const { data: userData, error: userErr } = await supabaseAnon.auth.getUser(access_token);
-    if (userErr) return NextResponse.json({ error: userErr.message }, { status: 401 });
-    const user = userData.user;
-    if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    const { data: userData, error: uErr } = await supabase.auth.getUser(token);
+    if (uErr || !userData?.user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    const uid = userData.user.id;
 
-    // upsert (user_id, period_id, month)
-    const payload = {
-      user_id: user.id,
+    // Si une ligne existe déjà et qu’elle est verrouillée ou opt-out => on interdit la modif
+    const { data: existing, error: exErr } = await supabase
+      .from('doctor_period_months')
+      .select('locked, opted_out')
+      .eq('user_id', uid)
+      .eq('period_id', period_id)
+      .eq('month', month)
+      .maybeSingle();
+
+    if (exErr) {
+      return NextResponse.json({ error: exErr.message }, { status: 500 });
+    }
+    if (existing?.locked) {
+      return NextResponse.json(
+        { error: 'Mois verrouillé. Déverrouillage requis par un admin.' },
+        { status: 409 }
+      );
+    }
+    if (existing?.opted_out) {
+      return NextResponse.json(
+        { error: 'Mois marqué comme “opt-out”. Contactez un admin pour réactiver.' },
+        { status: 409 }
+      );
+    }
+
+    // Upsert (clé composite (user_id, period_id, month))
+    const row = {
+      user_id: uid,
       period_id,
       month,
       validated_at: validated ? new Date().toISOString() : null,
-      opted_out: false,
+      // on ne touche pas à "locked" ni "opted_out" ici
     };
 
-    const { data, error } = await supabaseService
+    const { data, error } = await supabase
       .from('doctor_period_months')
-      .upsert(payload, { onConflict: 'user_id,period_id,month' })
+      .upsert(row, { onConflict: 'user_id,period_id,month' })
       .select()
       .maybeSingle();
 
-    if (error) throw error;
+    if (error) {
+      return NextResponse.json({ error: error.message }, { status: 500 });
+    }
 
-    return NextResponse.json(data ?? payload);
+    return NextResponse.json(data ?? row);
   } catch (e: any) {
-    console.error('[validate-month]', e);
-    return NextResponse.json({ error: e?.message ?? 'Server error' }, { status: 500 });
+    console.error('[availability/validate-month]', e);
+    return NextResponse.json(
+      { error: e?.message ?? 'Server error' },
+      { status: 500 }
+    );
   }
 }

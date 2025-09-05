@@ -1,302 +1,283 @@
 // app/api/doctor-months/route.ts
-import { NextRequest, NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { createClient } from "@supabase/supabase-js";
+import { NextRequest, NextResponse } from 'next/server';
+import { cookies } from 'next/headers';
+import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
 
-export const dynamic = "force-dynamic";
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+/* -------------------- Auth helpers (Bearer / Cookies) -------------------- */
+function getAccessTokenFromReq(req: NextRequest): string | null {
+  // 1) Authorization: Bearer <jwt>
+  const auth = req.headers.get('authorization');
+  if (auth && auth.toLowerCase().startsWith('bearer ')) {
+    return auth.slice(7).trim();
+  }
 
-const supabaseAnon = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-  auth: { persistSession: false },
-});
+  // 2) Cookie direct sb-access-token (supabase-js côté client)
+  const c = cookies();
+  const direct = c.get('sb-access-token')?.value;
+  if (direct) return direct;
 
-// ---- helpers ----
-async function getAccessTokenFromCookies(): Promise<string | null> {
-  const store = await cookies();
-  const ref = new URL(SUPABASE_URL).host.split(".")[0];
-  const base = `sb-${ref}-auth-token`;
-
-  const c0 = store.get(`${base}.0`)?.value ?? "";
-  const c1 = store.get(`${base}.1`)?.value ?? "";
-  const c = store.get(base)?.value ?? "";
-  const raw = c0 || c1 ? `${c0}${c1}` : c;
-  if (!raw) return null;
-
-  let txt = raw;
+  // 3) Cookie objet sb-<ref>-auth-token (Helpers) éventuellement splitté .0/.1
+  const supabaseUrl =
+    process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || '';
   try {
-    txt = decodeURIComponent(raw);
-  } catch {}
-  try {
+    const ref = new URL(supabaseUrl).host.split('.')[0];
+    const base = `sb-${ref}-auth-token`;
+    const c0 = c.get(`${base}.0`)?.value ?? '';
+    const c1 = c.get(`${base}.1`)?.value ?? '';
+    const cj = c.get(base)?.value ?? '';
+    const raw = c0 || c1 ? `${c0}${c1}` : cj;
+    if (!raw) return null;
+
+    let txt = raw;
+    try { txt = decodeURIComponent(raw); } catch {}
     const parsed = JSON.parse(txt);
-    if (parsed?.access_token) return parsed.access_token as string;
+    if (parsed?.access_token) return String(parsed.access_token);
     if (parsed?.currentSession?.access_token)
-      return parsed.currentSession.access_token as string;
-  } catch {}
+      return String(parsed.currentSession.access_token);
+  } catch {
+    // ignore
+  }
   return null;
 }
 
+/* ---------------------- Utils ---------------------- */
 function yyyymm(dateStr: string): string {
   // dateStr attendu: 'YYYY-MM-DD'
   return dateStr.slice(0, 7);
 }
-// -----------------
 
+type MonthState = {
+  month: string;                // 'YYYY-MM'
+  validated_at: string | null;  // ISO or null
+  locked: boolean;
+  opted_out: boolean;
+};
+
+function computeFlags(rows: MonthState[]) {
+  const total = rows.length;
+  const all_validated =
+    total > 0 && rows.every(r => !!r.validated_at || r.opted_out);
+  const opted_out =
+    total > 0 && rows.every(r => r.opted_out);
+  const locked = rows.some(r => r.locked);
+  return { all_validated, opted_out, locked };
+}
+
+/* ------------------------------ GET --------------------------------- */
 /**
  * GET /api/doctor-months?period_id=...
- * -> renvoie la liste des mois de la période + l'état de validation de l'utilisateur courant
- *    et les flags (all_validated, opted_out)
+ * -> Renvoie les mois présents dans la période + l'état de l'utilisateur courant
+ *    et des flags agrégés { all_validated, opted_out, locked }
  */
 export async function GET(req: NextRequest) {
   try {
-    const { searchParams } = new URL(req.url);
-    const period_id = searchParams.get("period_id") ?? "";
+    const supabase = getSupabaseAdmin();
 
+    const { searchParams } = new URL(req.url);
+    const period_id = String(searchParams.get('period_id') ?? '').trim();
     if (!period_id) {
-      return NextResponse.json(
-        { error: "period_id requis" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'period_id requis' }, { status: 400 });
     }
 
     // Auth
-    const tokenFromAuth = req.headers
-      .get("authorization")
-      ?.toLowerCase()
-      .startsWith("bearer ")
-      ? req.headers.get("authorization")!.slice(7).trim()
-      : null;
-    let access_token = tokenFromAuth ?? (await getAccessTokenFromCookies());
-    if (!access_token) {
-      return NextResponse.json(
-        { error: "Auth session missing!" },
-        { status: 401 }
-      );
+    const token = getAccessTokenFromReq(req);
+    if (!token) {
+      return NextResponse.json({ error: 'Auth session missing!' }, { status: 401 });
     }
-
-    const { data: userData, error: userErr } =
-      await supabaseAnon.auth.getUser(access_token);
-    if (userErr || !userData.user) {
-      return NextResponse.json(
-        { error: userErr?.message ?? "Unauthorized" },
-        { status: 401 }
-      );
+    const { data: userData, error: uErr } = await supabase.auth.getUser(token);
+    if (uErr || !userData?.user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
     const uid = userData.user.id;
 
-    // 1) récupérer les mois présents dans les slots de la période
-    const { data: slots, error: slotsErr } = await supabaseAnon
-      .from("slots")
-      .select("date")
-      .eq("period_id", period_id);
-    if (slotsErr)
+    // 1) Mois présents dans la période (d’après slots.date)
+    const { data: slotRows, error: slotsErr } = await supabase
+      .from('slots')
+      .select('date')
+      .eq('period_id', period_id);
+    if (slotsErr) {
       return NextResponse.json({ error: slotsErr.message }, { status: 500 });
+    }
 
     const monthSet = new Set<string>();
-    for (const s of slots ?? []) {
-      if (s.date) monthSet.add(yyyymm(s.date));
+    for (const s of slotRows ?? []) {
+      const d = (s as any).date as string | null;
+      if (d) monthSet.add(yyyymm(d));
     }
     const months = Array.from(monthSet).sort();
 
-    // 2) état de validation de l'utilisateur
-    const { data: dpm, error: dpmErr } = await supabaseAnon
-      .from("doctor_period_months")
-      .select("month_key, validated_at")
-      .eq("user_id", uid)
-      .eq("period_id", period_id);
-    if (dpmErr)
+    // 2) État utilisateur pour ces mois
+    const { data: dpmRows, error: dpmErr } = await supabase
+      .from('doctor_period_months')
+      .select('month, validated_at, locked, opted_out')
+      .eq('user_id', uid)
+      .eq('period_id', period_id);
+    if (dpmErr) {
       return NextResponse.json({ error: dpmErr.message }, { status: 500 });
-
-    const validatedMap = new Map<string, string | null>();
-    for (const row of dpm ?? []) {
-      validatedMap.set(row.month_key, row.validated_at);
     }
 
-    // 3) flags
-    const { data: flagsRow, error: flagsErr } = await supabaseAnon
-      .from("doctor_period_flags")
-      .select("all_validated, opted_out, locked")
-      .eq("user_id", uid)
-      .eq("period_id", period_id)
-      .maybeSingle();
-    if (flagsErr)
-      return NextResponse.json({ error: flagsErr.message }, { status: 500 });
+    const byMonth = new Map<string, MonthState>();
+    for (const r of dpmRows ?? []) {
+      const row = r as any;
+      byMonth.set(row.month, {
+        month: row.month,
+        validated_at: row.validated_at ?? null,
+        locked: !!row.locked,
+        opted_out: !!row.opted_out,
+      });
+    }
+
+    const monthsOut: MonthState[] = months.map(m => {
+      const r = byMonth.get(m);
+      return r ?? { month: m, validated_at: null, locked: false, opted_out: false };
+    });
+
+    const flags = computeFlags(monthsOut);
 
     return NextResponse.json({
       period_id,
-      months: months.map((m) => ({
-        month_key: m,
-        validated_at: validatedMap.get(m) ?? null,
-      })),
-      flags: {
-        all_validated: flagsRow?.all_validated ?? false,
-        opted_out: flagsRow?.opted_out ?? false,
-        locked: flagsRow?.locked ?? false,
-      },
+      months: monthsOut,
+      flags,
     });
   } catch (e: any) {
-    console.error("[doctor-months GET]", e);
-    return NextResponse.json(
-      { error: e?.message ?? "Server error" },
-      { status: 500 }
-    );
+    console.error('[doctor-months GET]', e);
+    return NextResponse.json({ error: e?.message ?? 'Server error' }, { status: 500 });
   }
 }
 
+/* ------------------------------ POST -------------------------------- */
 /**
  * POST /api/doctor-months
  * body:
- *   { action: 'toggle_validate', period_id, month_key, value: boolean }
+ *   { action: 'toggle_validate', period_id, month | month_key, value: boolean }
  *   { action: 'opt_out',        period_id, value: boolean }
  */
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-    const action = String(body?.action ?? "");
-    const period_id = String(body?.period_id ?? "");
+    const supabase = getSupabaseAdmin();
 
+    const body = await req.json().catch(() => ({}));
+    const action = String((body as any)?.action ?? '').trim();
+    const period_id = String((body as any)?.period_id ?? '').trim();
     if (!period_id) {
-      return NextResponse.json(
-        { error: "period_id requis" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'period_id requis' }, { status: 400 });
     }
 
     // Auth
-    const tokenFromAuth = req.headers
-      .get("authorization")
-      ?.toLowerCase()
-      .startsWith("bearer ")
-      ? req.headers.get("authorization")!.slice(7).trim()
-      : null;
-    let access_token = tokenFromAuth ?? (await getAccessTokenFromCookies());
-    if (!access_token) {
-      return NextResponse.json(
-        { error: "Auth session missing!" },
-        { status: 401 }
-      );
+    const token = getAccessTokenFromReq(req);
+    if (!token) {
+      return NextResponse.json({ error: 'Auth session missing!' }, { status: 401 });
     }
-
-    const { data: userData, error: userErr } =
-      await supabaseAnon.auth.getUser(access_token);
-    if (userErr || !userData.user) {
-      return NextResponse.json(
-        { error: userErr?.message ?? "Unauthorized" },
-        { status: 401 }
-      );
+    const { data: userData, error: uErr } = await supabase.auth.getUser(token);
+    if (uErr || !userData?.user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
     const uid = userData.user.id;
 
-    if (action === "toggle_validate") {
-      const month_key = String(body?.month_key ?? "");
-      const value: boolean = !!body?.value;
-      if (!month_key || !/^\d{4}-\d{2}$/.test(month_key)) {
+    if (action === 'toggle_validate') {
+      // On accepte 'month' ou 'month_key'
+      const mkRaw = (body as any)?.month ?? (body as any)?.month_key;
+      const month = String(mkRaw ?? '').trim();
+      const value: boolean = !!(body as any)?.value;
+
+      if (!month || !/^\d{4}-\d{2}$/.test(month)) {
+        return NextResponse.json({ error: 'month invalide' }, { status: 400 });
+      }
+
+      // Bloquer si locked / opted_out
+      const { data: existing, error: exErr } = await supabase
+        .from('doctor_period_months')
+        .select('locked, opted_out')
+        .eq('user_id', uid)
+        .eq('period_id', period_id)
+        .eq('month', month)
+        .maybeSingle();
+      if (exErr) return NextResponse.json({ error: exErr.message }, { status: 500 });
+      if (existing?.locked) {
         return NextResponse.json(
-          { error: "month_key invalide" },
-          { status: 400 }
+          { error: 'Mois verrouillé. Déverrouillage requis par un admin.' },
+          { status: 409 }
+        );
+      }
+      if (existing?.opted_out) {
+        return NextResponse.json(
+          { error: 'Mois en opt-out. Désactivez l’opt-out pour modifier la validation.' },
+          { status: 409 }
         );
       }
 
       if (value) {
-        // upsert avec validated_at = now()
-        const { error: insErr } = await supabaseAnon
-          .from("doctor_period_months")
+        const { error: upErr } = await supabase
+          .from('doctor_period_months')
           .upsert(
             {
               user_id: uid,
               period_id,
-              month_key,
+              month,
               validated_at: new Date().toISOString(),
             },
-            { onConflict: "user_id,period_id,month_key" }
+            { onConflict: 'user_id,period_id,month' }
           );
-        if (insErr)
-          return NextResponse.json({ error: insErr.message }, { status: 500 });
+        if (upErr) return NextResponse.json({ error: upErr.message }, { status: 500 });
       } else {
-        // mettre validated_at = null (ou delete)
-        const { error: updErr } = await supabaseAnon
-          .from("doctor_period_months")
+        const { error: updErr } = await supabase
+          .from('doctor_period_months')
           .update({ validated_at: null })
-          .eq("user_id", uid)
-          .eq("period_id", period_id)
-          .eq("month_key", month_key);
-        if (updErr)
-          return NextResponse.json({ error: updErr.message }, { status: 500 });
+          .eq('user_id', uid)
+          .eq('period_id', period_id)
+          .eq('month', month);
+        if (updErr) return NextResponse.json({ error: updErr.message }, { status: 500 });
       }
 
-      // Recalcul all_validated (3 mois validés) si besoin
-      const { data: slots, error: slotsErr } = await supabaseAnon
-        .from("slots")
-        .select("date")
-        .eq("period_id", period_id);
-      if (slotsErr)
-        return NextResponse.json({ error: slotsErr.message }, { status: 500 });
+      // Répondre avec l’état recalculé
+      return await GET(new NextRequest(new URL(`${req.url}?period_id=${encodeURIComponent(period_id)}`)));
+    }
 
-      const monthsInPeriod = new Set<string>();
-      for (const s of slots ?? []) if (s.date) monthsInPeriod.add(yyyymm(s.date));
+    if (action === 'opt_out') {
+      const value: boolean = !!(body as any)?.value;
 
-      const { data: dpm, error: dpmErr } = await supabaseAnon
-        .from("doctor_period_months")
-        .select("month_key, validated_at")
-        .eq("user_id", uid)
-        .eq("period_id", period_id);
-      if (dpmErr)
-        return NextResponse.json({ error: dpmErr.message }, { status: 500 });
+      // L’opt-out est “période entière” -> on applique à tous les mois de la période
+      const { data: slotRows, error: slotsErr } = await supabase
+        .from('slots')
+        .select('date')
+        .eq('period_id', period_id);
+      if (slotsErr) return NextResponse.json({ error: slotsErr.message }, { status: 500 });
 
-      let validatedCount = 0;
-      for (const m of monthsInPeriod) {
-        const row = dpm?.find((r) => r.month_key === m);
-        if (row && row.validated_at) validatedCount++;
+      const monthsSet = new Set<string>();
+      for (const s of slotRows ?? []) {
+        const d = (s as any).date as string | null;
+        if (d) monthsSet.add(yyyymm(d));
       }
-      const allValidated = validatedCount === monthsInPeriod.size && monthsInPeriod.size > 0;
+      const months = Array.from(monthsSet);
 
-      const { error: flagsErr } = await supabaseAnon
-        .from("doctor_period_flags")
-        .upsert(
-          {
-            user_id: uid,
-            period_id,
-            all_validated: allValidated,
-          },
-          { onConflict: "user_id,period_id" }
-        );
-      if (flagsErr)
-        return NextResponse.json({ error: flagsErr.message }, { status: 500 });
+      if (months.length === 0) {
+        return NextResponse.json({ error: 'Aucun mois pour cette période' }, { status: 400 });
+      }
 
-      return NextResponse.json({ ok: true });
+      const rows = months.map(m => ({
+        user_id: uid,
+        period_id,
+        month: m,
+        opted_out: value,
+        validated_at: value ? new Date().toISOString() : null,
+      }));
+
+      // Upsert en lot
+      const { error: upErr } = await supabase
+        .from('doctor_period_months')
+        .upsert(rows, { onConflict: 'user_id,period_id,month' });
+      if (upErr) return NextResponse.json({ error: upErr.message }, { status: 500 });
+
+      // Répondre avec l’état recalculé
+      return await GET(new NextRequest(new URL(`${req.url}?period_id=${encodeURIComponent(period_id)}`)));
     }
 
-    if (action === "opt_out") {
-      const value: boolean = !!body?.value;
-
-      // Quand opt_out = true, on considère l'utilisateur "à jour" (all_validated = true)
-      const { error: flagsErr } = await supabaseAnon
-        .from("doctor_period_flags")
-        .upsert(
-          {
-            user_id: uid,
-            period_id,
-            opted_out: value,
-            all_validated: value ? true : false, // si on revient à false, on remettra all_validated à false (il devra valider les mois)
-          },
-          { onConflict: "user_id,period_id" }
-        );
-      if (flagsErr)
-        return NextResponse.json({ error: flagsErr.message }, { status: 500 });
-
-      return NextResponse.json({ ok: true });
-    }
-
-    return NextResponse.json(
-      { error: "action inconnue" },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: 'action inconnue' }, { status: 400 });
   } catch (e: any) {
-    console.error("[doctor-months POST]", e);
-    return NextResponse.json(
-      { error: e?.message ?? "Server error" },
-      { status: 500 }
-    );
+    console.error('[doctor-months POST]', e);
+    return NextResponse.json({ error: e?.message ?? 'Server error' }, { status: 500 });
   }
 }

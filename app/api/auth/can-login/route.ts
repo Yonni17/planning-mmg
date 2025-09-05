@@ -1,35 +1,52 @@
 // app/api/auth/can-login/route.ts
 import { NextRequest, NextResponse } from 'next/server';
-import { createClient } from '@supabase/supabase-js';
+import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
 
+export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-
-const supabaseService = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
-
 export async function GET(req: NextRequest) {
-  const email = String(req.nextUrl.searchParams.get('email') ?? '').trim().toLowerCase();
-  if (!email) return NextResponse.json({ allowed: false });
+  try {
+    const email = String(req.nextUrl.searchParams.get('email') ?? '')
+      .trim()
+      .toLowerCase();
 
-  // autorisé si : existe dans invites (non révoqué) OU a déjà un profile (au cas où)
-  const { data: inv } = await supabaseService
-    .from('invites')
-    .select('status')
-    .eq('email', email)
-    .maybeSingle();
+    if (!email) return NextResponse.json({ allowed: false });
 
-  if (inv && inv.status !== 'revoked') {
-    return NextResponse.json({ allowed: true });
+    const supabase = getSupabaseAdmin();
+
+    // 1) Chemin "officiel" : allowlist via RPC
+    //    -> doit retourner un booléen
+    const { data: allowedByRpc, error: rpcErr } = await supabase.rpc(
+      'user_exists_by_email',
+      { in_email: email }
+    );
+
+    if (rpcErr) {
+      // On journalise mais on continue avec un fallback
+      console.warn('[can-login] RPC user_exists_by_email error:', rpcErr.message);
+    } else if (typeof allowedByRpc === 'boolean') {
+      return NextResponse.json({ allowed: allowedByRpc });
+    }
+
+    // 2) Fallback : on considère "autorisé" si une invite existe et n’est pas révoquée
+    const { data: inv, error: invErr } = await supabase
+      .from('invites')
+      .select('status')
+      .eq('email', email)
+      .maybeSingle();
+
+    if (invErr) {
+      console.warn('[can-login] invites read error:', invErr.message);
+      // prudence: en cas d’erreur DB on n’autorise pas
+      return NextResponse.json({ allowed: false });
+    }
+
+    const allowed = !!inv && inv.status !== 'revoked';
+    return NextResponse.json({ allowed });
+  } catch (e: any) {
+    console.error('[can-login]', e);
+    // ne pas fuiter d’info: on répond simplement false
+    return NextResponse.json({ allowed: false });
   }
-
-  // (optionnel) autoriser si déjà un profil (il peut se reconnecter)
-  const { data: prof } = await supabaseService
-    .from('profiles')
-    .select('user_id')
-    .eq('full_name', email) // <-- si full_name != email, mieux vaut vérifier via auth.users. Sans accès direct: laissons false si pas invite.
-    .limit(1);
-  // Par défaut, ne pas autoriser sur ce fallback, à moins d’un mapping email->profile.
-  return NextResponse.json({ allowed: false });
 }
