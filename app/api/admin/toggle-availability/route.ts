@@ -1,70 +1,130 @@
 // app/api/admin/toggle-availability/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
-import { createClient } from '@supabase/supabase-js';
+import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
 
+export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+/* -------------------- Auth helpers (Bearer / Cookies) -------------------- */
+function getAccessTokenFromReq(req: NextRequest): string | null {
+  // 1) Authorization: Bearer <jwt>
+  const auth = req.headers.get('authorization');
+  if (auth && auth.toLowerCase().startsWith('bearer ')) {
+    return auth.slice(7).trim();
+  }
 
-const supabaseAnon = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false } });
-const supabaseService = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
+  // 2) Cookie direct sb-access-token (supabase-js côté client)
+  const c = cookies();
+  const direct = c.get('sb-access-token')?.value;
+  if (direct) return direct;
 
-async function getAccessTokenFromCookies(): Promise<string | null> {
-  const store = await cookies();
-  const ref = new URL(SUPABASE_URL).host.split('.')[0];
-  const base = `sb-${ref}-auth-token`;
-  const c0 = store.get(`${base}.0`)?.value ?? '';
-  const c1 = store.get(`${base}.1`)?.value ?? '';
-  const c = store.get(base)?.value ?? '';
-  const raw = c0 || c1 ? `${c0}${c1}` : c;
-  if (!raw) return null;
-  let txt = raw;
-  try { txt = decodeURIComponent(raw); } catch {}
+  // 3) Cookie objet sb-<ref>-auth-token (Helpers) éventuellement splitté .0/.1
+  const supabaseUrl =
+    process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || '';
   try {
+    const ref = new URL(supabaseUrl).host.split('.')[0];
+    const base = `sb-${ref}-auth-token`;
+    const c0 = c.get(`${base}.0`)?.value ?? '';
+    const c1 = c.get(`${base}.1`)?.value ?? '';
+    const cj = c.get(base)?.value ?? '';
+    const raw = c0 || c1 ? `${c0}${c1}` : cj;
+    if (!raw) return null;
+
+    let txt = raw;
+    try {
+      txt = decodeURIComponent(raw);
+    } catch {}
     const parsed = JSON.parse(txt);
-    if (parsed?.access_token) return parsed.access_token as string;
-    if (parsed?.currentSession?.access_token) return parsed.currentSession.access_token as string;
-  } catch {}
+    if (parsed?.access_token) return String(parsed.access_token);
+    if (parsed?.currentSession?.access_token)
+      return String(parsed.currentSession.access_token);
+  } catch {
+    // ignore
+  }
   return null;
 }
 
+async function requireAdminOrResponse(req: NextRequest) {
+  const supabase = getSupabaseAdmin();
+
+  const token = getAccessTokenFromReq(req);
+  if (!token) {
+    return {
+      errorResponse: NextResponse.json(
+        { error: 'Unauthorized' },
+        { status: 401 }
+      ),
+      supabase,
+      userId: null as string | null,
+    };
+  }
+
+  const { data: userData, error: uErr } = await supabase.auth.getUser(token);
+  if (uErr || !userData?.user) {
+    return {
+      errorResponse: NextResponse.json(
+        { error: 'Unauthorized' },
+        { status: 401 }
+      ),
+      supabase,
+      userId: null,
+    };
+  }
+
+  const uid = userData.user.id;
+  const { data: isAdmin, error: aErr } = await supabase.rpc('is_admin', { uid });
+  if (aErr || !isAdmin) {
+    return {
+      errorResponse: NextResponse.json(
+        { error: 'Forbidden' },
+        { status: 403 }
+      ),
+      supabase,
+      userId: uid,
+    };
+  }
+
+  return { errorResponse: null as NextResponse | null, supabase, userId: uid };
+}
+
+/* ------------------------------ Handler --------------------------------- */
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-    const { slot_id, user_id, available } = body ?? {};
+    const auth = await requireAdminOrResponse(req);
+    if (auth.errorResponse) return auth.errorResponse;
+    const supabase = auth.supabase;
+
+    const body = await req.json().catch(() => ({}));
+    const slot_id = String((body as any)?.slot_id ?? '').trim();
+    const user_id = String((body as any)?.user_id ?? '').trim();
+    const available = (body as any)?.available;
+
     if (!slot_id || !user_id || typeof available !== 'boolean') {
-      return NextResponse.json({ error: 'slot_id, user_id et available sont requis' }, { status: 400 });
+      return NextResponse.json(
+        { error: 'slot_id, user_id et available sont requis' },
+        { status: 400 }
+      );
     }
 
-    // Auth admin
-    const authHeader = req.headers.get('authorization') || '';
-    let access_token: string | null = null;
-    if (authHeader.toLowerCase().startsWith('bearer ')) access_token = authHeader.slice(7).trim();
-    if (!access_token) access_token = await getAccessTokenFromCookies();
-    if (!access_token) return NextResponse.json({ error: 'Auth session missing!' }, { status: 401 });
-
-    const { data: userData, error: userErr } = await supabaseAnon.auth.getUser(access_token);
-    if (userErr) return NextResponse.json({ error: userErr.message }, { status: 401 });
-    const user = userData.user;
-    if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-
-    const { data: isAdmin, error: adminErr } = await supabaseService.rpc('is_admin', { uid: user.id });
-    if (adminErr) return NextResponse.json({ error: adminErr.message }, { status: 500 });
-    if (!isAdmin) return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
-
     // Upsert (PK composite (user_id, slot_id))
-    const { error: upErr } = await supabaseService
+    const { error: upErr } = await supabase
       .from('availability')
-      .upsert({ user_id, slot_id, available }, { onConflict: 'user_id,slot_id' });
+      .upsert(
+        { user_id, slot_id, available },
+        { onConflict: 'user_id,slot_id' }
+      );
 
-    if (upErr) throw upErr;
+    if (upErr) {
+      return NextResponse.json({ error: upErr.message }, { status: 500 });
+    }
 
     return NextResponse.json({ ok: true });
   } catch (e: any) {
     console.error('[toggle-availability]', e);
-    return NextResponse.json({ error: e?.message ?? 'Server error' }, { status: 500 });
+    return NextResponse.json(
+      { error: e?.message ?? 'Server error' },
+      { status: 500 }
+    );
   }
 }

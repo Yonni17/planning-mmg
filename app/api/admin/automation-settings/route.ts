@@ -1,77 +1,126 @@
 // app/api/admin/automation-settings/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
-import { createClient } from '@supabase/supabase-js';
+import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
 
+export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+/** Récupère l'access token depuis Authorization: Bearer ou cookies Supabase */
+function getAccessTokenFromReq(req: NextRequest): string | null {
+  // 1) Authorization: Bearer <jwt>
+  const auth = req.headers.get('authorization');
+  if (auth && auth.toLowerCase().startsWith('bearer ')) {
+    return auth.slice(7).trim();
+  }
 
-const supabaseAnon = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false } });
-const supabaseService = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
+  // 2) Cookie direct sb-access-token (supabase-js v2 côté client)
+  const c = cookies();
+  const direct = c.get('sb-access-token')?.value;
+  if (direct) return direct;
 
-async function getAccessTokenFromCookies(): Promise<string | null> {
-  const store = await cookies();
-  const ref = new URL(SUPABASE_URL).host.split('.')[0];
-  const base = `sb-${ref}-auth-token`;
-  const c0 = store.get(`${base}.0`)?.value ?? '';
-  const c1 = store.get(`${base}.1`)?.value ?? '';
-  const c  = store.get(base)?.value ?? '';
-  const raw = c0 || c1 ? `${c0}${c1}` : c;
-  if (!raw) return null;
-  let txt = raw;
-  try { txt = decodeURIComponent(raw); } catch {}
+  // 3) Cookie objet sb-<ref>-auth-token (Helpers) éventuellement splitté .0/.1
+  const supabaseUrl =
+    process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || '';
   try {
+    const ref = new URL(supabaseUrl).host.split('.')[0];
+    const base = `sb-${ref}-auth-token`;
+    const c0 = c.get(`${base}.0`)?.value ?? '';
+    const c1 = c.get(`${base}.1`)?.value ?? '';
+    const cj = c.get(base)?.value ?? '';
+    const raw = c0 || c1 ? `${c0}${c1}` : cj;
+    if (!raw) return null;
+
+    let txt = raw;
+    try {
+      txt = decodeURIComponent(raw);
+    } catch {}
     const parsed = JSON.parse(txt);
-    if (parsed?.access_token) return parsed.access_token as string;
-    if (parsed?.currentSession?.access_token) return parsed.currentSession.access_token as string;
-  } catch {}
+    if (parsed?.access_token) return String(parsed.access_token);
+    if (parsed?.currentSession?.access_token)
+      return String(parsed.currentSession.access_token);
+  } catch {
+    // ignore
+  }
   return null;
 }
 
-async function requireAdmin(req: NextRequest) {
-  const authHeader = req.headers.get('authorization') || '';
-  let access_token: string | null = null;
-  if (authHeader.toLowerCase().startsWith('bearer ')) access_token = authHeader.slice(7).trim();
-  if (!access_token) access_token = await getAccessTokenFromCookies();
-  if (!access_token) return { error: 'Auth session missing!' };
+/** Vérifie l’admin via RPC is_admin(uid) */
+async function requireAdminOrResponse(req: NextRequest) {
+  const supabase = getSupabaseAdmin();
 
-  const { data: userData, error: userErr } = await supabaseAnon.auth.getUser(access_token);
-  if (userErr || !userData.user) return { error: 'Unauthorized' };
+  const token = getAccessTokenFromReq(req);
+  if (!token) {
+    return {
+      errorResponse: NextResponse.json(
+        { ok: false, error: 'Unauthorized' },
+        { status: 401 }
+      ),
+      supabase,
+      userId: null as string | null,
+    };
+  }
 
-  const { data: isAdmin, error: adminErr } = await supabaseService.rpc('is_admin', { uid: userData.user.id });
-  if (adminErr) return { error: adminErr.message };
-  if (!isAdmin) return { error: 'Forbidden' };
-  return { user: userData.user };
+  const { data: userData, error: uErr } = await supabase.auth.getUser(token);
+  if (uErr || !userData?.user) {
+    return {
+      errorResponse: NextResponse.json(
+        { ok: false, error: 'Unauthorized' },
+        { status: 401 }
+      ),
+      supabase,
+      userId: null,
+    };
+  }
+
+  const uid = userData.user.id;
+  const { data: isAdmin, error: aErr } = await supabase.rpc('is_admin', { uid });
+  if (aErr || !isAdmin) {
+    return {
+      errorResponse: NextResponse.json(
+        { ok: false, error: 'Forbidden' },
+        { status: 403 }
+      ),
+      supabase,
+      userId: uid,
+    };
+  }
+
+  return { errorResponse: null as NextResponse | null, supabase, userId: uid };
 }
 
 /** GET : lit/retourne les réglages de la période (ou des defaults s’il n’y a pas encore de ligne) */
 export async function GET(req: NextRequest) {
-  const auth = await requireAdmin(req);
-  if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: 401 });
+  const { errorResponse, supabase } = await requireAdminOrResponse(req);
+  if (errorResponse) return errorResponse;
 
   const { searchParams } = new URL(req.url);
   const period_id = searchParams.get('period_id');
-  if (!period_id) return NextResponse.json({ error: 'period_id requis' }, { status: 400 });
+  if (!period_id) {
+    return NextResponse.json(
+      { error: 'period_id requis' },
+      { status: 400 }
+    );
+  }
 
-  const { data, error } = await supabaseService
+  const { data, error } = await supabase
     .from('period_automation')
     .select('*')
     .eq('period_id', period_id)
     .maybeSingle();
 
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
 
   // valeurs par défaut si pas de ligne pour cette période
   const defaults = {
     period_id,
     slots_generate_before_days: 45,
-    avail_open_at: null,
-    avail_deadline: null,
+    avail_open_at: null as string | null,
+    avail_deadline: null as string | null,
     weekly_reminder: true,
-    extra_reminder_hours: [48, 24, 1],
+    extra_reminder_hours: [48, 24, 1] as number[],
     planning_generate_before_days: 21,
     lock_assignments: false,
   };
@@ -81,50 +130,88 @@ export async function GET(req: NextRequest) {
 
 /** POST : upsert des réglages pour une période */
 export async function POST(req: NextRequest) {
-  const auth = await requireAdmin(req);
-  if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: 401 });
+  const { errorResponse, supabase } = await requireAdminOrResponse(req);
+  if (errorResponse) return errorResponse;
 
-  const body = await req.json();
-  const {
-    period_id,
-    slots_generate_before_days,
-    avail_open_at,
-    avail_deadline,
-    weekly_reminder,
-    extra_reminder_hours, // string "48,24,1" ou array
-    planning_generate_before_days,
-    lock_assignments,
-  } = body ?? {};
-
-  if (!period_id) return NextResponse.json({ error: 'period_id requis' }, { status: 400 });
-
-  let extraHours: number[] | null = null;
-  if (Array.isArray(extra_reminder_hours)) {
-    extraHours = extra_reminder_hours.map((n: any) => Number(n)).filter((n: any) => Number.isFinite(n));
-  } else if (typeof extra_reminder_hours === 'string') {
-    extraHours = extra_reminder_hours
-      .split(',')
-      .map(s => Number(s.trim()))
-      .filter(n => Number.isFinite(n));
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
   }
 
-  const row = {
+  const payload = body as Record<string, unknown>;
+  const period_id = String(payload.period_id ?? '');
+  if (!period_id) {
+    return NextResponse.json(
+      { error: 'period_id requis' },
+      { status: 400 }
+    );
+  }
+
+  // coercitions douces
+  const toNum = (v: unknown) =>
+    typeof v === 'number'
+      ? v
+      : Number.isFinite(Number(v))
+      ? Number(v)
+      : undefined;
+
+  let extraHours: number[] | undefined;
+  const erh = payload.extra_reminder_hours;
+  if (Array.isArray(erh)) {
+    extraHours = (erh as unknown[]).map(toNum).filter((n): n is number => Number.isFinite(n as number));
+  } else if (typeof erh === 'string') {
+    extraHours = (erh as string)
+      .split(',')
+      .map((s) => Number(s.trim()))
+      .filter((n) => Number.isFinite(n));
+  }
+
+  const row: Record<string, unknown> = {
     period_id,
-    ...(Number.isFinite(Number(slots_generate_before_days)) ? { slots_generate_before_days: Number(slots_generate_before_days) } : {}),
-    ...(avail_open_at ? { avail_open_at: new Date(avail_open_at).toISOString() } : { avail_open_at: null }),
-    ...(avail_deadline ? { avail_deadline: new Date(avail_deadline).toISOString() } : { avail_deadline: null }),
-    ...(typeof weekly_reminder === 'boolean' ? { weekly_reminder } : {}),
-    ...(extraHours ? { extra_reminder_hours: extraHours } : {}),
-    ...(Number.isFinite(Number(planning_generate_before_days)) ? { planning_generate_before_days: Number(planning_generate_before_days) } : {}),
-    ...(typeof lock_assignments === 'boolean' ? { lock_assignments } : {}),
   };
 
-  const { data, error } = await supabaseService
+  const sgbd = toNum(payload.slots_generate_before_days);
+  if (typeof sgbd === 'number') row.slots_generate_before_days = sgbd;
+
+  if (payload.avail_open_at) {
+    const d = new Date(String(payload.avail_open_at));
+    row.avail_open_at = isNaN(d.valueOf()) ? null : d.toISOString();
+  } else {
+    row.avail_open_at = null;
+  }
+
+  if (payload.avail_deadline) {
+    const d = new Date(String(payload.avail_deadline));
+    row.avail_deadline = isNaN(d.valueOf()) ? null : d.toISOString();
+  } else {
+    row.avail_deadline = null;
+  }
+
+  if (typeof payload.weekly_reminder === 'boolean') {
+    row.weekly_reminder = payload.weekly_reminder;
+  }
+
+  if (extraHours && extraHours.length) {
+    row.extra_reminder_hours = extraHours;
+  }
+
+  const pgbd = toNum(payload.planning_generate_before_days);
+  if (typeof pgbd === 'number') row.planning_generate_before_days = pgbd;
+
+  if (typeof payload.lock_assignments === 'boolean') {
+    row.lock_assignments = payload.lock_assignments;
+  }
+
+  const { data, error } = await supabase
     .from('period_automation')
     .upsert(row, { onConflict: 'period_id' })
     .select('*')
     .maybeSingle();
 
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
   return NextResponse.json(data);
 }
