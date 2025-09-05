@@ -11,6 +11,6 @@ jobs:
     steps:
       - name: Call the endpoint
         run: |
-          curl -fsS "https://planning-mmg-y716.vercel.app/api/admin/cron?key=$CRON_SECRET"
+          curl -fsS "https://planning-mmg.ovh/api/admin/cron?key=$CRON_SECRET"
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
