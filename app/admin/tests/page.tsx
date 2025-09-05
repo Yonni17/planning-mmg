@@ -1,3 +1,4 @@
+// app/admin/tests/page.tsx
 'use client';
 
 import { useEffect, useState } from 'react';
@@ -11,22 +12,73 @@ type TestId =
   | 'targets_presence'
   | 'assignments_coverage'
   | 'automation_settings'
-  | 'doctor_months_status';
+  | 'doctor_months_status'
+  | 'mail_opening'
+  | 'mail_weekly_reminder'
+  | 'mail_deadline_extra'
+  | 'mail_planning_ready';
 
 type TestResult = {
   ok: boolean;
   title: string;
-  details?: any;
+  details?: unknown;
   error?: string;
 };
 
 const TESTS: { id: TestId; title: string; needsPeriod: boolean; hint?: string }[] = [
   { id: 'slots_exist', title: 'Slots présents pour la période', needsPeriod: true },
-  { id: 'availability_consistency', title: 'Disponibilités (cohérence & volume)', needsPeriod: true, hint: 'Vérifie candidats / slot / utilisateurs distincts' },
-  { id: 'targets_presence', title: 'Cibles (preferences_period)', needsPeriod: true, hint: 'Vérifie présence de target_level pour les utilisateurs' },
-  { id: 'assignments_coverage', title: 'Assignations (couverture)', needsPeriod: true, hint: 'Vérifie trous / doublons par slot' },
+  {
+    id: 'availability_consistency',
+    title: 'Disponibilités (cohérence & volume)',
+    needsPeriod: true,
+    hint: 'Vérifie candidats / slot / utilisateurs distincts',
+  },
+  {
+    id: 'targets_presence',
+    title: 'Cibles (preferences_period)',
+    needsPeriod: true,
+    hint: 'Vérifie présence de target_level pour les utilisateurs',
+  },
+  {
+    id: 'assignments_coverage',
+    title: 'Assignations (couverture)',
+    needsPeriod: true,
+    hint: 'Vérifie trous / doublons par slot',
+  },
   { id: 'automation_settings', title: 'Réglages d’automatisation (globaux)', needsPeriod: false },
-  { id: 'doctor_months_status', title: 'Statut des mois (doctor_period_months)', needsPeriod: true, hint: 'Locked/Opted-out par mois' },
+
+  // Scénarios mails (dry-run)
+  {
+    id: 'mail_opening',
+    title: 'Mail — Ouverture des disponibilités',
+    needsPeriod: true,
+    hint: 'Destinataires au moment de l’ouverture',
+  },
+  {
+    id: 'mail_weekly_reminder',
+    title: 'Mail — Rappel hebdomadaire',
+    needsPeriod: true,
+    hint: 'Entre ouverture et deadline, si non validé',
+  },
+  {
+    id: 'mail_deadline_extra',
+    title: 'Mail — Rappels 48/24/1h',
+    needsPeriod: true,
+    hint: 'Autour de la deadline',
+  },
+  {
+    id: 'mail_planning_ready',
+    title: 'Mail — Planning validé & prêt',
+    needsPeriod: true,
+    hint: 'Docteurs ayant des gardes',
+  },
+
+  {
+    id: 'doctor_months_status',
+    title: 'Statut des mois (doctor_period_months)',
+    needsPeriod: true,
+    hint: 'Locked/Opted-out par mois',
+  },
 ];
 
 export default function TestsAdminPage() {
@@ -42,22 +94,26 @@ export default function TestsAdminPage() {
     (async () => {
       setLoading(true);
       setMsg(null);
+
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) {
         setMsg('Auth session missing!');
         setLoading(false);
         return;
       }
+
       const { data: periodsData, error: pErr } = await supabase
         .from('periods')
         .select('id,label')
         .order('open_at', { ascending: false });
+
       if (pErr) {
         setMsg(`Erreur périodes: ${pErr.message}`);
         setLoading(false);
         return;
       }
-      const list = periodsData ?? [];
+
+      const list = (periodsData ?? []) as Period[];
       setPeriods(list);
       setPeriodId(list[0]?.id ?? '');
       setLoading(false);
@@ -68,6 +124,7 @@ export default function TestsAdminPage() {
     setMsg(null);
     setRunning(prev => ({ ...prev, [id]: true }));
     setResults(prev => ({ ...prev, [id]: null }));
+
     try {
       const { data: { session } } = await supabase.auth.getSession();
       const token = session?.access_token;
@@ -80,43 +137,32 @@ export default function TestsAdminPage() {
         },
         body: JSON.stringify({ test: id, period_id: periodId || null }),
       });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json?.error ?? 'Erreur test');
-      setResults(prev => ({ ...prev, [id]: json as TestResult }));
-    } catch (e: any) {
+
+      const json: TestResult = await res.json();
+      if (!res.ok) throw new Error((json as unknown as { error?: string })?.error ?? 'Erreur test');
+
+      setResults(prev => ({ ...prev, [id]: json }));
+    } catch (e) {
+      const err = e as Error;
       setResults(prev => ({
         ...prev,
-        [id]: { ok: false, title: id, error: e.message },
+        [id]: { ok: false, title: id, error: err.message },
       }));
     } finally {
       setRunning(prev => ({ ...prev, [id]: false }));
     }
   };
-const TESTS: { id: TestId; title: string; needsPeriod: boolean; hint?: string }[] = [
-  { id: 'slots_exist', title: 'Slots présents pour la période', needsPeriod: true },
-  { id: 'availability_consistency', title: 'Disponibilités (cohérence & volume)', needsPeriod: true, hint: 'Vérifie candidats / slot / utilisateurs distincts' },
-  { id: 'targets_presence', title: 'Cibles (preferences_period)', needsPeriod: true, hint: 'Vérifie présence de target_level pour les utilisateurs' },
-  { id: 'assignments_coverage', title: 'Assignations (couverture)', needsPeriod: true, hint: 'Vérifie trous / doublons par slot' },
-  { id: 'automation_settings', title: 'Réglages d’automatisation (globaux)', needsPeriod: false },
-
-  // ↓ nouveaux scénarios mail (dry-run)
-  { id: 'mail_opening', title: 'Mail — Ouverture des disponibilités', needsPeriod: true, hint: 'Destinataires au moment de l’ouverture' },
-  { id: 'mail_weekly_reminder', title: 'Mail — Rappel hebdomadaire', needsPeriod: true, hint: 'Entre ouverture et deadline, si non validé' },
-  { id: 'mail_deadline_extra', title: 'Mail — Rappels 48/24/1h', needsPeriod: true, hint: 'Autour de la deadline' },
-  { id: 'mail_planning_ready', title: 'Mail — Planning validé & prêt', needsPeriod: true, hint: 'Docteurs ayant des gardes' },
-
-  { id: 'doctor_months_status', title: 'Statut mois — doctor_period_months', needsPeriod: true, hint: 'Locked / Opted-out par mois' },
-];
 
   const runAll = async () => {
     setRunningAll(true);
-    // reset
     const clean: Record<string, TestResult | null> = {};
-    TESTS.forEach(t => clean[t.id] = null);
+    TESTS.forEach(t => (clean[t.id] = null));
     setResults(clean);
+
     try {
       for (const t of TESTS) {
         if (t.needsPeriod && !periodId) continue;
+        // eslint-disable-next-line no-await-in-loop
         await runOne(t.id);
       }
     } finally {
@@ -125,7 +171,13 @@ const TESTS: { id: TestId; title: string; needsPeriod: boolean; hint?: string }[
   };
 
   const Badge = ({ ok }: { ok: boolean }) => (
-    <span className={`px-2 py-0.5 rounded text-xs ${ok ? 'bg-emerald-600/20 text-emerald-300 border border-emerald-700/40' : 'bg-red-600/20 text-red-200 border border-red-800/40'}`}>
+    <span
+      className={`px-2 py-0.5 rounded text-xs ${
+        ok
+          ? 'bg-emerald-600/20 text-emerald-300 border border-emerald-700/40'
+          : 'bg-red-600/20 text-red-200 border border-red-800/40'
+      }`}
+    >
       {ok ? 'OK' : 'FAIL'}
     </span>
   );
@@ -134,7 +186,7 @@ const TESTS: { id: TestId; title: string; needsPeriod: boolean; hint?: string }[
     <div className="mx-auto max-w-6xl p-4 space-y-6">
       <h1 className="text-2xl font-bold text-white">Tests & Diagnostics</h1>
 
-      {/* Sélecteur période */}
+      {/* Sélecteur période + bouton tout lancer */}
       <div className="flex items-center gap-3">
         <label className="text-sm text-zinc-300">Période</label>
         <select
@@ -143,7 +195,11 @@ const TESTS: { id: TestId; title: string; needsPeriod: boolean; hint?: string }[
           onChange={(e) => setPeriodId(e.target.value)}
         >
           <option value="">— choisir —</option>
-          {periods.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
+          {periods.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.label}
+            </option>
+          ))}
         </select>
 
         <button
@@ -164,11 +220,14 @@ const TESTS: { id: TestId; title: string; needsPeriod: boolean; hint?: string }[
       {loading && <div className="text-zinc-400">Chargement…</div>}
 
       <div className="grid md:grid-cols-2 gap-4">
-        {TESTS.map(t => {
+        {TESTS.map((t) => {
           const r = results[t.id] || null;
-          const disabled = running[t.id] || (t.needsPeriod && !periodId);
+          const disabled = !!running[t.id] || (t.needsPeriod && !periodId);
           return (
-            <div key={t.id} className="rounded-xl border border-zinc-700 bg-zinc-900/60 p-4 space-y-2">
+            <div
+              key={t.id}
+              className="rounded-xl border border-zinc-700 bg-zinc-900/60 p-4 space-y-2"
+            >
               <div className="flex items-center justify-between">
                 <h2 className="text-white font-semibold">{t.title}</h2>
                 <div className="flex items-center gap-2">
@@ -182,7 +241,9 @@ const TESTS: { id: TestId; title: string; needsPeriod: boolean; hint?: string }[
                   </button>
                 </div>
               </div>
+
               {!!t.hint && <div className="text-xs text-zinc-400">{t.hint}</div>}
+
               {r && (
                 <pre className="mt-2 text-xs text-zinc-300 bg-black/30 border border-zinc-800 rounded p-2 overflow-x-auto">
 {JSON.stringify(r, null, 2)}
