@@ -5,13 +5,13 @@ import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-// Pour déclencher à la main : /api/admin/cron?key=TA_CLE
+// Déclenchement manuel : /api/admin/cron?key=TA_CLE
 const CRON_SECRET = process.env.CRON_SECRET ?? '';
 
 // ------------------ utils dates (UTC) ------------------
 function startOfQuarter(d: Date) {
-  const m = d.getUTCMonth(); // 0..11
-  const q = Math.floor(m / 3); // 0..3
+  const m = d.getUTCMonth();                 // 0..11
+  const q = Math.floor(m / 3);               // 0..3
   const m0 = q * 3;
   return new Date(Date.UTC(d.getUTCFullYear(), m0, 1, 0, 0, 0));
 }
@@ -19,8 +19,9 @@ function addMonthsUTC(d: Date, months: number) {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + months, d.getUTCDate(), 0, 0, 0));
 }
 function endOfQuarter(qStart: Date) {
+  // dernier jour inclus, à 23:59:59.999
   const nextQ = addMonthsUTC(qStart, 3);
-  return new Date(nextQ.getTime() - 24 * 3600 * 1000); // dernier jour inclus
+  return new Date(nextQ.getTime() - 1);
 }
 function addDaysUTC(d: Date, n: number) {
   return new Date(d.getTime() + n * 24 * 3600 * 1000);
@@ -38,7 +39,9 @@ type SlotInsert = { period_id: string; date: string; start_ts: string; end_ts: s
 
 function slotsForDay(d: Date): SlotSpec[] {
   const dow = dayOfWeekUTC(d);
-  if (dow >= 1 && dow <= 5) return [{ kind: 'WEEKDAY_20_00', start: '20:00', end: '00:00' }];
+  if (dow >= 1 && dow <= 5) {
+    return [{ kind: 'WEEKDAY_20_00', start: '20:00', end: '00:00' }];
+  }
   if (dow === 6) {
     return [
       { kind: 'SAT_12_18', start: '12:00', end: '18:00' },
@@ -70,17 +73,23 @@ export async function GET(req: NextRequest) {
 
   const supa = getSupabaseAdmin();
 
-  // Paramètre global (fallback 45)
-  let openLeadDays = 45;
+  // Paramètres globaux (avec valeurs par défaut)
+  let openLeadDays = 45;          // ouverture des dispos à J-45
+  let planningLeadDays = 21;      // génération du planning à J-21
+
   try {
     const { data } = await supa
       .from('automation_settings')
       .select('settings')
       .eq('key', 'global')
       .maybeSingle();
-    const val = (data as any)?.settings?.open_lead_days;
-    if (Number.isFinite(val)) openLeadDays = Number(val);
-  } catch {}
+
+    const s = (data as any)?.settings ?? {};
+    if (Number.isFinite(s?.open_lead_days)) openLeadDays = Number(s.open_lead_days);
+    if (Number.isFinite(s?.planning_generate_before_days)) planningLeadDays = Number(s.planning_generate_before_days);
+  } catch {
+    // on garde les défauts
+  }
 
   const now = new Date(); // UTC
 
@@ -99,36 +108,48 @@ export async function GET(req: NextRequest) {
   for (const cand of candidates) {
     const openFrom = addDaysUTC(cand.start, -openLeadDays);
 
-    // Crée si non existant ET on est dans la fenêtre [J-45 ; J0[
+    // Créer si non existant ET on est dans la fenêtre [J-openLeadDays ; J0[
     if (now >= openFrom && now < cand.start) {
-      const { data: p0 } = await supa.from('periods').select('id').eq('label', cand.label).maybeSingle();
+      // Période déjà créée ?
+      const { data: p0, error: p0err } = await supa
+        .from('periods')
+        .select('id')
+        .eq('label', cand.label)
+        .maybeSingle();
+      if (p0err) {
+        return NextResponse.json({ error: p0err.message }, { status: 500 });
+      }
       if (p0?.id) continue;
 
-      // Créer la période
       // close_at = dernier jour du trimestre à 23:59:59.999Z
-	const closeAt = new Date(Date.UTC(
-  		cand.end.getUTCFullYear(),
-  		cand.end.getUTCMonth(),
-  		cand.end.getUTCDate(),
-  		23, 59, 59, 999
-	)).toISOString();
+      const closeAt = new Date(Date.UTC(
+        cand.end.getUTCFullYear(),
+        cand.end.getUTCMonth(),
+        cand.end.getUTCDate(),
+        23, 59, 59, 999
+      )).toISOString();
 
-const { data: insP, error: pErr } = await supa
-  .from('periods')
-  .insert([{
-    label:   cand.label,
-    open_at: cand.start.toISOString(), // 1er jour du trimestre
-    close_at: closeAt                   // fin de trimestre
-  }])
-  .select('id')
-  .maybeSingle();
+      // generate_at = J - planningLeadDays
+      const generateAt = addDaysUTC(cand.start, -planningLeadDays).toISOString();
+
+      // Créer la période (évite les NOT NULL)
+      const { data: insP, error: pErr } = await supa
+        .from('periods')
+        .insert([{
+          label:       cand.label,
+          open_at:     cand.start.toISOString(), // 1er jour du trimestre
+          close_at:    closeAt,                  // fin de trimestre
+          generate_at: generateAt,               // date de génération auto du planning
+        }])
+        .select('id')
+        .maybeSingle();
 
       if (pErr || !insP?.id) {
         return NextResponse.json({ error: pErr?.message || 'insert period failed' }, { status: 500 });
       }
       const period_id = String(insP.id);
 
-      // Générer les slots
+      // Générer les slots de la période
       const rows: SlotInsert[] = [];
       for (let d = new Date(cand.start); d <= cand.end; d = addDaysUTC(d, 1)) {
         const ymd = ymdUTC(d);
@@ -146,7 +167,7 @@ const { data: insP, error: pErr } = await supa
       }
 
       created = { period_id, label: cand.label, slots: rows.length };
-      break;
+      break; // on ne crée qu'une période par passage
     }
   }
 
