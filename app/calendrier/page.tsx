@@ -64,48 +64,50 @@ export default function CalendrierPage() {
 
   // --------- INIT ---------
   useEffect(() => {
-    (async () => {
-      setLoading(true);
-      setMsg(null);
+  (async () => {
+    setLoading(true);
+    setMsg(null);
 
-      // 1) Auth
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) { router.replace('/login'); return; }
-      setUserId(user.id);
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) { router.replace('/login'); return; }
+    setUserId(user.id);
 
-      // 2) S’assurer qu’un profil existe (IMPORTANT pour ton FK si availability.user_id -> profiles.user_id)
-      const { data: prof, error: pErr } = await supabase
-        .from('profiles')
-        .select('user_id, first_name, last_name, role')
-        .eq('user_id', user.id)
-        .maybeSingle();
+    // Profil requis : si incomplet -> redirection vers /check-in
+    const { data: prof, error: pErr } = await supabase
+      .from('profiles')
+      .select('first_name, last_name')
+      .eq('user_id', user.id)
+      .maybeSingle();
 
-      if (pErr) {
-        setMsg(`Erreur profil: ${pErr.message}`);
-        setLoading(false);
-        return;
-      }
+    if (pErr) { setMsg(`Erreur profil: ${pErr.message}`); setLoading(false); return; }
+    if (!prof || !prof.first_name || !prof.last_name) {
+      router.replace('/check-in');
+      return;
+    }
 
-      if (!prof) {
-        // crée un profil minimal pour satisfaire le FK
-        const { error: insErr } = await supabase.from('profiles').insert({
-          user_id: user.id,
-          first_name: null,
-          last_name: null,
-          role: 'doctor',
-        } as any);
-        if (insErr) {
-          setMsg(`Erreur création profil: ${insErr.message}`);
-          setLoading(false);
-          return;
-        }
-      } else {
-        // si prénom/nom manquants → on force la page Préférences
-        if (!prof.first_name || !prof.last_name) {
-          router.replace('/preferences?missing=1');
-          return;
-        }
-      }
+    // Périodes
+    const { data: periodsData, error: perr } = await supabase
+      .from('periods')
+      .select('id,label')
+      .order('open_at', { ascending: false });
+    if (perr) { setMsg(`Erreur périodes: ${perr.message}`); setLoading(false); return; }
+
+    const list = periodsData || [];
+    setPeriods(list);
+
+    const defId = list[0]?.id || '';
+    setPeriodId(defId);
+
+    if (defId) {
+      await Promise.all([
+        loadSlotsAndAvail(defId, user.id),
+        loadMonthStatus(defId, user.id),
+      ]);
+    }
+    setLoading(false);
+  })();
+}, [router]);
+
 
       // 3) Périodes
       const { data: periodsData, error: perr } = await supabase

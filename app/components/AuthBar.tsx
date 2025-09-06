@@ -12,69 +12,75 @@ const supabase = createClient(
 
 type Role = 'admin' | 'doctor' | null;
 
+type ProfileRow = {
+  first_name: string | null;
+  last_name: string | null;
+  role: Role;
+} | null;
+
 export default function AuthBar() {
-  const [email, setEmail] = useState<string | null>(null);
-  const [role, setRole] = useState<Role>(null);
-  const [loading, setLoading] = useState(true);
   const router = useRouter();
   const pathname = usePathname();
+
+  const [email, setEmail] = useState<string | null>(null);
+  const [role, setRole] = useState<Role>(null);
+  const [profile, setProfile] = useState<ProfileRow>(null);
+  const [loading, setLoading] = useState(true);
+
+  // Cache complètement la barre sur la route de check-in
+  if (pathname?.startsWith('/check-in')) return null;
 
   useEffect(() => {
     let mounted = true;
 
-    async function loadSessionAndRole() {
-      const { data } = await supabase.auth.getSession();
+    async function load() {
+      setLoading(true);
+
+      const { data: { session } } = await supabase.auth.getSession();
       if (!mounted) return;
 
-      const user = data.session?.user ?? null;
+      const user = session?.user ?? null;
       setEmail(user?.email ?? null);
 
       if (user?.id) {
-        // Lis le rôle depuis profiles (RLS: l'utilisateur peut lire sa propre ligne)
         const { data: prof } = await supabase
           .from('profiles')
-          .select('role')
+          .select('first_name, last_name, role')
           .eq('user_id', user.id)
           .maybeSingle();
+
+        setProfile(prof ?? null);
         setRole((prof?.role as Role) ?? 'doctor');
       } else {
+        setProfile(null);
         setRole(null);
       }
 
       setLoading(false);
     }
 
-    loadSessionAndRole();
+    load();
 
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, _session) => {
-      setEmail(_session?.user?.email ?? null);
-      // recharge le rôle à chaque changement d'auth
-      if (_session?.user?.id) {
-        supabase
-          .from('profiles')
-          .select('role')
-          .eq('user_id', _session.user.id)
-          .maybeSingle()
-          .then(({ data }) => setRole((data?.role as Role) ?? 'doctor'));
-      } else {
-        setRole(null);
-      }
+    const { data: subscription } = supabase.auth.onAuthStateChange(async () => {
+      await load();
       router.refresh();
     });
 
     return () => {
       mounted = false;
-      sub.subscription.unsubscribe();
+      subscription.subscription.unsubscribe();
     };
   }, [router]);
+
+  const incomplete = !!email && (!!profile?.first_name === false || !!profile?.last_name === false);
 
   async function handleLogout() {
     try {
       setLoading(true);
       await supabase.auth.signOut();
-      await fetch('/api/auth/signout', { method: 'POST' });
-      router.refresh();
+      await fetch('/api/auth/signout', { method: 'POST' }).catch(() => {});
       router.push('/');
+      router.refresh();
     } finally {
       setLoading(false);
     }
@@ -98,27 +104,48 @@ export default function AuthBar() {
     );
   };
 
+  // Construire le menu en fonction de l'état
+  const renderNav = () => {
+    if (!email) {
+      // Non connecté : pas de liens "app"
+      return null;
+    }
+
+    if (incomplete) {
+      // Profil incomplet : on ne laisse que l'accès aux préférences/check-in
+      return (
+        <nav className="flex items-center gap-2">
+          {navLink('/check-in', 'Mes préférences')}
+        </nav>
+      );
+    }
+
+    // Profil complet : liens normaux
+    return (
+      <nav className="flex items-center gap-2">
+        {navLink('/calendrier', 'Mes disponibilités')}
+        {navLink('/preferences', 'Mes préférences')}
+        {navLink('/agenda', 'Agenda MMG')}
+        {role === 'admin' && navLink('/admin', 'Admin')}
+      </nav>
+    );
+  };
+
   return (
     <header className="sticky top-0 z-50 w-full border-b border-zinc-800 bg-zinc-900/80 backdrop-blur">
       <div className="mx-auto max-w-7xl flex items-center justify-between px-3 py-2">
-        <nav className="flex items-center gap-2">
-          {navLink('/calendrier', 'Mes disponibilités')}
-          {navLink('/preferences', 'Mes préférences')}
-          {navLink('/agenda', 'Agenda MMG')}
-          {/* Lien Admin unique vers /admin (visible seulement pour role=admin) */}
-          {role === 'admin' && navLink('/admin', 'Admin')}
-        </nav>
+        {renderNav()}
 
         <div className="flex items-center gap-3">
           {loading ? (
             <div className="text-sm text-zinc-400">…</div>
           ) : !email ? (
-            <a
+            <Link
               href="/login"
               className="text-sm px-3 py-1.5 rounded-lg border border-zinc-700 text-zinc-200 hover:bg-white/5 hover:text-white"
             >
               Se connecter
-            </a>
+            </Link>
           ) : (
             <>
               <span className="text-sm text-zinc-400 hidden sm:inline">
