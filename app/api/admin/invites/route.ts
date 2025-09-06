@@ -103,8 +103,8 @@ function parseLineToContact(raw: string): { email: string; full_name?: string } 
 function guessFullNameFromEmail(email: string): string {
   const local = email.split('@')[0] || '';
   const cleaned = local
-    .replace(/[._-]+/g, ' ')  // jean.dupont -> "jean dupont"
-    .replace(/\d+/g, ' ')     // supprime les numéros
+    .replace(/[._-]+/g, ' ')
+    .replace(/\d+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
   if (!cleaned) return email;
@@ -132,8 +132,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'emails[] requis' }, { status: 400 });
     }
 
-    // Normalisation + extraction éventuelle du nom
-    // -> on garde la 1ère occurrence d'un email (avec son full_name si fourni)
+    // Normalisation + extraction du nom (on garde la 1ère occurrence d’un email)
     const map = new Map<string, { email: string; full_name?: string }>();
     for (const raw of emailsIn) {
       const contact = parseLineToContact(String(raw || ''));
@@ -162,10 +161,7 @@ export async function POST(req: NextRequest) {
 
     for (const { email, full_name } of contacts) {
       // A) déjà un compte ?
-      const { data: exUser, error: exErr } = await supabase.rpc(
-        'user_exists_by_email',
-        { in_email: email }
-      );
+      const { data: exUser, error: exErr } = await supabase.rpc('user_exists_by_email', { in_email: email });
       if (exErr) {
         results.push({ email, status: 'insert_failed', error: exErr.message });
         continue;
@@ -193,21 +189,19 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
-      // C) insérer (⚠️ full_name NOT NULL dans ton schéma)
+      // C) insérer (évite les colonnes optionnelles pour ne pas planter)
       const finalFullName = (full_name && full_name.trim()) || guessFullNameFromEmail(email);
-
       const { error: insErr } = await supabase
         .from('invites')
         .insert({
           email,
-          full_name: finalFullName,    // <-- IMPORTANT
+          full_name: finalFullName,   // ⚠️ NOT NULL dans ton schéma
           role,
           invited_by: adminUserId,
           status: 'pending',
-          invited_at: new Date().toISOString(), // si ta colonne existe, sinon enlève
+          // invited_at: new Date().toISOString(),     // <- décommente si tu as cette colonne
         } as any);
 
-      // 23505 = unique_violation (au cas où)
       if (insErr && (insErr as any).code !== '23505') {
         results.push({ email, status: 'insert_failed', error: insErr.message });
         continue;
@@ -215,47 +209,35 @@ export async function POST(req: NextRequest) {
 
       // D) envoyer l’invitation via l’Admin API (Magic Link d’invitation)
       try {
-        const { error: inviteErr } = await supabase.auth.admin.inviteUserByEmail(
-          email,
-          {
-            data: { role },
-            redirectTo: `${siteUrl}/auth/callback`,
-          }
-        );
+        const { error: inviteErr } = await supabase.auth.admin.inviteUserByEmail(email, {
+          data: { role },
+          redirectTo: `${siteUrl}/auth/callback`,
+        });
         if (inviteErr) {
           results.push({ email, status: 'invite_failed', error: inviteErr.message });
         } else {
           results.push({ email, status: 'invited' });
-          // (optionnel) MAJ status/last_sent_at si colonnes présentes
+          // MAJ "status" (sans toucher aux colonnes optionnelles)
           await supabase
             .from('invites')
-            .update({ status: 'sent', last_sent_at: new Date().toISOString() })
+            .update({ status: 'sent' /* , last_sent_at: new Date().toISOString() */ })
             .eq('email', email);
         }
       } catch (e: any) {
-        results.push({
-          email,
-          status: 'invite_failed',
-          error: e?.message ?? 'unknown error',
-        });
+        results.push({ email, status: 'invite_failed', error: e?.message ?? 'unknown error' });
       }
     }
 
     return NextResponse.json({
-      invited: results.filter((r) => r.status === 'invited').length,
-      already_registered: results.filter((r) => r.status === 'already_registered').length,
-      already_invited: results.filter((r) => r.status === 'already_invited').length,
-      already_accepted: results.filter((r) => r.status === 'already_accepted').length,
-      failed: results.filter(
-        (r) => r.status === 'invite_failed' || r.status === 'insert_failed'
-      ).length,
+      invited: results.filter(r => r.status === 'invited').length,
+      already_registered: results.filter(r => r.status === 'already_registered').length,
+      already_invited: results.filter(r => r.status === 'already_invited').length,
+      already_accepted: results.filter(r => r.status === 'already_accepted').length,
+      failed: results.filter(r => r.status === 'invite_failed' || r.status === 'insert_failed').length,
       results,
     });
   } catch (e: any) {
     console.error('[admin/invites]', e);
-    return NextResponse.json(
-      { error: e?.message ?? 'Server error' },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: e?.message ?? 'Server error' }, { status: 500 });
   }
 }
