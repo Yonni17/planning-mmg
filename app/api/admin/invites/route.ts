@@ -60,7 +60,7 @@ async function requireAdminOrResponse(req: NextRequest) {
 
 /* =========================
    GET  /api/admin/invites
-   Agrège : invites + users + profils + progression période
+   -> invites + comptes Auth (même sans invitation)
    ========================= */
 export async function GET(req: NextRequest) {
   const auth = await requireAdminOrResponse(req);
@@ -70,7 +70,7 @@ export async function GET(req: NextRequest) {
   try {
     const period_id = req.nextUrl.searchParams.get('period_id') ?? '';
 
-    // période courante (fallback: plus récente)
+    // Période courante ou passée en param
     let periodId = period_id;
     let periodLabel = '';
     if (!periodId) {
@@ -90,40 +90,46 @@ export async function GET(req: NextRequest) {
       periodLabel = p?.label ?? '';
     }
 
-    // invites : on prend * pour supporter tous schémas
+    // ---- Invites (toutes colonnes pour s'adapter à ton schéma)
     const { data: invites, error: invErr } = await supabase
       .from('invites')
       .select('*')
       .order('email', { ascending: true });
     if (invErr) return NextResponse.json({ error: invErr.message }, { status: 500 });
 
-    const emailSet = new Set<string>((invites ?? []).map(i => String((i as any).email).toLowerCase()));
+    const invitesByEmail = new Map<string, any>();
+    for (const i of invites ?? []) {
+      invitesByEmail.set(String((i as any).email).toLowerCase(), i);
+    }
 
-    // users (admin API) mappés par email
-    const usersByEmail = new Map<string, any>();
+    // ---- Tous les users Supabase Auth (pagination)
+    const allUsers: any[] = [];
     let page = 1;
     while (true) {
       const { data, error } = await supabase.auth.admin.listUsers({ page, perPage: 1000 });
       if (error) break;
       const batch = data?.users ?? [];
-      for (const u of batch) {
-        const e = (u.email || '').toLowerCase();
-        if (emailSet.has(e)) usersByEmail.set(e, u);
-      }
+      allUsers.push(...batch);
       if (batch.length < 1000) break;
       page++;
     }
 
-    // profils pour ces users
-    const userIds = Array.from(usersByEmail.values()).map((u: any) => u.id);
+    const usersByEmail = new Map<string, any>();
+    for (const u of allUsers) {
+      const e = (u.email || '').toLowerCase();
+      if (e) usersByEmail.set(e, u);
+    }
+
+    // ---- UIDs pour les profils + flags
+    const allUids = allUsers.map(u => u.id as string);
     const { data: profiles } = await supabase
       .from('profiles')
       .select('user_id, first_name, last_name, role')
-      .in('user_id', userIds.length ? userIds : ['_none_']);
+      .in('user_id', allUids.length ? allUids : ['_none_']);
     const profByUid = new Map<string, any>();
     for (const p of profiles ?? []) profByUid.set(p.user_id as string, p);
 
-    // mois de la période
+    // ---- Mois de la période
     const { data: slots } = await supabase
       .from('slots')
       .select('date')
@@ -132,12 +138,12 @@ export async function GET(req: NextRequest) {
     for (const s of slots ?? []) if ((s as any).date) monthsSet.add(String((s as any).date).slice(0, 7));
     const monthsTotal = Array.from(monthsSet).length;
 
-    // flags + mois validés
+    // ---- Flags + validations
     const { data: flags } = await supabase
       .from('doctor_period_flags')
       .select('user_id, all_validated, opted_out')
       .eq('period_id', periodId || '__none__')
-      .in('user_id', userIds.length ? userIds : ['_none_']);
+      .in('user_id', allUids.length ? allUids : ['_none_']);
     const flagsByUid = new Map<string, any>();
     for (const f of flags ?? []) flagsByUid.set((f as any).user_id as string, f);
 
@@ -145,7 +151,7 @@ export async function GET(req: NextRequest) {
       .from('doctor_period_months')
       .select('user_id, month, validated_at')
       .eq('period_id', periodId || '__none__')
-      .in('user_id', userIds.length ? userIds : ['_none_']);
+      .in('user_id', allUids.length ? allUids : ['_none_']);
     const validatedCountByUid = new Map<string, number>();
     for (const r of monthsRows ?? []) {
       if ((r as any).validated_at) {
@@ -154,8 +160,9 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    // assembler
-    const rows = (invites ?? []).map((invRaw) => {
+    // ---- Lignes pour les invites (avec user s’il existe)
+    const rows: any[] = [];
+    for (const invRaw of invites ?? []) {
       const inv = invRaw as any;
       const email = String(inv.email).toLowerCase();
       const user = usersByEmail.get(email);
@@ -164,11 +171,12 @@ export async function GET(req: NextRequest) {
       const f = uid ? flagsByUid.get(uid) : null;
       const validated = uid ? (validatedCountByUid.get(uid) ?? 0) : 0;
 
-      return {
+      rows.push({
+        source: 'invite',
         email,
         invite: {
           status: inv.status ?? 'pending',
-          invited_at: inv.created_at ?? inv.inserted_at ?? null, // tolère schémas différents
+          invited_at: inv.created_at ?? inv.inserted_at ?? null,
           accepted_at: inv.accepted_at ?? null,
           last_sent_at: inv.last_sent_at ?? null,
           revoked_at: inv.revoked_at ?? null,
@@ -194,8 +202,55 @@ export async function GET(req: NextRequest) {
           all_validated: !!f?.all_validated,
           opted_out: !!f?.opted_out,
         },
-      };
-    });
+      });
+    }
+
+    // ---- Lignes pour les users sans invite
+    for (const user of allUsers) {
+      const email = (user.email || '').toLowerCase();
+      if (!email || invitesByEmail.has(email)) continue; // déjà couvert
+
+      const uid = user.id as string;
+      const prof = profByUid.get(uid);
+      const f = flagsByUid.get(uid);
+      const validated = validatedCountByUid.get(uid) ?? 0;
+
+      rows.push({
+        source: 'user_only',
+        email,
+        invite: {
+          status: 'not_invited',
+          invited_at: null,
+          accepted_at: null,
+          last_sent_at: null,
+          revoked_at: null,
+          role: prof?.role ?? 'doctor',
+          full_name: prof ? `${prof.first_name ?? ''} ${prof.last_name ?? ''}`.trim() || null : null,
+        },
+        user: {
+          id: uid,
+          last_sign_in_at: user.last_sign_in_at ?? null,
+          confirmed_at: user.confirmed_at ?? user.email_confirmed_at ?? null,
+          created_at: user.created_at ?? null,
+        },
+        profile: prof ? {
+          first_name: prof.first_name ?? null,
+          last_name: prof.last_name ?? null,
+          role: prof.role ?? null,
+        } : null,
+        period: {
+          id: periodId || null,
+          label: periodLabel || null,
+          months_total: monthsTotal,
+          months_validated: validated,
+          all_validated: !!f?.all_validated,
+          opted_out: !!f?.opted_out,
+        },
+      });
+    }
+
+    // Tri par email
+    rows.sort((a, b) => (a.email < b.email ? -1 : a.email > b.email ? 1 : 0));
 
     return NextResponse.json({
       period: { id: periodId || null, label: periodLabel || null, months_total: monthsTotal },
@@ -208,7 +263,7 @@ export async function GET(req: NextRequest) {
   }
 }
 
-/** ---- POST: envoi d’invitations en lot (inchangé) ---- */
+/** ---- POST (inchangé) : envoyer des invitations en lot ---- */
 export async function POST(req: NextRequest) {
   try {
     const auth = await requireAdminOrResponse(req);
