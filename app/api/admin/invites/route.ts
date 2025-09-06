@@ -242,44 +242,39 @@ export async function POST(req: NextRequest) {
       if (existErr) { results.push({ email, status: 'insert_failed', error: existErr.message }); continue; }
       if (existing) { results.push({ email, status: (existing as any).accepted_at ? 'already_accepted' : 'already_invited' }); continue; }
 
-      // C) insert invite
-      const finalFullName = (full_name && full_name.trim()) || guessFullNameFromEmail(email);
-      const { error: insErr } = await supabase.from('invites').insert({
-        email,
-        full_name: finalFullName,
-        role,
-        invited_by: adminUserId,
-        status: 'pending',
-        invited_at: new Date().toISOString(),
-      } as any);
-      if (insErr && (insErr as any).code !== '23505') { results.push({ email, status: 'insert_failed', error: insErr.message }); continue; }
+    // ... dans la boucle for (const { email, full_name } of contacts) { ... }
 
-      // D) invite puis fallback magiclink
-      const { error: inviteErr } = await supabase.auth.admin.inviteUserByEmail(email, { data: { role }, redirectTo: `${siteUrl}/auth/callback` });
-      if (inviteErr) {
-        const { error: linkErr } = await supabase.auth.admin.generateLink({ type: 'magiclink', email, options: { redirectTo: `${siteUrl}/auth/callback` } });
-        if (linkErr) {
-          results.push({ email, status: 'invite_failed', error: linkErr.message });
-        } else {
-          results.push({ email, status: 'invited' });
-          await supabase.from('invites').update({ status: 'sent', last_sent_at: new Date().toISOString() }).eq('email', email);
-        }
-      } else {
-        results.push({ email, status: 'invited' });
-        await supabase.from('invites').update({ status: 'sent', last_sent_at: new Date().toISOString() }).eq('email', email);
-      }
-    }
+// C) insérer l'invite (comme avant)
+const finalFullName = (full_name && full_name.trim()) || guessFullNameFromEmail(email);
+const [firstFromFull, lastFromFull] = (() => {
+  const parts = finalFullName.split(' ').filter(Boolean);
+  return [parts[0] || '', parts.slice(1).join(' ') || ''];
+})();
 
-    return NextResponse.json({
-      invited: results.filter(r => r.status === 'invited').length,
-      already_registered: results.filter(r => r.status === 'already_registered').length,
-      already_invited: results.filter(r => r.status === 'already_invited').length,
-      already_accepted: results.filter(r => r.status === 'already_accepted').length,
-      failed: results.filter(r => r.status === 'invite_failed' || r.status === 'insert_failed').length,
-      results,
+// D) envoi via Admin API (NOUVEAU: on pousse aussi first_name/last_name/full_name)
+try {
+  const meta = {
+    role,
+    first_name: firstFromFull,
+    last_name: lastFromFull,
+    full_name: finalFullName,
+  };
+
+  const { data: inviteData, error: inviteErr } =
+    await supabase.auth.admin.inviteUserByEmail(email, {
+      data: meta,
+      redirectTo: `${siteUrl}/auth/callback`,
     });
-  } catch (e: any) {
-    console.error('[admin/invites POST]', e);
-    return NextResponse.json({ error: e?.message ?? 'Server error' }, { status: 500 });
+
+  if (inviteErr) {
+    results.push({ email, status: 'invite_failed', error: inviteErr.message });
+  } else {
+    results.push({ email, status: 'invited' });
+    await supabase
+      .from('invites')
+      .update({ status: 'sent', last_sent_at: new Date().toISOString() })
+      .eq('email', email);
   }
+} catch (e: any) {
+  results.push({ email, status: 'invite_failed', error: e?.message ?? 'unknown error' });
 }
