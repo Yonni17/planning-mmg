@@ -32,16 +32,11 @@ function getAccessTokenFromReq(req: NextRequest): string | null {
     if (!raw) return null;
 
     let txt = raw;
-    try {
-      txt = decodeURIComponent(raw);
-    } catch {}
+    try { txt = decodeURIComponent(raw); } catch {}
     const parsed = JSON.parse(txt);
     if (parsed?.access_token) return String(parsed.access_token);
-    if (parsed?.currentSession?.access_token)
-      return String(parsed.currentSession.access_token);
-  } catch {
-    // ignore
-  }
+    if (parsed?.currentSession?.access_token) return String(parsed.currentSession.access_token);
+  } catch {}
   return null;
 }
 
@@ -51,10 +46,7 @@ async function requireAdminOrResponse(req: NextRequest) {
   const token = getAccessTokenFromReq(req);
   if (!token) {
     return {
-      errorResponse: NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401 }
-      ),
+      errorResponse: NextResponse.json({ error: 'Unauthorized' }, { status: 401 }),
       supabase,
       userId: null as string | null,
     };
@@ -63,10 +55,7 @@ async function requireAdminOrResponse(req: NextRequest) {
   const { data: userData, error: uErr } = await supabase.auth.getUser(token);
   if (uErr || !userData?.user) {
     return {
-      errorResponse: NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401 }
-      ),
+      errorResponse: NextResponse.json({ error: 'Unauthorized' }, { status: 401 }),
       supabase,
       userId: null,
     };
@@ -76,10 +65,7 @@ async function requireAdminOrResponse(req: NextRequest) {
   const { data: isAdmin, error: aErr } = await supabase.rpc('is_admin', { uid });
   if (aErr || !isAdmin) {
     return {
-      errorResponse: NextResponse.json(
-        { error: 'Forbidden' },
-        { status: 403 }
-      ),
+      errorResponse: NextResponse.json({ error: 'Forbidden' }, { status: 403 }),
       supabase,
       userId: uid,
     };
@@ -88,7 +74,163 @@ async function requireAdminOrResponse(req: NextRequest) {
   return { errorResponse: null as NextResponse | null, supabase, userId: uid };
 }
 
-/** ---- Handler ---- */
+/* =========================
+   GET  /api/admin/invites
+   Agrège : invites + users + profils + progression période
+   Querystring: ?period_id=<id> (facultatif — prend la plus récente sinon)
+   ========================= */
+export async function GET(req: NextRequest) {
+  const auth = await requireAdminOrResponse(req);
+  if (auth.errorResponse) return auth.errorResponse;
+  const supabase = auth.supabase;
+
+  try {
+    const period_id = req.nextUrl.searchParams.get('period_id') ?? '';
+
+    // 1) période courante (fallback = plus récente par open_at)
+    let periodId = period_id;
+    let periodLabel = '';
+    if (!periodId) {
+      const { data: p } = await supabase
+        .from('periods')
+        .select('id,label')
+        .order('open_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (p?.id) { periodId = p.id; periodLabel = p.label ?? ''; }
+    } else {
+      const { data: p } = await supabase
+        .from('periods')
+        .select('label')
+        .eq('id', periodId)
+        .maybeSingle();
+      periodLabel = p?.label ?? '';
+    }
+
+    // 2) invites
+    const { data: invites, error: invErr } = await supabase
+      .from('invites')
+      .select('email, full_name, role, status, created_at, accepted_at, last_sent_at, revoked_at')
+      .order('created_at', { ascending: false });
+    if (invErr) return NextResponse.json({ error: invErr.message }, { status: 500 });
+
+    const emailSet = new Set<string>((invites ?? []).map(i => (i.email as string).toLowerCase()));
+
+    // 3) auth users (par pages) → map par email
+    const usersByEmail = new Map<string, any>();
+    let page = 1;
+    while (true) {
+      const { data, error } = await supabase.auth.admin.listUsers({ page, perPage: 1000 });
+      if (error) break;
+      const batch = data?.users ?? [];
+      for (const u of batch) {
+        const e = (u.email || '').toLowerCase();
+        if (emailSet.has(e)) usersByEmail.set(e, u);
+      }
+      if (batch.length < 1000) break;
+      page++;
+    }
+
+    // 4) profils pour les users trouvés
+    const userIds = Array.from(usersByEmail.values()).map((u: any) => u.id);
+    const { data: profiles } = await supabase
+      .from('profiles')
+      .select('user_id, first_name, last_name, role')
+      .in('user_id', userIds.length ? userIds : ['_none_']);
+
+    const profByUid = new Map<string, any>();
+    for (const p of profiles ?? []) profByUid.set(p.user_id as string, p);
+
+    // 5) mois de la période
+    const { data: slots } = await supabase
+      .from('slots')
+      .select('date')
+      .eq('period_id', periodId || '__none__');
+    const monthsSet = new Set<string>();
+    for (const s of slots ?? []) if (s.date) monthsSet.add(String(s.date).slice(0, 7));
+    const months = Array.from(monthsSet).sort();
+    const monthsTotal = months.length;
+
+    // 6) progression des utilisateurs pour la période (flags + mois)
+    const { data: flags } = await supabase
+      .from('doctor_period_flags')
+      .select('user_id, all_validated, opted_out')
+      .eq('period_id', periodId || '__none__')
+      .in('user_id', userIds.length ? userIds : ['_none_']);
+
+    const flagsByUid = new Map<string, any>();
+    for (const f of flags ?? []) flagsByUid.set(f.user_id as string, f);
+
+    const { data: monthsRows } = await supabase
+      .from('doctor_period_months')
+      .select('user_id, month, validated_at')
+      .eq('period_id', periodId || '__none__')
+      .in('user_id', userIds.length ? userIds : ['_none_']);
+
+    const validatedCountByUid = new Map<string, number>();
+    for (const r of monthsRows ?? []) {
+      const ok = !!r.validated_at;
+      if (ok) {
+        const u = r.user_id as string;
+        validatedCountByUid.set(u, 1 + (validatedCountByUid.get(u) ?? 0));
+      }
+    }
+
+    // 7) assembler
+    const rows = (invites ?? []).map((inv) => {
+      const email = (inv.email as string).toLowerCase();
+      const user = usersByEmail.get(email);
+      const uid = user?.id as string | undefined;
+
+      const prof = uid ? profByUid.get(uid) : null;
+      const f = uid ? flagsByUid.get(uid) : null;
+      const validated = uid ? (validatedCountByUid.get(uid) ?? 0) : 0;
+
+      return {
+        email,
+        invite: {
+          status: inv.status,
+          invited_at: inv.created_at,
+          accepted_at: inv.accepted_at,
+          last_sent_at: (inv as any).last_sent_at ?? null,
+          revoked_at: inv.revoked_at ?? null,
+          role: inv.role,
+          full_name: (inv as any).full_name ?? null,
+        },
+        user: user ? {
+          id: uid,
+          last_sign_in_at: user.last_sign_in_at ?? null,
+          confirmed_at: user.confirmed_at ?? user.email_confirmed_at ?? null,
+          created_at: user.created_at ?? null,
+        } : null,
+        profile: prof ? {
+          first_name: prof.first_name ?? null,
+          last_name: prof.last_name ?? null,
+          role: prof.role ?? null,
+        } : null,
+        period: {
+          id: periodId || null,
+          label: periodLabel || null,
+          months_total: monthsTotal,
+          months_validated: validated,
+          all_validated: !!f?.all_validated,
+          opted_out: !!f?.opted_out,
+        },
+      };
+    });
+
+    return NextResponse.json({
+      period: { id: periodId || null, label: periodLabel || null, months_total: monthsTotal },
+      count: rows.length,
+      rows,
+    });
+  } catch (e: any) {
+    console.error('[admin/invites GET]', e);
+    return NextResponse.json({ error: e?.message ?? 'Server error' }, { status: 500 });
+  }
+}
+
+/** ---- Handler POST: (envoi d’invitations en lot) ---- */
 export async function POST(req: NextRequest) {
   try {
     const auth = await requireAdminOrResponse(req);
@@ -143,7 +285,7 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
-      // B) déjà invité chez nous ?
+      // B) déjà invité ?
       const { data: existing, error: existErr } = await supabase
         .from('invites')
         .select('id, accepted_at, status')
@@ -163,18 +305,17 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
-      // C) insérer (protégé par unique constraint)
+      // C) insérer
       const { error: insErr } = await supabase
         .from('invites')
         .insert({ email, role, invited_by: adminUserId, status: 'pending' });
 
-      // 23505 = unique_violation
       if (insErr && (insErr as any).code !== '23505') {
         results.push({ email, status: 'insert_failed', error: insErr.message });
         continue;
       }
 
-      // D) envoyer l’invitation via l’Admin API (Magic Link d’invitation)
+      // D) envoyer l’invitation via Admin API
       try {
         const { error: inviteErr } = await supabase.auth.admin.inviteUserByEmail(
           email,
@@ -189,29 +330,21 @@ export async function POST(req: NextRequest) {
           results.push({ email, status: 'invited' });
         }
       } catch (e: any) {
-        results.push({
-          email,
-          status: 'invite_failed',
-          error: e?.message ?? 'unknown error',
-        });
+        results.push({ email, status: 'invite_failed', error: e?.message ?? 'unknown error' });
       }
     }
 
-    return NextResponse.json({
+    const summary = {
       invited: results.filter((r) => r.status === 'invited').length,
       already_registered: results.filter((r) => r.status === 'already_registered').length,
       already_invited: results.filter((r) => r.status === 'already_invited').length,
       already_accepted: results.filter((r) => r.status === 'already_accepted').length,
-      failed: results.filter(
-        (r) => r.status === 'invite_failed' || r.status === 'insert_failed'
-      ).length,
+      failed: results.filter((r) => r.status === 'invite_failed' || r.status === 'insert_failed').length,
       results,
-    });
+    };
+    return NextResponse.json(summary);
   } catch (e: any) {
-    console.error('[admin/invites]', e);
-    return NextResponse.json(
-      { error: e?.message ?? 'Server error' },
-      { status: 500 }
-    );
+    console.error('[admin/invites POST]', e);
+    return NextResponse.json({ error: e?.message ?? 'Server error' }, { status: 500 });
   }
 }
