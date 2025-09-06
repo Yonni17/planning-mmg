@@ -1,4 +1,3 @@
-// app/admin/invites/page.tsx
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
@@ -47,7 +46,9 @@ function fmt(d?: string | null) {
   if (!d) return '—';
   try {
     return new Date(d).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' });
-  } catch { return d; }
+  } catch {
+    return d;
+  }
 }
 
 // parse JSON sans planter si le serveur ne renvoie pas de JSON
@@ -60,9 +61,16 @@ async function parseJsonSafe(res: Response) {
   }
 }
 
+type ContactDraft = { first_name: string; last_name: string; email: string };
+
 export default function AdminInvitationsPage() {
   const [meEmail, setMeEmail] = useState<string | null>(null);
-  const [emailsText, setEmailsText] = useState('');
+
+  // --- Nouveaux états pour le formulaire 3 champs ---
+  const [firstName, setFirstName] = useState('');
+  const [lastName, setLastName] = useState('');
+  const [email, setEmail] = useState('');
+  const [drafts, setDrafts] = useState<ContactDraft[]>([]);
   const [sending, setSending] = useState(false);
 
   const [rows, setRows] = useState<Row[]>([]);
@@ -135,15 +143,47 @@ export default function AdminInvitationsPage() {
     );
   }, [rows, q]);
 
-  // --------- INVITE FORM ---------
-  // On laisse le back parser "Nom <email>" : on envoie juste chaque morceau non vide
-  const splitEntries = (txt: string) =>
-    txt.split(/[\n,;]+/).map(s => s.trim()).filter(Boolean);
+  // --------- INVITE FORM (3 champs) ---------
+  function resetInputs() {
+    setFirstName('');
+    setLastName('');
+    setEmail('');
+  }
+
+  function addDraft() {
+    const fn = firstName.trim();
+    const ln = lastName.trim();
+    const em = email.trim().toLowerCase();
+
+    if (!em) {
+      setMsg('Veuillez saisir un email.');
+      return;
+    }
+    if (!/^\S+@\S+\.\S+$/.test(em)) {
+      setMsg('Email invalide.');
+      return;
+    }
+    // prénom/nom facultatifs mais on conseille de remplir
+    const newItem: ContactDraft = { first_name: fn, last_name: ln, email: em };
+
+    // éviter les doublons par email
+    setDrafts((prev) => {
+      if (prev.some(d => d.email === em)) return prev;
+      return [...prev, newItem];
+    });
+    resetInputs();
+    setMsg(null);
+  }
+
+  function removeDraft(email: string) {
+    setDrafts(prev => prev.filter(d => d.email !== email));
+  }
 
   async function sendInvites() {
-    const entries = splitEntries(emailsText);
-    if (!entries.length) { setMsg('Veuillez saisir au moins un email.'); return; }
-
+    if (!drafts.length) {
+      setMsg('Ajoutez au moins une invitation.');
+      return;
+    }
     setSending(true);
     setMsg(null);
     try {
@@ -154,7 +194,16 @@ export default function AdminInvitationsPage() {
       const res = await fetch('/api/admin/invites', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ emails: entries, role: 'doctor' }),
+        body: JSON.stringify({
+          // nouveau format structuré
+          contacts: drafts.map(d => ({
+            first_name: d.first_name,
+            last_name: d.last_name,
+            email: d.email,
+            role: 'doctor',
+          })),
+          role: 'doctor',
+        }),
       });
       const json = await parseJsonSafe(res);
       if (!res.ok) {
@@ -162,7 +211,7 @@ export default function AdminInvitationsPage() {
         throw new Error(err);
       }
       setMsg(`✅ Invitations envoyées: ${(json as any).invited}, déjà invit.: ${(json as any).already_invited}, déjà inscrits: ${(json as any).already_registered}, échecs: ${(json as any).failed}`);
-      setEmailsText('');
+      setDrafts([]);
       await load(periodId || period?.id || undefined);
     } catch (e: any) {
       setMsg(`❌ ${e.message ?? 'Échec envoi'}`);
@@ -234,25 +283,85 @@ export default function AdminInvitationsPage() {
         </div>
       )}
 
-      {/* Formulaire envoi d'invitations */}
-      <div className="rounded-xl border border-zinc-700 bg-zinc-800/60 p-4 space-y-3">
-        <label className="block text-sm text-zinc-300">
-          Collez une liste d’entrées (emails simples ou <code>Nom {'<'}email{'>'}</code>), séparées par virgule / point-virgule / retour à la ligne :
-        </label>
-        <textarea
-          className="w-full min-h-36 rounded-lg border border-zinc-700 bg-zinc-900 text-zinc-100 p-3 placeholder-zinc-500"
-          placeholder={`Exemples :\nJean Dupont <jean.dupont@exemple.com>\nmarie@exemple.com, nicolas@exemple.com`}
-          value={emailsText}
-          onChange={(e) => setEmailsText(e.target.value)}
-        />
-        <div className="flex flex-wrap items-center gap-2 justify-between">
-          <div className="text-xs text-zinc-400">Un lien magique sera envoyé.</div>
+      {/* Formulaire envoi d'invitations — 3 champs + liste */}
+      <div className="rounded-xl border border-zinc-700 bg-zinc-800/60 p-4 space-y-4">
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+          <input
+            className="rounded-lg border border-zinc-700 bg-zinc-900 text-zinc-100 px-3 py-2"
+            placeholder="Prénom"
+            value={firstName}
+            onChange={(e) => setFirstName(e.target.value)}
+          />
+          <input
+            className="rounded-lg border border-zinc-700 bg-zinc-900 text-zinc-100 px-3 py-2"
+            placeholder="Nom"
+            value={lastName}
+            onChange={(e) => setLastName(e.target.value)}
+          />
+          <input
+            className="rounded-lg border border-zinc-700 bg-zinc-900 text-zinc-100 px-3 py-2 md:col-span-2"
+            placeholder="Email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+          />
+        </div>
+        <div className="flex items-center justify-between">
+          <div className="text-xs text-zinc-400">Ajoutez l’invité à la liste puis envoyez toutes les invitations.</div>
+          <div className="flex gap-2">
+            <button
+              onClick={addDraft}
+              className="px-3 py-1.5 rounded-lg border border-zinc-700 text-zinc-100 hover:bg-zinc-800"
+            >
+              Ajouter
+            </button>
+            <button
+              onClick={() => { setDrafts([]); resetInputs(); }}
+              className="px-3 py-1.5 rounded-lg border border-zinc-700 text-zinc-100 hover:bg-zinc-800"
+            >
+              Vider
+            </button>
+          </div>
+        </div>
+
+        {drafts.length > 0 && (
+          <div className="rounded-lg border border-zinc-700 overflow-hidden">
+            <table className="min-w-full text-sm">
+              <thead className="bg-zinc-900/60 text-zinc-300">
+                <tr>
+                  <th className="px-3 py-2 text-left">Prénom</th>
+                  <th className="px-3 py-2 text-left">Nom</th>
+                  <th className="px-3 py-2 text-left">Email</th>
+                  <th className="px-3 py-2"></th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-zinc-800 bg-zinc-900/30 text-zinc-200">
+                {drafts.map((d) => (
+                  <tr key={d.email}>
+                    <td className="px-3 py-2">{d.first_name || '—'}</td>
+                    <td className="px-3 py-2">{d.last_name || '—'}</td>
+                    <td className="px-3 py-2">{d.email}</td>
+                    <td className="px-3 py-2 text-right">
+                      <button
+                        onClick={() => removeDraft(d.email)}
+                        className="px-2 py-1 rounded border border-red-500 text-red-200 hover:bg-red-900/30 text-xs"
+                      >
+                        Retirer
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <div className="flex items-center justify-end">
           <button
             onClick={sendInvites}
-            disabled={sending}
+            disabled={sending || drafts.length === 0}
             className="px-4 py-2 rounded-lg border border-blue-500 text-white bg-blue-600 hover:bg-blue-500 disabled:opacity-50"
           >
-            {sending ? 'Envoi…' : 'Envoyer les invitations'}
+            {sending ? 'Envoi…' : `Envoyer ${drafts.length} invitation${drafts.length > 1 ? 's' : ''}`}
           </button>
         </div>
       </div>
@@ -343,15 +452,15 @@ export default function AdminInvitationsPage() {
                   <td className="px-3 py-2 align-top">
                     <div className={`inline-block px-2 py-0.5 rounded border text-xs ${statusBadge}`}>{r.invite.status}</div>
                     <div className="text-xs text-zinc-400 mt-1">
-                      Invité: {fmt(r.invite.invited_at)}<br/>
-                      Accepté: {fmt(r.invite.accepted_at)}<br/>
+                      Invité: {fmt(r.invite.invited_at)}<br />
+                      Accepté: {fmt(r.invite.accepted_at)}<br />
                       Dernier envoi: {fmt(r.invite.last_sent_at)}
                     </div>
                   </td>
                   <td className="px-3 py-2 align-top">
                     <div className="text-xs text-zinc-300">
-                      Créé: {fmt(r.user?.created_at)}<br/>
-                      Confirmé: {fmt(r.user?.confirmed_at)}<br/>
+                      Créé: {fmt(r.user?.created_at)}<br />
+                      Confirmé: {fmt(r.user?.confirmed_at)}<br />
                       Dernière connexion: <span className={r.user?.last_sign_in_at ? 'text-emerald-300' : 'text-zinc-400'}>{fmt(r.user?.last_sign_in_at)}</span>
                     </div>
                   </td>

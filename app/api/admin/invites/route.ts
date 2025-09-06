@@ -171,7 +171,6 @@ export async function GET(req: NextRequest) {
     if (invErr) throw invErr;
 
     // Users (Auth)
-    // On liste raisonnablement (perPage 1000). Suffisant pour ton usage.
     const usersRes = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 });
     const users = usersRes?.data?.users ?? [];
 
@@ -206,7 +205,7 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    // Flags période (all_validated / opted_out) par user_id
+    // Flags période
     const { data: flags, error: fErr } = await supabase
       .from('doctor_period_flags')
       .select('user_id, all_validated, opted_out')
@@ -220,7 +219,7 @@ export async function GET(req: NextRequest) {
       });
     }
 
-    // Compte des mois validés (validated_at non null)
+    // Compte des mois validés
     const { data: months, error: mErr } = await supabase
       .from('doctor_period_months')
       .select('user_id, validated_at')
@@ -347,7 +346,28 @@ export async function POST(req: NextRequest) {
         continue;
       }
       if (exUser === true) {
-        results.push({ email, status: 'already_registered' });
+        // Déjà user → envoyer un magic link (fallback auto)
+        const { data: linkData, error: linkErr } = await supabase.auth.admin.generateLink({
+          type: 'magiclink',
+          email,
+          options: { redirectTo: `${siteUrl}/auth/callback` },
+        });
+        if (linkErr) {
+          results.push({ email, status: 'invite_failed', error: linkErr.message });
+        } else {
+          results.push({ email, status: 'invited' });
+          await supabase
+            .from('invites')
+            .upsert({
+              email,
+              full_name: (full_name && full_name.trim()) || guessFullNameFromEmail(email),
+              role,
+              invited_by: adminUserId,
+              status: 'sent',
+              last_sent_at: new Date().toISOString(),
+              invited_at: new Date().toISOString(),
+            } as any, { onConflict: 'email' });
+        }
         continue;
       }
 
@@ -362,14 +382,15 @@ export async function POST(req: NextRequest) {
         continue;
       }
       if (existing) {
-        results.push({
-          email,
-          status: (existing as any).accepted_at ? 'already_accepted' : 'already_invited',
-        });
+        if ((existing as any).accepted_at) {
+          results.push({ email, status: 'already_accepted' });
+        } else {
+          results.push({ email, status: 'already_invited' });
+        }
         continue;
       }
 
-      // C) insérer (⚠️ full_name NOT NULL si ton schéma l’exige)
+      // C) insérer invite (assure-toi que les colonnes existent)
       const finalFullName = (full_name && full_name.trim()) || guessFullNameFromEmail(email);
 
       const { error: insErr } = await supabase
@@ -380,7 +401,7 @@ export async function POST(req: NextRequest) {
           role,
           invited_by: adminUserId,
           status: 'pending',
-          invited_at: new Date().toISOString(), // enlève si ta colonne n’existe pas
+          invited_at: new Date().toISOString(),
         } as any);
 
       if (insErr && (insErr as any).code !== '23505') {
@@ -390,15 +411,32 @@ export async function POST(req: NextRequest) {
 
       // D) envoi via Admin API
       try {
+        // 1) tentative d'invite "classique"
         const { error: inviteErr } = await supabase.auth.admin.inviteUserByEmail(
           email,
           { data: { role }, redirectTo: `${siteUrl}/auth/callback` }
         );
+
         if (inviteErr) {
-          results.push({ email, status: 'invite_failed', error: inviteErr.message });
+          // Cas fréquent: user déjà créé → fallback magic link
+          const { data: linkData, error: linkErr } = await supabase.auth.admin.generateLink({
+            type: 'magiclink',
+            email,
+            options: { redirectTo: `${siteUrl}/auth/callback` },
+          });
+
+          if (linkErr) {
+            results.push({ email, status: 'invite_failed', error: linkErr.message });
+          } else {
+            results.push({ email, status: 'invited' });
+            await supabase
+              .from('invites')
+              .update({ status: 'sent', last_sent_at: new Date().toISOString() })
+              .eq('email', email);
+          }
         } else {
+          // Invite OK (premier envoi)
           results.push({ email, status: 'invited' });
-          // MAJ status/last_sent_at si colonnes présentes
           await supabase
             .from('invites')
             .update({ status: 'sent', last_sent_at: new Date().toISOString() })
@@ -411,7 +449,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       invited: results.filter((r) => r.status === 'invited').length,
-      already_registered: results.filter((r) => r.status === 'already_registered').length,
+      already_registered: results.filter((r) => r.status === 'already_registered').length, // (rare ici car on gère en fallback)
       already_invited: results.filter((r) => r.status === 'already_invited').length,
       already_accepted: results.filter((r) => r.status === 'already_accepted').length,
       failed: results.filter((r) => r.status === 'invite_failed' || r.status === 'insert_failed').length,
