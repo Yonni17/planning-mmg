@@ -1,13 +1,13 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { supabase } from '@/lib/supabase';
 import { useRouter } from 'next/navigation';
 
 type Slot = {
   id: string;
   period_id: string;
-  date: string;      // YYYY-MM-DD (locale)
+  date: string;      // YYYY-MM-DD
   start_ts: string;
   end_ts: string;
   kind: 'WEEKDAY_20_00'|'SAT_12_18'|'SAT_18_00'|'SUN_08_14'|'SUN_14_20'|'SUN_20_24';
@@ -52,55 +52,39 @@ export default function CalendrierPage() {
   const [availability, setAvailability] = useState<Record<string, boolean>>({});
   const [monthStatus, setMonthStatus] = useState<Record<string, MonthStatus>>({});
   const [viewMonth, setViewMonth] = useState<Date | null>(null);
-  const [msg, setMsg] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // --- sheet (menu des heures) ---
-  const [sheetOpen, setSheetOpen] = useState(false);
-  const [sheetDate, setSheetDate] = useState<Date | null>(null);
-
-  // -- petit buffer pour "sauvegarder maintenant" en lot (mobile)
-  const [dirtyIds, setDirtyIds] = useState<Set<string>>(new Set());
+  // autosave silencieux (debounce)
+  const debounceRef = useRef<number | null>(null);
+  const pendingIdsRef = useRef<Set<string>>(new Set()); // set des slot_id modifiés depuis la dernière save
 
   // --------- INIT ---------
   useEffect(() => {
     (async () => {
       setLoading(true);
-      setMsg(null);
 
       // 1) Auth
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) { router.replace('/login'); return; }
       setUserId(user.id);
 
-      // 2) S’assurer qu’un profil existe (IMPORTANT pour ton FK si availability.user_id -> profiles.user_id)
-      const { data: prof, error: pErr } = await supabase
+      // 2) S’assurer qu’un profil existe (FK éventuel)
+      const { data: prof } = await supabase
         .from('profiles')
         .select('user_id, first_name, last_name, role')
         .eq('user_id', user.id)
         .maybeSingle();
 
-      if (pErr) {
-        setMsg(`Erreur profil: ${pErr.message}`);
-        setLoading(false);
-        return;
-      }
-
       if (!prof) {
-        // crée un profil minimal pour satisfaire le FK
-        const { error: insErr } = await supabase.from('profiles').insert({
+        // crée un profil minimal silencieusement (aucun message UI)
+        await supabase.from('profiles').insert({
           user_id: user.id,
           first_name: null,
           last_name: null,
           role: 'doctor',
         } as any);
-        if (insErr) {
-          setMsg(`Erreur création profil: ${insErr.message}`);
-          setLoading(false);
-          return;
-        }
       } else {
-        // si prénom/nom manquants → on force la page Préférences
+        // si prénom/nom manquants → on force la complétion d’identité
         if (!prof.first_name || !prof.last_name) {
           router.replace('/preferences?missing=1');
           return;
@@ -112,7 +96,7 @@ export default function CalendrierPage() {
         .from('periods')
         .select('id,label')
         .order('open_at', { ascending: false });
-      if (perr) { setMsg(`Erreur périodes: ${perr.message}`); setLoading(false); return; }
+      if (perr) { setLoading(false); return; }
 
       const list = periodsData || [];
       setPeriods(list);
@@ -132,14 +116,12 @@ export default function CalendrierPage() {
 
   // --------- LOADERS ---------
   const loadSlotsAndAvail = async (pid: string, uid: string) => {
-    setMsg(null);
-
-    const { data: slotsData, error: sErr } = await supabase
+    const { data: slotsData } = await supabase
       .from('slots')
       .select('id, period_id, date, start_ts, end_ts, kind')
       .eq('period_id', pid)
       .order('start_ts', { ascending: true });
-    if (sErr) { setMsg(`Erreur slots: ${sErr.message}`); return; }
+
     const sList = (slotsData || []) as Slot[];
     setSlots(sList);
 
@@ -148,31 +130,31 @@ export default function CalendrierPage() {
       setViewMonth(new Date(d0.getFullYear(), d0.getMonth(), 1));
     }
 
-    // toutes les dispos de l’utilisateur
-    const { data: avData, error: aErr } = await supabase
+    const { data: avData } = await supabase
       .from('availability')
       .select('slot_id, available')
       .eq('user_id', uid);
-    if (aErr) { setMsg(`Erreur availability: ${aErr.message}`); return; }
+
     const map: Record<string, boolean> = {};
-    for (const row of avData || []) map[row.slot_id as string] = !!row.available;
+    for (const row of avData || []) map[(row as any).slot_id as string] = !!(row as any).available;
     setAvailability(map);
-    setDirtyIds(new Set());
+
+    pendingIdsRef.current = new Set();
   };
 
   const loadMonthStatus = async (pid: string, uid: string) => {
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from('doctor_period_months')
       .select('month, validated_at, locked, opted_out')
       .eq('user_id', uid)
       .eq('period_id', pid);
-    if (error) { setMsg(`Erreur statut mois: ${error.message}`); return; }
+
     const m: Record<string, MonthStatus> = {};
     for (const row of data || []) {
-      m[row.month as string] = {
-        validated_at: row.validated_at as string | null,
-        locked: !!row.locked,
-        opted_out: (row.opted_out as boolean | null) ?? null,
+      m[(row as any).month as string] = {
+        validated_at: (row as any).validated_at as string | null,
+        locked: !!(row as any).locked,
+        opted_out: ((row as any).opted_out as boolean | null) ?? null,
       };
     }
     setMonthStatus(m);
@@ -211,32 +193,57 @@ export default function CalendrierPage() {
 
   const currentMonthKey = useMemo(() => viewMonth ? yyyymm(viewMonth) : '', [viewMonth]);
 
-  // --------- ACTIONS ---------
-  const toggleLocal = (slotId: string) => {
-    const next = !availability[slotId];
-    setAvailability(prev => ({ ...prev, [slotId]: next }));
-    setDirtyIds(prev => new Set(prev).add(slotId));
-  };
+  // --------- AUTOSAVE (debounce) ---------
+  const flushSave = async () => {
+    if (!userId) return;
+    const ids = Array.from(pendingIdsRef.current);
+    if (ids.length === 0) return;
 
-  const saveDirty = async () => {
-    if (!userId || dirtyIds.size === 0) return;
-    const payload = Array.from(dirtyIds).map(slot_id => ({
+    // snapshot changes
+    const payload = ids.map(slot_id => ({
       user_id: userId,
       slot_id,
       available: !!availability[slot_id],
     }));
 
-    const { error } = await supabase.from('availability').upsert(payload);
-    if (error) setMsg(`❌ Sauvegarde: ${error.message}`);
-    else {
-      setMsg('✅ Modifications sauvegardées.');
-      setDirtyIds(new Set());
+    // on tente la sauvegarde ; en cas d’échec on rollback localement
+    try {
+      const { error } = await supabase.from('availability').upsert(payload);
+      if (error) throw error;
+
+      pendingIdsRef.current = new Set(); // ok
+    } catch {
+      // rollback silencieux
+      setAvailability(prev => {
+        const copy = { ...prev };
+        for (const slot_id of ids) {
+          copy[slot_id] = !copy[slot_id];
+        }
+        return copy;
+      });
+      pendingIdsRef.current = new Set(); // reset quand même
     }
+  };
+
+  const scheduleSave = () => {
+    if (debounceRef.current) window.clearTimeout(debounceRef.current);
+    debounceRef.current = window.setTimeout(flushSave, 500);
+  };
+
+  // --------- ACTIONS ---------
+  const toggleLocal = (slotId: string, locked: boolean) => {
+    if (locked) return; // si mois verrouillé : pas de modif
+    setAvailability(prev => {
+      const next = { ...prev, [slotId]: !prev[slotId] };
+      return next;
+    });
+    pendingIdsRef.current.add(slotId);
+    scheduleSave();
   };
 
   const validateMonth = async (mKey: string) => {
     if (!userId || !periodId) return;
-    const { error } = await supabase
+    await supabase
       .from('doctor_period_months')
       .upsert({
         user_id: userId,
@@ -246,16 +253,14 @@ export default function CalendrierPage() {
         validated_at: new Date().toISOString(),
         opted_out: false,
       }, { onConflict: 'user_id,period_id,month' });
-    if (error) { setMsg(`❌ Validation: ${error.message}`); return; }
     await loadMonthStatus(periodId, userId);
-    setMsg('✅ Mois validé.');
   };
 
   const unlockMonth = async (mKey: string) => {
     if (!userId || !periodId) return;
     const ok = confirm('Déverrouiller ce mois pour modifier vos disponibilités ?');
     if (!ok) return;
-    const { error } = await supabase
+    await supabase
       .from('doctor_period_months')
       .upsert({
         user_id: userId,
@@ -264,77 +269,11 @@ export default function CalendrierPage() {
         locked: false,
         validated_at: null,
       }, { onConflict: 'user_id,period_id,month' });
-    if (error) { setMsg(`❌ Déverrouillage: ${error.message}`); return; }
     await loadMonthStatus(periodId, userId);
-    setMsg('🔓 Mois déverrouillé.');
   };
-
-  // --------- SHEET helpers ---------
-  const openDay = (d: Date) => { setSheetDate(d); setSheetOpen(true); };
-  const closeSheet = () => setSheetOpen(false);
 
   // --------- RENDER ---------
   if (loading) return <p>Chargement…</p>;
-
-  const DaySheet = () => {
-    if (!sheetOpen || !sheetDate) return null;
-    const k = ymdLocal(sheetDate);
-    const daySlots = slotsByDate[k] || [];
-    const mKey = yyyymm(sheetDate);
-    const locked = !!monthStatus[mKey]?.locked;
-
-    return (
-      <div className="fixed inset-0 z-50">
-        {/* backdrop */}
-        <div className="absolute inset-0 bg-black/60" onClick={closeSheet} />
-        {/* panel */}
-        <div className="absolute inset-x-0 bottom-0 rounded-t-2xl overflow-hidden shadow-xl">
-          {/* Header mieux contrasté */}
-          <div className="flex items-center justify-between px-4 py-3 bg-zinc-900 text-zinc-100">
-            <div className="text-sm font-medium">
-              {sheetDate.toLocaleDateString('fr-FR', { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric' })}
-            </div>
-            <button onClick={closeSheet} className="px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100 text-sm">
-              Fermer
-            </button>
-          </div>
-
-          <div className="bg-zinc-950 p-3 space-y-2">
-            {daySlots.length === 0 ? (
-              <div className="text-sm text-zinc-400 py-6 text-center">Aucun créneau ce jour.</div>
-            ) : daySlots.map(s => {
-              const on = !!availability[s.id];
-              const btnCls = locked
-                ? (on ? 'bg-emerald-700 text-white cursor-not-allowed' : 'bg-zinc-800 text-zinc-400 cursor-not-allowed')
-                : (on ? 'bg-emerald-600 text-white' : 'bg-zinc-800 text-zinc-100 hover:bg-zinc-700');
-              return (
-                <button
-                  key={s.id}
-                  disabled={locked}
-                  onClick={() => toggleLocal(s.id)}
-                  className={`w-full text-left px-4 py-3 rounded-lg ${btnCls}`}
-                  title={KIND_LABEL[s.kind]}
-                >
-                  {KIND_LABEL[s.kind]}
-                </button>
-              );
-            })}
-
-            {/* CTA sauvegarde */}
-            <div className="pt-2">
-              <button
-                onClick={saveDirty}
-                disabled={dirtyIds.size === 0}
-                className="w-full px-4 py-3 rounded-lg bg-emerald-600 text-white disabled:opacity-60"
-              >
-                Enregistrer maintenant {dirtyIds.size > 0 ? `(${dirtyIds.size} modifs)` : ''}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  };
 
   return (
     <div className="space-y-4">
@@ -384,12 +323,12 @@ export default function CalendrierPage() {
           );
         })}
 
-        {/* Actions mois courant */}
+        {/* Actions mois courant (silencieuses) */}
         {!!currentMonthKey && (
           <div className="ml-auto flex items-center gap-2">
             {monthStatus[currentMonthKey]?.locked ? (
               <>
-                <span className="text-sm text-green-700">Ce mois est validé ✅</span>
+                <span className="text-sm text-green-700">Mois validé</span>
                 <button
                   className="px-3 py-1.5 rounded border border-zinc-300 hover:bg-zinc-50"
                   onClick={() => unlockMonth(currentMonthKey)}
@@ -399,7 +338,7 @@ export default function CalendrierPage() {
               </>
             ) : (
               <>
-                <span className="text-sm text-red-700">Ce mois n’est pas validé</span>
+                <span className="text-sm text-red-700">Mois à valider</span>
                 <button
                   className="px-3 py-1.5 rounded border border-emerald-300 text-emerald-900 bg-emerald-50 hover:bg-emerald-100"
                   onClick={() => validateMonth(currentMonthKey)}
@@ -412,13 +351,7 @@ export default function CalendrierPage() {
         )}
       </div>
 
-      {msg && (
-        <div className={`p-3 rounded border ${msg.startsWith('❌') ? 'bg-red-50 border-red-200 text-red-900' : 'bg-gray-50 border-gray-200 text-gray-800'}`}>
-          {msg}
-        </div>
-      )}
-
-      {/* Grille mensuelle */}
+      {/* Grille mensuelle : clic direct = toggle (pas de sheet, pas de bandeau) */}
       <div className="grid grid-cols-7 gap-2">
         {['Lun','Mar','Mer','Jeu','Ven','Sam','Dim'].map(w => (
           <div key={w} className="text-center text-xs uppercase tracking-wide text-gray-500">{w}</div>
@@ -433,13 +366,10 @@ export default function CalendrierPage() {
           const mKey = yyyymm(d);
           const locked = !!monthStatus[mKey]?.locked;
 
-          // 👉 Toute la tuile devient cliquable pour ouvrir le menu des heures
           return (
-            <button
+            <div
               key={i}
-              type="button"
-              onClick={() => openDay(d)}
-              className="h-32 rounded-2xl border border-gray-200 overflow-hidden bg-white shadow-sm text-left focus:outline-none focus:ring-2 focus:ring-emerald-400"
+              className="h-32 rounded-2xl border border-gray-200 overflow-hidden bg-white shadow-sm text-left"
             >
               <div className="px-2 pt-2 pb-1 text-sm font-medium text-gray-700 flex items-center justify-between">
                 <span>{dayNum}</span>
@@ -448,43 +378,35 @@ export default function CalendrierPage() {
                 </span>
               </div>
 
-              <div className="flex flex-col h-[calc(100%-2rem)] pointer-events-none">
+              <div className="flex flex-col h-[calc(100%-2rem)]">
                 {daySlots.length === 0 ? (
                   <div className="flex-1 text-xs px-2 text-gray-400 flex items-center justify-center">Aucun créneau</div>
                 ) : daySlots.map((s) => {
                   const on = !!availability[s.id];
-                  const onCls  = locked ? 'bg-green-600 text-white' : 'bg-green-500 text-white';
-                  const offCls = 'bg-white text-gray-500';
-                  const cellClass  = on ? onCls : offCls;
+                  const cellClass = on
+                    ? (locked ? 'bg-emerald-700 text-white' : 'bg-emerald-600 text-white hover:bg-emerald-500')
+                    : (locked ? 'bg-zinc-200 text-zinc-500' : 'bg-zinc-100 text-zinc-600 hover:bg-zinc-200');
+
                   return (
-                    <div
+                    <button
                       key={s.id}
+                      type="button"
+                      disabled={locked}
+                      onClick={() => toggleLocal(s.id, locked)}
                       className={`flex-1 text-[11px] px-2 border-t first:border-t-0 ${cellClass} flex items-center justify-center`}
                       title={KIND_LABEL[s.kind]}
                     >
                       {KIND_LABEL[s.kind]}
-                    </div>
+                    </button>
                   );
                 })}
               </div>
-            </button>
+            </div>
           );
         })}
       </div>
 
-      {/* Bouton global sauvegarde (utile desktop aussi) */}
-      <div className="sticky bottom-3">
-        <button
-          onClick={saveDirty}
-          disabled={dirtyIds.size === 0}
-          className="w-full px-4 py-3 rounded-xl bg-emerald-600 text-white shadow disabled:opacity-60"
-        >
-          Enregistrer maintenant {dirtyIds.size > 0 ? `(${dirtyIds.size} modifs)` : ''}
-        </button>
-      </div>
-
-      {/* Drawer mobile */}
-      <DaySheet />
+      {/* Pas de bouton “Enregistrer” ni de bandeau : tout est auto-sauvé en silence */}
     </div>
   );
 }
