@@ -1,6 +1,7 @@
+// app/calendrier/page.tsx
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { supabase } from '@/lib/supabase';
 import { useRouter } from 'next/navigation';
 
@@ -12,7 +13,6 @@ type Slot = {
   end_ts: string;
   kind: 'WEEKDAY_20_00'|'SAT_12_18'|'SAT_18_00'|'SUN_08_14'|'SUN_14_20'|'SUN_20_24';
 };
-
 type Period = { id: string; label: string };
 
 type MonthStatus = {
@@ -47,6 +47,13 @@ export default function CalendrierPage() {
   const [viewMonth, setViewMonth] = useState<Date | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+
+  // --- état pour le "batch + debounce" ---
+  const [pending, setPending] = useState<Record<string, boolean>>({});
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // --- bottom sheet (mobile) ---
+  const [openDay, setOpenDay] = useState<string | null>(null); // YYYY-MM-DD
 
   // --------- INIT ---------
   useEffect(() => {
@@ -96,7 +103,7 @@ export default function CalendrierPage() {
       setViewMonth(new Date(d0.getFullYear(), d0.getMonth(), 1));
     }
 
-    // On récupère toutes les dispos de l'utilisateur (toutes périodes confondues) — simple & robuste
+    // Toutes les dispos de l'utilisateur
     const { data: avData, error: aErr } = await supabase
       .from('availability')
       .select('slot_id, available')
@@ -156,32 +163,55 @@ export default function CalendrierPage() {
     return map;
   }, [slots]);
 
-  // ⚠️ Hook calculé AVANT tout return (sinon warning React)
   const currentMonthKey = useMemo(() => viewMonth ? yyyymm(viewMonth) : '', [viewMonth]);
 
-  // --------- ACTIONS ---------
-  const toggle = async (slotId: string) => {
+  // --------- BATCH SAVE (debounce 800ms) ---------
+  const flushPending = async () => {
     if (!userId) return;
+    const entries = Object.entries(pending);
+    if (entries.length === 0) return;
 
-    // Trouver le mois du slot
+    try {
+      const rows = entries.map(([slot_id, available]) => ({
+        user_id: userId!,
+        slot_id,
+        available,
+      }));
+      const { error } = await supabase.from('availability').upsert(rows);
+      if (error) throw error;
+      setPending({});
+      setMsg('✔️ Modifications enregistrées.');
+    } catch (e: any) {
+      setMsg(`❌ Sauvegarde: ${e.message ?? e}`);
+    }
+  };
+
+  // déclenchement auto après 800ms sans nouveau clic
+  useEffect(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (Object.keys(pending).length === 0) return;
+    debounceRef.current = setTimeout(() => { flushPending(); }, 800);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [JSON.stringify(pending)]);
+
+  // --------- ACTIONS ---------
+  const toggleLocal = (slotId: string, target?: boolean) => {
+    // trouve le mois du slot → si verrouillé, on bloque
     const slot = slots.find(s => s.id === slotId);
     if (!slot) return;
     const mKey = yyyymm(new Date(slot.date + 'T00:00:00'));
-    const st = monthStatus[mKey];
-
-    if (st?.locked) {
-      alert('Ce mois est validé et verrouillé. Déverrouillez-le pour modifier vos disponibilités.');
+    if (monthStatus[mKey]?.locked) {
+      alert('Ce mois est validé. Déverrouillez-le pour modifier vos disponibilités.');
       return;
     }
 
-    const next = !availability[slotId];
-    setAvailability(prev => ({ ...prev, [slotId]: next }));
-
-    const { error } = await supabase
-      .from('availability')
-      .upsert({ user_id: userId, slot_id: slotId, available: next });
-    if (error) setMsg(`❌ Sauvegarde: ${error.message}`);
-    else setMsg(null);
+    setAvailability(prev => {
+      const nextVal = target ?? !prev[slotId];
+      const next = { ...prev, [slotId]: nextVal };
+      // marque comme "à envoyer"
+      setPending(p => ({ ...p, [slotId]: nextVal }));
+      return next;
+    });
   };
 
   const validateMonth = async (mKey: string) => {
@@ -223,8 +253,10 @@ export default function CalendrierPage() {
   // --------- RENDER ---------
   if (loading) return <p>Chargement…</p>;
 
+  const pendingCount = Object.keys(pending).length;
+
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 pb-[calc(env(safe-area-inset-bottom)+64px)]">
       <h1 className="text-xl font-semibold">Mes disponibilités</h1>
 
       {/* Sélecteurs période & mois */}
@@ -306,13 +338,15 @@ export default function CalendrierPage() {
       )}
 
       {/* Grille mensuelle */}
-      <div className="grid grid-cols-7 gap-2">
+      <div className="grid grid-cols-7 gap-2 md:gap-3">
         {['Lun','Mar','Mer','Jeu','Ven','Sam','Dim'].map(w => (
           <div key={w} className="text-center text-xs uppercase tracking-wide text-gray-500">{w}</div>
         ))}
 
         {daysOfMonth.map((d, i) => {
-          if (!d) return <div key={i} className="h-32 rounded-xl border border-dashed border-gray-200 bg-gray-50" />;
+          if (!d) return (
+            <div key={i} className="h-24 md:h-32 rounded-xl border border-dashed border-gray-200 bg-gray-50" />
+          );
 
           const key = ymdLocal(d);
           const daySlots = slotsByDate[key] || [];
@@ -320,23 +354,33 @@ export default function CalendrierPage() {
           const mKey = yyyymm(d);
           const locked = !!monthStatus[mKey]?.locked;
 
-          return (
-            <div key={i} className="h-32 rounded-2xl border border-gray-200 overflow-hidden bg-white shadow-sm">
-              <div className="px-2 pt-2 pb-1 text-sm font-medium text-gray-700 flex items-center justify-between">
-                <span>{dayNum}</span>
-                <span className="text-xs text-gray-400">
-                  {d.toLocaleDateString('fr-FR', { weekday: 'short' })}
-                </span>
-              </div>
+          // sur mobile : toucher la carte ouvre la bottom-sheet
+          const openSheet = () => {
+            if (daySlots.length === 0) return;
+            setOpenDay(key);
+          };
 
-              <div className="flex flex-col h-[calc(100%-2rem)]">
+          return (
+            <div
+              key={i}
+              className="h-24 md:h-32 rounded-2xl border border-gray-200 overflow-hidden bg-white shadow-sm"
+            >
+              <button
+                onClick={openSheet}
+                className="px-2 pt-2 pb-1 text-sm font-medium text-gray-700 w-full flex items-center justify-between md:cursor-default"
+              >
+                <span>{dayNum}</span>
+                <span className="text-xs text-gray-400">{d.toLocaleDateString('fr-FR', { weekday: 'short' })}</span>
+              </button>
+
+              {/* desktop: boutons directement cliquables */}
+              <div className="hidden md:flex flex-col h-[calc(100%-2rem)]">
                 {daySlots.length === 0 ? (
                   <div className="flex-1 text-xs px-2 text-gray-400 flex items-center justify-center">Aucun créneau</div>
                 ) : daySlots.map((s) => {
                   const on = !!availability[s.id];
-
-                  const onCls      = locked ? 'bg-green-600 text-white cursor-not-allowed' : 'bg-green-500 text-white';
-                  const offCls     = locked ? 'bg-white text-gray-400 cursor-not-allowed' : 'bg-white hover:bg-gray-50 text-gray-700';
+                  const onCls  = locked ? 'bg-green-600 text-white cursor-not-allowed' : 'bg-green-500 text-white';
+                  const offCls = locked ? 'bg-white text-gray-400 cursor-not-allowed' : 'bg-white hover:bg-gray-50 text-gray-700';
                   const cellClass  = on ? onCls : offCls;
 
                   const handleClick = () => {
@@ -344,7 +388,7 @@ export default function CalendrierPage() {
                       alert('Mois validé : déverrouillez pour modifier vos disponibilités.');
                       return;
                     }
-                    toggle(s.id);
+                    toggleLocal(s.id);
                   };
 
                   return (
@@ -366,9 +410,51 @@ export default function CalendrierPage() {
         })}
       </div>
 
-      <div className="mt-4 text-sm text-gray-600">
-        Total cochés : {Object.values(availability).filter(Boolean).length}
-      </div>
+      {/* Barre d'action collante (flush immédiat) */}
+      {pendingCount > 0 && (
+        <div className="fixed bottom-0 left-0 right-0 z-30 p-3 bg-gradient-to-t from-zinc-950/90 to-transparent md:max-w-5xl md:mx-auto">
+          <div className="rounded-xl bg-emerald-600 text-white py-3 text-center font-medium active:scale-[.99]"
+               onClick={flushPending}>
+            Enregistrer maintenant ({pendingCount} modif{pendingCount>1?'s':''})
+          </div>
+        </div>
+      )}
+
+      {/* Bottom Sheet mobile : liste des créneaux du jour */}
+      {openDay && (
+        <div className="fixed inset-0 z-40 md:hidden">
+          <button className="absolute inset-0 bg-black/40" onClick={()=>setOpenDay(null)} />
+          <div className="absolute inset-x-0 bottom-0 rounded-t-2xl bg-white border-t border-zinc-200 p-3 pb-[calc(env(safe-area-inset-bottom)+16px)]">
+            <div className="flex items-center justify-between mb-2">
+              <div className="font-medium">{openDay}</div>
+              <button onClick={()=>setOpenDay(null)} className="px-2 py-1 rounded bg-zinc-100">Fermer</button>
+            </div>
+            <div className="space-y-2">
+              {(slotsByDate[openDay] || []).map(s => {
+                const checked = !!availability[s.id];
+                const mKey = yyyymm(new Date(openDay + 'T00:00:00'));
+                const locked = !!monthStatus[mKey]?.locked;
+
+                return (
+                  <label key={s.id} className={`flex items-center justify-between px-3 py-2 rounded-lg border ${checked ? 'bg-emerald-50 border-emerald-200' : 'bg-white border-zinc-200'}`}>
+                    <span className="text-zinc-800">{KIND_LABEL[s.kind]}</span>
+                    <input
+                      type="checkbox"
+                      className="h-5 w-5"
+                      checked={checked}
+                      disabled={locked}
+                      onChange={(e)=>toggleLocal(s.id, e.target.checked)}
+                    />
+                  </label>
+                );
+              })}
+              {(slotsByDate[openDay] || []).length === 0 && (
+                <div className="text-sm text-zinc-500">Aucun créneau pour ce jour.</div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

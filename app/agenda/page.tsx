@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, ReactNode } from 'react';
 import { supabase } from '@/lib/supabase';
 import { useRouter } from 'next/navigation';
 
@@ -10,7 +10,13 @@ type Slot = {
   date: string; // YYYY-MM-DD (locale)
   start_ts: string;
   end_ts: string;
-  kind: 'WEEKDAY_20_00'|'SAT_12_18'|'SAT_18_00'|'SUN_08_14'|'SUN_14_20'|'SUN_20_24';
+  kind:
+    | 'WEEKDAY_20_00'
+    | 'SAT_12_18'
+    | 'SAT_18_00'
+    | 'SUN_08_14'
+    | 'SUN_14_20'
+    | 'SUN_20_24';
 };
 
 type Period = { id: string; label: string };
@@ -19,6 +25,17 @@ const pad = (n: number) => String(n).padStart(2, '0');
 const yyyymm = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
 const ymdLocal = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const frMonthLabel = (d: Date) => d.toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' });
+
+const KIND_LABEL: Record<Slot['kind'], string> = {
+  WEEKDAY_20_00: '20:00–00:00',
+  SAT_12_18: '12:00–18:00',
+  SAT_18_00: '18:00–00:00',
+  SUN_08_14: '08:00–14:00',
+  SUN_14_20: '14:00–20:00',
+  SUN_20_24: '20:00–00:00',
+};
+
+const WEEKDAYS_FR = ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam', 'Dim'];
 
 export default function AgendaPage() {
   const router = useRouter();
@@ -66,7 +83,7 @@ export default function AgendaPage() {
       .eq('period_id', pid)
       .order('start_ts', { ascending: true });
     if (sErr) { setMsg(`Erreur slots: ${sErr.message}`); return; }
-    setSlots(slotsData || []);
+    setSlots((slotsData || []) as Slot[]);
 
     if (!viewMonth && (slotsData?.length ?? 0) > 0) {
       const d0 = new Date(slotsData![0].date + 'T00:00:00'); // base locale
@@ -90,7 +107,7 @@ export default function AgendaPage() {
     }
     setAssignBySlot(map);
 
-    // Profils des user_ids utilisés → first_name / last_name (plus de full_name)
+    // Profils des user_ids utilisés → first_name / last_name
     if (uids.size > 0) {
       const { data: profs, error: profErr } = await supabase
         .from('profiles')
@@ -147,40 +164,105 @@ export default function AgendaPage() {
     return map;
   }, [slots]);
 
-  if (loading) return <p>Chargement…</p>;
+  const labelFor = (k: Slot['kind']) => KIND_LABEL[k];
 
-  const labelFor = (k: Slot['kind']) => ({
-    WEEKDAY_20_00: '20:00–00:00',
-    SAT_12_18:     '12:00–18:00',
-    SAT_18_00:     '18:00–00:00',
-    SUN_08_14:     '08:00–14:00',
-    SUN_14_20:     '14:00–20:00',
-    SUN_20_24:     '20:00–00:00',
-  } as const)[k];
+  // rendu d'une cellule de jour (compact = mobile)
+  const renderDayCell = (d: Date | null, key: React.Key, compact = false): ReactNode => {
+    if (!d) {
+      return (
+        <div
+          key={key}
+          className={`rounded-xl border border-dashed border-gray-200 bg-gray-50 ${compact ? 'h-24 sm:h-28' : 'h-32'}`}
+        />
+      );
+    }
+
+    const ymd = ymdLocal(d);
+    const daySlots = slotsByDate[ymd] || [];
+    const dayNum = d.getDate();
+
+    const todayYmd = ymdLocal(new Date());
+    const isToday = ymd === todayYmd;
+
+    return (
+      <div
+        key={key}
+        className={`rounded-2xl border border-gray-200 overflow-hidden bg-white shadow-sm ${compact ? 'h-24 sm:h-28' : 'h-32'} ${isToday ? 'ring-1 ring-emerald-300' : ''}`}
+      >
+        <div className="px-2 pt-2 pb-1 text-sm font-medium text-gray-700 flex items-center justify-between">
+          <span>{dayNum}</span>
+          <span className="text-xs text-gray-400">
+            {d.toLocaleDateString('fr-FR', { weekday: 'short' })}
+          </span>
+        </div>
+
+        <div className="flex flex-col h-[calc(100%-2rem)]">
+          {daySlots.length === 0 ? (
+            <div className="flex-1 text-[11px] px-2 text-gray-400 flex items-center justify-center">Aucun créneau</div>
+          ) : daySlots.map((s) => {
+            const uid = assignBySlot[s.id];
+            const name = uid ? (nameMap[uid] ?? uid) : null;
+            return (
+              <div
+                key={s.id}
+                className="flex-1 text-[11px] md:text-xs px-2 border-t first:border-t-0 bg-white text-gray-700 flex items-center justify-between"
+                title={labelFor(s.kind)}
+              >
+                <span className="truncate">{labelFor(s.kind)}</span>
+                {name ? (
+                  <span className="font-semibold text-emerald-600 truncate max-w-[55%] md:max-w-none">{name}</span>
+                ) : (
+                  <span className="italic text-gray-400">—</span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
+  if (loading) return <p>Chargement…</p>;
 
   return (
     <div className="space-y-4">
       <h1 className="text-xl font-semibold">Agenda MMG</h1>
 
       {/* Sélecteurs période & mois */}
-      <div className="flex flex-wrap gap-2 items-center">
-        <select
-          className="border rounded p-2"
-          value={periodId}
-          onChange={async (e) => { const v = e.target.value; setPeriodId(v); await loadData(v); }}
-        >
-          {periods.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
-        </select>
-
-        {monthsInPeriod.map(m => (
-          <button
-            key={m.key}
-            className={`px-3 py-1.5 rounded border ${viewMonth && yyyymm(viewMonth) === m.key ? 'bg-black text-white' : 'hover:bg-gray-50'}`}
-            onClick={() => setViewMonth(m.date)}
+      <div className="flex flex-col gap-3 md:flex-row md:items-center">
+        <div className="flex items-center gap-2">
+          <label className="text-sm text-gray-600">Période</label>
+          <select
+            className="border rounded p-2 bg-white"
+            value={periodId}
+            onChange={async (e) => {
+              const v = e.target.value;
+              setPeriodId(v);
+              await loadData(v);
+            }}
           >
-            {m.label}
-          </button>
-        ))}
+            {periods.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
+          </select>
+        </div>
+
+        {/* Liste des mois — défilable horizontalement sur mobile */}
+        <div className="md:ml-2 overflow-x-auto">
+          <div className="inline-flex gap-2 pr-1">
+            {monthsInPeriod.map(m => (
+              <button
+                key={m.key}
+                className={`px-3 py-1.5 rounded border transition-colors ${
+                  viewMonth && yyyymm(viewMonth) === m.key
+                    ? 'bg-black text-white border-black'
+                    : 'hover:bg-gray-50 border-gray-300'
+                }`}
+                onClick={() => setViewMonth(m.date)}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
 
       {msg && (
@@ -189,53 +271,23 @@ export default function AgendaPage() {
         </div>
       )}
 
-      {/* Grille mensuelle (affichage read-only des assignations) */}
-      <div className="grid grid-cols-7 gap-2">
-        {['Lun','Mar','Mer','Jeu','Ven','Sam','Dim'].map(w => (
-          <div key={w} className="text-center text-xs uppercase tracking-wide text-gray-500">{w}</div>
-        ))}
+      {/* ======= Desktop / Tablette : vraie grille 7 colonnes ======= */}
+      <div className="hidden md:block">
+        {/* Entête des jours de la semaine (md+) */}
+        <div className="grid grid-cols-7 gap-3 mb-2">
+          {WEEKDAYS_FR.map(w => (
+            <div key={w} className="text-center text-xs uppercase tracking-wide text-gray-500">{w}</div>
+          ))}
+        </div>
 
-        {daysOfMonth.map((d, i) => {
-          if (!d) return <div key={i} className="h-32 rounded-xl border border-dashed border-gray-200 bg-gray-50" />;
+        <div className="grid grid-cols-7 gap-3">
+          {daysOfMonth.map((d, i) => renderDayCell(d, i, false))}
+        </div>
+      </div>
 
-          const key = ymdLocal(d);
-          const daySlots = slotsByDate[key] || [];
-          const dayNum = d.getDate();
-
-          return (
-            <div key={i} className="h-32 rounded-2xl border border-gray-200 overflow-hidden bg-white shadow-sm">
-              <div className="px-2 pt-2 pb-1 text-sm font-medium text-gray-700 flex items-center justify-between">
-                <span>{dayNum}</span>
-                <span className="text-xs text-gray-400">
-                  {d.toLocaleDateString('fr-FR', { weekday: 'short' })}
-                </span>
-              </div>
-
-              <div className="flex flex-col h-[calc(100%-2rem)]">
-                {daySlots.length === 0 ? (
-                  <div className="flex-1 text-xs px-2 text-gray-400 flex items-center justify-center">Aucun créneau</div>
-                ) : daySlots.map((s) => {
-                  const uid = assignBySlot[s.id];
-                  const name = uid ? (nameMap[uid] ?? uid) : null;
-                  return (
-                    <div
-                      key={s.id}
-                      className="flex-1 text-xs px-2 border-t first:border-t-0 bg-white text-gray-700 flex items-center justify-between"
-                      title={labelFor(s.kind)}
-                    >
-                      <span>{labelFor(s.kind)}</span>
-                      {name ? (
-                        <span className="font-semibold text-emerald-600">{name}</span>
-                      ) : (
-                        <span className="italic text-gray-400">—</span>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          );
-        })}
+      {/* ======= Mobile : grille compacte 2 → 3 colonnes ======= */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 md:hidden">
+        {daysOfMonth.map((d, i) => renderDayCell(d, i, true))}
       </div>
     </div>
   );
