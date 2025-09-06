@@ -1,6 +1,7 @@
+// app/calendrier/page.tsx
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { supabase } from '@/lib/supabase';
 import { useRouter } from 'next/navigation';
 
@@ -18,7 +19,6 @@ type Slot = {
     | 'SUN_14_20'
     | 'SUN_20_24';
 };
-
 type Period = { id: string; label: string };
 
 type MonthStatus = {
@@ -57,17 +57,27 @@ export default function CalendrierPage() {
   const [msg, setMsg] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
+<<<<<<< HEAD
   // Drawer “heures”
   const [sheetOpen, setSheetOpen] = useState(false);
   const [sheetDate, setSheetDate] = useState<Date | null>(null);
 
   // Buffer modifs à sauvegarder en lot
   const [dirtyIds, setDirtyIds] = useState<Set<string>>(new Set());
+=======
+  // --- état pour le "batch + debounce" ---
+  const [pending, setPending] = useState<Record<string, boolean>>({});
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // --- bottom sheet (mobile) ---
+  const [openDay, setOpenDay] = useState<string | null>(null); // YYYY-MM-DD
+>>>>>>> parent of 8209c7f (patch responsive + mandatory nom/prenom)
 
   // --------- INIT ---------
   useEffect(() => {
     (async () => {
       setLoading(true);
+<<<<<<< HEAD
       setMsg(null);
 
       const {
@@ -107,6 +117,17 @@ export default function CalendrierPage() {
         setLoading(false);
         return;
       }
+=======
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) { router.replace('/login'); return; }
+      setUserId(user.id);
+
+      const { data: periodsData, error: pErr } = await supabase
+        .from('periods')
+        .select('id,label')
+        .order('open_at', { ascending: false });
+      if (pErr) { setMsg(`Erreur périodes: ${pErr.message}`); setLoading(false); return; }
+>>>>>>> parent of 8209c7f (patch responsive + mandatory nom/prenom)
 
       const list = periodsData || [];
       setPeriods(list);
@@ -145,7 +166,7 @@ export default function CalendrierPage() {
       setViewMonth(new Date(d0.getFullYear(), d0.getMonth(), 1));
     }
 
-    // toutes les dispos de l’utilisateur
+    // Toutes les dispos de l'utilisateur
     const { data: avData, error: aErr } = await supabase
       .from('availability')
       .select('slot_id, available')
@@ -157,7 +178,6 @@ export default function CalendrierPage() {
     const map: Record<string, boolean> = {};
     for (const row of avData || []) map[row.slot_id as string] = !!row.available;
     setAvailability(map);
-    setDirtyIds(new Set());
   };
 
   const loadMonthStatus = async (pid: string, uid: string) => {
@@ -223,6 +243,7 @@ export default function CalendrierPage() {
     [viewMonth]
   );
 
+<<<<<<< HEAD
   // --------- ACTIONS ---------
   const toggleLocal = (slotId: string) => {
     const next = !availability[slotId];
@@ -237,17 +258,60 @@ export default function CalendrierPage() {
       slot_id,
       available: !!availability[slot_id],
     }));
+=======
+  // --------- BATCH SAVE (debounce 800ms) ---------
+  const flushPending = async () => {
+    if (!userId) return;
+    const entries = Object.entries(pending);
+    if (entries.length === 0) return;
 
-    const { error } = await supabase.from('availability').upsert(payload);
-    if (error) setMsg(`❌ Sauvegarde: ${error.message}`);
-    else {
-      setMsg('✅ Modifications sauvegardées.');
-      setDirtyIds(new Set());
+    try {
+      const rows = entries.map(([slot_id, available]) => ({
+        user_id: userId!,
+        slot_id,
+        available,
+      }));
+      const { error } = await supabase.from('availability').upsert(rows);
+      if (error) throw error;
+      setPending({});
+      setMsg('✔️ Modifications enregistrées.');
+    } catch (e: any) {
+      setMsg(`❌ Sauvegarde: ${e.message ?? e}`);
     }
+  };
+
+  // déclenchement auto après 800ms sans nouveau clic
+  useEffect(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (Object.keys(pending).length === 0) return;
+    debounceRef.current = setTimeout(() => { flushPending(); }, 800);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [JSON.stringify(pending)]);
+>>>>>>> parent of 8209c7f (patch responsive + mandatory nom/prenom)
+
+  // --------- ACTIONS ---------
+  const toggleLocal = (slotId: string, target?: boolean) => {
+    // trouve le mois du slot → si verrouillé, on bloque
+    const slot = slots.find(s => s.id === slotId);
+    if (!slot) return;
+    const mKey = yyyymm(new Date(slot.date + 'T00:00:00'));
+    if (monthStatus[mKey]?.locked) {
+      alert('Ce mois est validé. Déverrouillez-le pour modifier vos disponibilités.');
+      return;
+    }
+
+    setAvailability(prev => {
+      const nextVal = target ?? !prev[slotId];
+      const next = { ...prev, [slotId]: nextVal };
+      // marque comme "à envoyer"
+      setPending(p => ({ ...p, [slotId]: nextVal }));
+      return next;
+    });
   };
 
   const validateMonth = async (mKey: string) => {
     if (!userId || !periodId) return;
+    // upsert (user_id, period_id, month) → locked = true, validated_at = now
     const { error } = await supabase
       .from('doctor_period_months')
       .upsert(
@@ -295,6 +359,7 @@ export default function CalendrierPage() {
     setMsg('🔓 Mois déverrouillé.');
   };
 
+<<<<<<< HEAD
   // --------- SHEET helpers ---------
   const openDay = (d: Date) => {
     setSheetDate(d);
@@ -381,15 +446,21 @@ export default function CalendrierPage() {
       </div>
     );
   };
+=======
+  // --------- RENDER ---------
+  if (loading) return <p>Chargement…</p>;
+
+  const pendingCount = Object.keys(pending).length;
+>>>>>>> parent of 8209c7f (patch responsive + mandatory nom/prenom)
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 pb-[calc(env(safe-area-inset-bottom)+64px)]">
       <h1 className="text-xl font-semibold">Mes disponibilités</h1>
 
       {/* Sélecteurs période & mois */}
       <div className="flex flex-wrap gap-2 items-center">
         <select
-          className="border rounded p-2 bg-zinc-900 text-zinc-100 border-zinc-700"
+          className="border rounded p-2"
           value={periodId}
           onChange={async (e) => {
             const v = e.target.value;
@@ -482,6 +553,7 @@ export default function CalendrierPage() {
       )}
 
       {/* Grille mensuelle */}
+<<<<<<< HEAD
       <div className="grid grid-cols-7 gap-2">
         {['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam', 'Dim'].map((w) => (
           <div
@@ -500,6 +572,17 @@ export default function CalendrierPage() {
                 className="h-32 rounded-xl border border-dashed border-gray-200 bg-gray-50"
               />
             );
+=======
+      <div className="grid grid-cols-7 gap-2 md:gap-3">
+        {['Lun','Mar','Mer','Jeu','Ven','Sam','Dim'].map(w => (
+          <div key={w} className="text-center text-xs uppercase tracking-wide text-gray-500">{w}</div>
+        ))}
+
+        {daysOfMonth.map((d, i) => {
+          if (!d) return (
+            <div key={i} className="h-24 md:h-32 rounded-xl border border-dashed border-gray-200 bg-gray-50" />
+          );
+>>>>>>> parent of 8209c7f (patch responsive + mandatory nom/prenom)
 
           const key = ymdLocal(d);
           const daySlots = slotsByDate[key] || [];
@@ -507,23 +590,29 @@ export default function CalendrierPage() {
           const mKey = yyyymm(d);
           const locked = !!monthStatus[mKey]?.locked;
 
-          // 👉 Toute la tuile devient cliquable pour ouvrir le menu des heures
-          return (
-            <button
-              key={i}
-              type="button"
-              onClick={() => openDay(d)}
-              className="h-32 rounded-2xl border border-gray-200 overflow-hidden bg-white shadow-sm text-left focus:outline-none focus:ring-2 focus:ring-emerald-400"
-            >
-              <div className="px-2 pt-2 pb-1 text-sm font-medium text-gray-700 flex items-center justify-between">
-                <span>{dayNum}</span>
-                <span className="text-xs text-gray-400">
-                  {d.toLocaleDateString('fr-FR', { weekday: 'short' })}
-                </span>
-              </div>
+          // sur mobile : toucher la carte ouvre la bottom-sheet
+          const openSheet = () => {
+            if (daySlots.length === 0) return;
+            setOpenDay(key);
+          };
 
-              <div className="flex flex-col h-[calc(100%-2rem)] pointer-events-none">
+          return (
+            <div
+              key={i}
+              className="h-24 md:h-32 rounded-2xl border border-gray-200 overflow-hidden bg-white shadow-sm"
+            >
+              <button
+                onClick={openSheet}
+                className="px-2 pt-2 pb-1 text-sm font-medium text-gray-700 w-full flex items-center justify-between md:cursor-default"
+              >
+                <span>{dayNum}</span>
+                <span className="text-xs text-gray-400">{d.toLocaleDateString('fr-FR', { weekday: 'short' })}</span>
+              </button>
+
+              {/* desktop: boutons directement cliquables */}
+              <div className="hidden md:flex flex-col h-[calc(100%-2rem)]">
                 {daySlots.length === 0 ? (
+<<<<<<< HEAD
                   <div className="flex-1 text-xs px-2 text-gray-400 flex items-center justify-center">
                     Aucun créneau
                   </div>
@@ -546,12 +635,43 @@ export default function CalendrierPage() {
                     );
                   })
                 )}
+=======
+                  <div className="flex-1 text-xs px-2 text-gray-400 flex items-center justify-center">Aucun créneau</div>
+                ) : daySlots.map((s) => {
+                  const on = !!availability[s.id];
+                  const onCls  = locked ? 'bg-green-600 text-white cursor-not-allowed' : 'bg-green-500 text-white';
+                  const offCls = locked ? 'bg-white text-gray-400 cursor-not-allowed' : 'bg-white hover:bg-gray-50 text-gray-700';
+                  const cellClass  = on ? onCls : offCls;
+
+                  const handleClick = () => {
+                    if (locked) {
+                      alert('Mois validé : déverrouillez pour modifier vos disponibilités.');
+                      return;
+                    }
+                    toggleLocal(s.id);
+                  };
+
+                  return (
+                    <button
+                      key={s.id}
+                      onClick={handleClick}
+                      className={`flex-1 text-xs px-2 border-t first:border-t-0 focus:outline-none transition-colors ${cellClass}`}
+                      title={KIND_LABEL[s.kind]}
+                    >
+                      <div className="h-full w-full flex items-center justify-center">
+                        {KIND_LABEL[s.kind]}
+                      </div>
+                    </button>
+                  );
+                })}
+>>>>>>> parent of 8209c7f (patch responsive + mandatory nom/prenom)
               </div>
-            </button>
+            </div>
           );
         })}
       </div>
 
+<<<<<<< HEAD
       {/* Bouton global sauvegarde */}
       <div className="sticky bottom-3">
         <button
@@ -563,9 +683,53 @@ export default function CalendrierPage() {
           {dirtyIds.size > 0 ? `(${dirtyIds.size} modifs)` : ''}
         </button>
       </div>
+=======
+      {/* Barre d'action collante (flush immédiat) */}
+      {pendingCount > 0 && (
+        <div className="fixed bottom-0 left-0 right-0 z-30 p-3 bg-gradient-to-t from-zinc-950/90 to-transparent md:max-w-5xl md:mx-auto">
+          <div className="rounded-xl bg-emerald-600 text-white py-3 text-center font-medium active:scale-[.99]"
+               onClick={flushPending}>
+            Enregistrer maintenant ({pendingCount} modif{pendingCount>1?'s':''})
+          </div>
+        </div>
+      )}
+>>>>>>> parent of 8209c7f (patch responsive + mandatory nom/prenom)
 
-      {/* Drawer mobile */}
-      <DaySheet />
+      {/* Bottom Sheet mobile : liste des créneaux du jour */}
+      {openDay && (
+        <div className="fixed inset-0 z-40 md:hidden">
+          <button className="absolute inset-0 bg-black/40" onClick={()=>setOpenDay(null)} />
+          <div className="absolute inset-x-0 bottom-0 rounded-t-2xl bg-white border-t border-zinc-200 p-3 pb-[calc(env(safe-area-inset-bottom)+16px)]">
+            <div className="flex items-center justify-between mb-2">
+              <div className="font-medium">{openDay}</div>
+              <button onClick={()=>setOpenDay(null)} className="px-2 py-1 rounded bg-zinc-100">Fermer</button>
+            </div>
+            <div className="space-y-2">
+              {(slotsByDate[openDay] || []).map(s => {
+                const checked = !!availability[s.id];
+                const mKey = yyyymm(new Date(openDay + 'T00:00:00'));
+                const locked = !!monthStatus[mKey]?.locked;
+
+                return (
+                  <label key={s.id} className={`flex items-center justify-between px-3 py-2 rounded-lg border ${checked ? 'bg-emerald-50 border-emerald-200' : 'bg-white border-zinc-200'}`}>
+                    <span className="text-zinc-800">{KIND_LABEL[s.kind]}</span>
+                    <input
+                      type="checkbox"
+                      className="h-5 w-5"
+                      checked={checked}
+                      disabled={locked}
+                      onChange={(e)=>toggleLocal(s.id, e.target.checked)}
+                    />
+                  </label>
+                );
+              })}
+              {(slotsByDate[openDay] || []).length === 0 && (
+                <div className="text-sm text-zinc-500">Aucun créneau pour ce jour.</div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
