@@ -5,7 +5,7 @@ import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-// Déclenchement manuel : /api/admin/cron?key=TA_CLE
+// Déclenchement manuel possible: /api/admin/cron?key=TA_CLE
 const CRON_SECRET = process.env.CRON_SECRET ?? '';
 
 // ------------------ utils dates (UTC) ------------------
@@ -19,8 +19,8 @@ function addMonthsUTC(d: Date, months: number) {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + months, d.getUTCDate(), 0, 0, 0));
 }
 function endOfQuarter(qStart: Date) {
-  // dernier jour inclus, à 23:59:59.999
   const nextQ = addMonthsUTC(qStart, 3);
+  // dernier jour inclus (23:59:59.999Z)
   return new Date(nextQ.getTime() - 1);
 }
 function addDaysUTC(d: Date, n: number) {
@@ -30,7 +30,7 @@ function ymdUTC(d: Date) {
   return d.toISOString().slice(0, 10);
 }
 function dayOfWeekUTC(d: Date) {
-  return d.getUTCDay(); // 0=dim,..6=sam
+  return d.getUTCDay(); // 0=dim..6=sam
 }
 // -------------------------------------------------------
 
@@ -39,9 +39,7 @@ type SlotInsert = { period_id: string; date: string; start_ts: string; end_ts: s
 
 function slotsForDay(d: Date): SlotSpec[] {
   const dow = dayOfWeekUTC(d);
-  if (dow >= 1 && dow <= 5) {
-    return [{ kind: 'WEEKDAY_20_00', start: '20:00', end: '00:00' }];
-  }
+  if (dow >= 1 && dow <= 5) return [{ kind: 'WEEKDAY_20_00', start: '20:00', end: '00:00' }];
   if (dow === 6) {
     return [
       { kind: 'SAT_12_18', start: '12:00', end: '18:00' },
@@ -62,8 +60,11 @@ function isoUTC(ymd: string, hhmm: string) {
 }
 
 export async function GET(req: NextRequest) {
+  const supa = getSupabaseAdmin();
+  const now = new Date(); // UTC
+
   // Autoriser :
-  // - les jobs planifiés Vercel (header x-vercel-cron)
+  // - les jobs (GitHub Actions / Vercel) qui envoient la requête
   // - OU l'appel manuel avec ?key=CRON_SECRET
   const hasVercelHeader = req.headers.get('x-vercel-cron') !== null;
   const keyMatches = !!CRON_SECRET && req.nextUrl.searchParams.get('key') === CRON_SECRET;
@@ -71,27 +72,21 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  const supa = getSupabaseAdmin();
-
-  // Paramètres globaux (avec valeurs par défaut)
-  let openLeadDays = 45;          // ouverture des dispos à J-45
-  let planningLeadDays = 21;      // génération du planning à J-21
-
+  // Defaults / réglages globaux
+  let openLeadDays = 45;      // J-45 : création auto de la période + slots
+  let planningLeadDays = 21;  // J-21 : génération planning (rempli generate_at)
   try {
     const { data } = await supa
       .from('automation_settings')
       .select('settings')
       .eq('key', 'global')
       .maybeSingle();
-
     const s = (data as any)?.settings ?? {};
     if (Number.isFinite(s?.open_lead_days)) openLeadDays = Number(s.open_lead_days);
     if (Number.isFinite(s?.planning_generate_before_days)) planningLeadDays = Number(s.planning_generate_before_days);
   } catch {
-    // on garde les défauts
+    // on garde les defaults
   }
-
-  const now = new Date(); // UTC
 
   // Trimestre courant + 3 suivants
   const candidates: { start: Date; end: Date; label: string }[] = [];
@@ -104,72 +99,88 @@ export async function GET(req: NextRequest) {
   }
 
   let created: null | { period_id: string; label: string; slots: number } = null;
+  let note: string = 'no-op';
 
-  for (const cand of candidates) {
-    const openFrom = addDaysUTC(cand.start, -openLeadDays);
+  try {
+    for (const cand of candidates) {
+      const openFrom = addDaysUTC(cand.start, -openLeadDays);
 
-    // Créer si non existant ET on est dans la fenêtre [J-openLeadDays ; J0[
-    if (now >= openFrom && now < cand.start) {
-      // Période déjà créée ?
-      const { data: p0, error: p0err } = await supa
-        .from('periods')
-        .select('id')
-        .eq('label', cand.label)
-        .maybeSingle();
-      if (p0err) {
-        return NextResponse.json({ error: p0err.message }, { status: 500 });
-      }
-      if (p0?.id) continue;
+      // Crée si non existant ET on est dans la fenêtre [J-45 ; J0[
+      if (now >= openFrom && now < cand.start) {
+        const { data: p0 } = await supa
+          .from('periods')
+          .select('id')
+          .eq('label', cand.label)
+          .maybeSingle();
+        if (p0?.id) { note = 'no-op (already exists)'; continue; }
 
-      // close_at = dernier jour du trimestre à 23:59:59.999Z
-      const closeAt = new Date(Date.UTC(
-        cand.end.getUTCFullYear(),
-        cand.end.getUTCMonth(),
-        cand.end.getUTCDate(),
-        23, 59, 59, 999
-      )).toISOString();
+        // close_at = fin de trimestre (23:59:59.999Z)
+        const closeAt = endOfQuarter(cand.start).toISOString();
+        // generate_at = J - planningLeadDays (00:00:00Z)
+        const generateAt = addDaysUTC(cand.start, -planningLeadDays).toISOString();
 
-      // generate_at = J - planningLeadDays
-      const generateAt = addDaysUTC(cand.start, -planningLeadDays).toISOString();
+        // Créer la période (respect des NOT NULL: label, open_at, close_at, generate_at)
+        const { data: insP, error: pErr } = await supa
+          .from('periods')
+          .insert([{
+            label:       cand.label,
+            open_at:     cand.start.toISOString(), // 1er jour du trimestre
+            close_at:    closeAt,                  // fin de trimestre
+            generate_at: generateAt                // date cible pour la génération du planning
+          }])
+          .select('id')
+          .maybeSingle();
 
-      // Créer la période (évite les NOT NULL)
-      const { data: insP, error: pErr } = await supa
-        .from('periods')
-        .insert([{
-          label:       cand.label,
-          open_at:     cand.start.toISOString(), // 1er jour du trimestre
-          close_at:    closeAt,                  // fin de trimestre
-          generate_at: generateAt,               // date de génération auto du planning
-        }])
-        .select('id')
-        .maybeSingle();
-
-      if (pErr || !insP?.id) {
-        return NextResponse.json({ error: pErr?.message || 'insert period failed' }, { status: 500 });
-      }
-      const period_id = String(insP.id);
-
-      // Générer les slots de la période
-      const rows: SlotInsert[] = [];
-      for (let d = new Date(cand.start); d <= cand.end; d = addDaysUTC(d, 1)) {
-        const ymd = ymdUTC(d);
-        for (const s of slotsForDay(d)) {
-          const start_ts = isoUTC(ymd, s.start);
-          const endYmd = s.end === '00:00' ? ymdUTC(addDaysUTC(d, 1)) : ymd;
-          const end_ts = isoUTC(endYmd, s.end);
-          rows.push({ period_id, date: ymd, start_ts, end_ts, kind: s.kind });
+        if (pErr || !insP?.id) {
+          throw new Error(pErr?.message || 'insert period failed');
         }
-      }
+        const period_id = String(insP.id);
 
-      if (rows.length) {
-        const { error: sErr } = await supa.from('slots').insert(rows);
-        if (sErr) return NextResponse.json({ error: sErr.message }, { status: 500 });
-      }
+        // Générer les slots
+        const rows: SlotInsert[] = [];
+        for (let d = new Date(cand.start); d <= cand.end; d = addDaysUTC(d, 1)) {
+          const ymd = ymdUTC(d);
+          for (const s of slotsForDay(d)) {
+            const start_ts = isoUTC(ymd, s.start);
+            const endYmd = s.end === '00:00' ? ymdUTC(addDaysUTC(d, 1)) : ymd;
+            const end_ts = isoUTC(endYmd, s.end);
+            rows.push({ period_id, date: ymd, start_ts, end_ts, kind: s.kind });
+          }
+        }
 
-      created = { period_id, label: cand.label, slots: rows.length };
-      break; // on ne crée qu'une période par passage
+        if (rows.length) {
+          const { error: sErr } = await supa.from('slots').insert(rows);
+          if (sErr) throw new Error(sErr.message);
+        }
+
+        created = { period_id, label: cand.label, slots: rows.length };
+        note = 'created';
+        break;
+      }
     }
-  }
 
-  return NextResponse.json({ ok: true, created });
+    // Log OK / noop
+    await supa.from('cron_runs').insert([{
+      run_at: new Date().toISOString(),
+      created_period_id: created?.period_id ?? null,
+      created_label: created?.label ?? null,
+      created_slots: created?.slots ?? null,
+      note,
+      error: null
+    }]);
+
+    return NextResponse.json({ ok: true, created, note });
+  } catch (e: any) {
+    // Log erreur
+    const message = e?.message ?? String(e);
+    await supa.from('cron_runs').insert([{
+      run_at: new Date().toISOString(),
+      created_period_id: null,
+      created_label: null,
+      created_slots: null,
+      note: 'error',
+      error: message
+    }]);
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
 }

@@ -2,11 +2,12 @@
 import nodemailer from 'nodemailer';
 
 type SendParams = {
-  to: string;
+  to: string | string[];
   subject: string;
   html: string;
   text?: string;
   fromOverride?: string;
+  replyTo?: string;
 };
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
@@ -33,11 +34,20 @@ async function sendWithResend(p: SendParams) {
       subject: p.subject,
       html: p.html,
       text: p.text,
+      reply_to: p.replyTo,
     }),
   });
+
   if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Resend error: ${res.status} ${t}`);
+    let msg = `Resend error: ${res.status}`;
+    try {
+      const j = await res.json();
+      if (j?.name || j?.message) msg += ` ${j.name ?? ''} ${j.message ?? ''}`.trim();
+    } catch {
+      const t = await res.text().catch(() => '');
+      if (t) msg += ` ${t}`;
+    }
+    throw new Error(msg);
   }
 }
 
@@ -45,7 +55,7 @@ async function sendWithSMTP(p: SendParams) {
   const transporter = nodemailer.createTransport({
     host: SMTP_HOST,
     port: SMTP_PORT,
-    secure: SMTP_PORT === 465, // 465 = SSL, sinon STARTTLS
+    secure: SMTP_PORT === 465, // 465 = SSL (implicit TLS), sinon STARTTLS
     auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
   });
 
@@ -55,6 +65,7 @@ async function sendWithSMTP(p: SendParams) {
     subject: p.subject,
     html: p.html,
     text: p.text,
+    replyTo: p.replyTo,
   });
 }
 
