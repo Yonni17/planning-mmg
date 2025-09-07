@@ -33,6 +33,8 @@ const ENDS_AT_MIDNIGHT: Record<string, boolean> = {
 const monthOf = (ymd: string) => ymd.slice(0, 7);
 // ----------------------------------
 
+const SOFT_MAX_PER_MONTH = 1; // “Max” → quota mensuel doux pour l’étalement
+
 // ---- Auth helpers (Bearer / cookies) ----
 function getAccessTokenFromReq(req: NextRequest): string | null {
   const auth = req.headers.get('authorization');
@@ -116,6 +118,7 @@ async function buildAvailabilitySummary(
     for (let i = 0; i < ids.length; i += idBatch) {
       const chunk = ids.slice(i, i + idBatch);
       let from = 0;
+      // eslint-disable-next-line no-constant-condition
       while (true) {
         const to = from + pageSize - 1;
         const { data, error } = await supabase
@@ -258,7 +261,7 @@ export async function POST(req: NextRequest) {
     }
 
     // Base: slots + summary
-    const { slots, availability_by_slot, candidates_by_slot, users_index } =
+    const { slots, availability_by_slot, users_index } =
       await buildAvailabilitySummary(supabase, period_id);
     if (!slots.length) return NextResponse.json({ error: 'Aucun slot pour cette période' }, { status: 400 });
 
@@ -272,17 +275,15 @@ export async function POST(req: NextRequest) {
 
     const fullNameOf = (uid: string) => users_index[uid]?.name ?? uid;
 
-    // Targets: 5/null = Max (∞), 1..4 = cap mensuel
-    const perMonthCap = new Map<string, number | 'MAX'>(); // 'MAX' pour infini
+    // Per-month cap:
+    //  - target_level == 5/null => “MAX” (soft) : SOFT_MAX_PER_MONTH
+    //  - otherwise 1..4 => cap mensuel dur = target_level
+    const perMonthCap = new Map<string, number>(); // “MAX” devient SOFT_MAX_PER_MONTH ici
     for (const u of allUsers) {
       const tl = users_index[u]?.target_level;
-      if (tl == null || tl === 5) perMonthCap.set(u, 'MAX');
-      else perMonthCap.set(u, Math.max(1, Math.min(4, tl))); // 1..4
+      if (tl == null || tl === 5) perMonthCap.set(u, SOFT_MAX_PER_MONTH);
+      else perMonthCap.set(u, Math.max(1, Math.min(4, tl)));
     }
-
-    // Rareté globale par user
-    const availCountByUser = new Map<string, number>();
-    for (const u of allUsers) availCountByUser.set(u, users_index[u]?.avail_count ?? 0);
 
     // Préparation “mois par mois”
     const months = Array.from(new Set(slots.map(s => monthOf(s.date)))).sort();
@@ -301,7 +302,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // preferences_month (si existant)
+    // preferences_month (si existant) — si défini, remplace le cap par mois
     const { data: pmRows } = await supabase
       .from('preferences_month')
       .select('user_id, month, target_total')
@@ -312,44 +313,35 @@ export async function POST(req: NextRequest) {
       pmByUser.get(r.user_id)!.set(r.month, Math.max(0, Number(r.target_total || 0)));
     }
 
-    // Quotas mensuels
+    // Quotas mensuels finaux
     const quotaByUserMonth = new Map<string, Map<string, number>>();
     for (const u of allUsers) {
-      const capM = perMonthCap.get(u)!; // 'MAX' ou 1..4
       const prefU = pmByUser.get(u);
       const dispU = disposByUserMonth.get(u) ?? new Map();
       const out = new Map<string, number>();
-
       if (prefU && Array.from(prefU.values()).some(v => (v ?? 0) > 0)) {
-        // Respecte preferences_month
         for (const m of months) out.set(m, Math.max(0, prefU.get(m) ?? 0));
       } else {
-        if (capM === 'MAX') {
-          // Max -> soft 1 par mois avec dispo (pour étaler)
-          months.forEach(m => out.set(m, (dispU.get(m) ?? 0) > 0 ? 1 : 0));
-        } else {
-          // Cap mensuel dur = tl par mois (0 si aucune dispo ce mois)
-          months.forEach(m => out.set(m, (dispU.get(m) ?? 0) > 0 ? capM as number : 0));
-        }
+        const capM = perMonthCap.get(u)!;
+        months.forEach(m => out.set(m, (dispU.get(m) ?? 0) > 0 ? capM : 0));
       }
       quotaByUserMonth.set(u, out);
     }
 
-    // Cap global = somme des quotas mensuels (infini pour MAX)
+    // Cap global = somme des quotas mensuels
     const totalCapByUser = new Map<string, number>();
     for (const u of allUsers) {
-      const capM = perMonthCap.get(u)!;
-      if (capM === 'MAX') {
-        totalCapByUser.set(u, Number.POSITIVE_INFINITY);
-      } else {
-        const q = quotaByUserMonth.get(u)!;
-        let sum = 0;
-        for (const m of months) sum += (q.get(m) ?? 0);
-        totalCapByUser.set(u, sum);
-      }
+      const q = quotaByUserMonth.get(u)!;
+      let sum = 0;
+      for (const m of months) sum += (q.get(m) ?? 0);
+      totalCapByUser.set(u, sum);
     }
 
-    // Structures d’assignation cross-mois
+    // Rareté globale par user (tie-breaker)
+    const availCountByUser = new Map<string, number>();
+    for (const u of allUsers) availCountByUser.set(u, users_index[u]?.avail_count ?? 0);
+
+    // Structures d’assignation
     const assignments: { slot_id: string; user_id: string; score: number }[] = [];
     const holes_list: { slot_id: string; date: string; kind: string; candidates: number }[] = [];
     const takenSlot = new Set<string>();
@@ -367,15 +359,12 @@ export async function POST(req: NextRequest) {
 
     // Anti-enchaînements (cross-mois)
     const assignedUsersByDate = new Map<string, Set<string>>();
-    const lastAssignedDate = new Map<string, string | null>();
     const lastNightDate = new Map<string, string | null>();
-    const nightStreak = new Map<string, number>();
     const assignedKindsByUserDate = new Map<string, Map<string, Set<string>>>();
 
     function markAssigned(u: string, date: string, kind: string) {
       if (!assignedUsersByDate.has(date)) assignedUsersByDate.set(date, new Set());
       assignedUsersByDate.get(date)!.add(u);
-      lastAssignedDate.set(u, date);
 
       if (!assignedKindsByUserDate.has(u)) assignedKindsByUserDate.set(u, new Map());
       const m = assignedKindsByUserDate.get(u)!;
@@ -383,24 +372,14 @@ export async function POST(req: NextRequest) {
       m.get(date)!.add(kind);
 
       if (isNight(kind)) {
-        const last = lastNightDate.get(u);
-        const streak = nightStreak.get(u) ?? 0;
-        if (last && isNextDay(last, date)) nightStreak.set(u, streak + 1);
-        else nightStreak.set(u, 1);
         lastNightDate.set(u, date);
       }
     }
 
     const userHasSameDay = (u: string, date: string) => assignedUsersByDate.get(date)?.has(u) ?? false;
 
-    // Besoins restants globaux
-    const remainingTotalNeed = new Map<string, number>();
-    for (const u of allUsers) remainingTotalNeed.set(u, totalCapByUser.get(u)!);
-
-    const isFiniteTarget = (u: string) => perMonthCap.get(u)! !== 'MAX';
-
-    // Tri stable
     const stableCompareUsers = (u1: string, u2: string) => {
+      // moins de dispos globales d'abord (plus “rare”), puis nom
       const c1 = availCountByUser.get(u1) ?? 0;
       const c2 = availCountByUser.get(u2) ?? 0;
       if (c1 !== c2) return c1 - c2;
@@ -409,158 +388,88 @@ export async function POST(req: NextRequest) {
       return u1.localeCompare(u2);
     };
 
+    // Sélection par paliers: on prend d’abord les candidats du palier minimal (nb de gardes déjà attribuées sur le trimestre)
+    function pickByTiers(candidates: string[], month: string, slotDate: string, slotKind: string): string | null {
+      // filtrage “pool avec besoin mensuel > 0 et total > 0”
+      const eligible = candidates.filter(u => {
+        const monNeed = (quotaByUserMonth.get(u)?.get(month) ?? 0) - (assignedCountByMonth.get(u)?.get(month) ?? 0);
+        const totNeed = (totalCapByUser.get(u) ?? 0) - (assignedCount.get(u) ?? 0);
+        if (monNeed <= 0) return false;
+        if (totNeed <= 0) return false;
+        if (userHasSameDay(u, slotDate)) return false;
+        // éviter Nuit→Nuit (J+1) et Nuit→Matin (J+1)
+        if (isNight(slotKind)) {
+          const lastN = lastNightDate.get(u);
+          if (lastN && isNextDay(lastN, slotDate)) return false;
+        }
+        if (slotKind === 'SUN_08_14') {
+          const y = addDays(slotDate, -1);
+          const kindsY = assignedKindsByUserDate.get(u)?.get(y);
+          if (kindsY) for (const k of kindsY) if (ENDS_AT_MIDNIGHT[k]) return false;
+        }
+        return true;
+      });
+
+      if (eligible.length === 0) return null;
+
+      // palier minimal (= nb de gardes déjà attribuées)
+      let minTier = Number.POSITIVE_INFINITY;
+      for (const u of eligible) {
+        const tier = assignedCount.get(u) ?? 0;
+        if (tier < minTier) minTier = tier;
+      }
+      let pool = eligible.filter(u => (assignedCount.get(u) ?? 0) === minTier);
+      if (pool.length === 0) pool = eligible.slice();
+
+      // tie-breaker : rareté globale puis nom
+      pool.sort(stableCompareUsers);
+      return pool[0] ?? null;
+    }
+
     // ---------- Assignation pour 1 mois ----------
     const assignForMonth = (month: string) => {
-      // besoins mensuels restants
-      const remainingMonthNeed = new Map<string, number>();
-      for (const u of allUsers) {
-        const q = quotaByUserMonth.get(u)?.get(month) ?? 0;
-        const already = assignedCountByMonth.get(u)?.get(month) ?? 0;
-        remainingMonthNeed.set(u, Math.max(0, q - already));
-      }
+      const monthSlotsAll = slots.filter((s) => !takenSlot.has(s.id) && monthOf(s.date) === month);
 
-      // criticité future (mois suivants) — pour éviter de “manger” les uniques
-      const mIndex = months.indexOf(month);
-      const futureMonths = months.slice(mIndex + 1);
-      const criticalFuture = new Map<string, number>();
-      if (futureMonths.length > 0) {
-        for (const fm of futureMonths) {
-          for (const s of slots) {
-            if (takenSlot.has(s.id)) continue;
-            if (monthOf(s.date) !== fm) continue;
-            const set = availBySlot.get(s.id) ?? new Set<string>();
-            if (set.size === 1) {
-              const only = Array.from(set)[0];
-              criticalFuture.set(only, (criticalFuture.get(only) ?? 0) + 1);
-            }
+      // 3 passes : 1 candidat, 2 candidats, 3+ candidats
+      const buckets: SlotRow[][] = [[], [], []];
+      for (const s of monthSlotsAll) {
+        const c = (availBySlot.get(s.id)?.size ?? 0);
+        if (c <= 1) buckets[0].push(s);
+        else if (c === 2) buckets[1].push(s);
+        else buckets[2].push(s);
+      }
+      // à l’intérieur de chaque bucket, on garde l’ordre croissant de start_ts
+      buckets.forEach(b => b.sort((a, b) => String(a.start_ts).localeCompare(String(b.start_ts))));
+
+      for (const bucket of buckets) {
+        for (const s of bucket) {
+          if (takenSlot.has(s.id)) continue;
+
+          const candAll = Array.from(availBySlot.get(s.id) ?? new Set<string>());
+          if (candAll.length === 0) {
+            holes_list.push({ slot_id: s.id, date: s.date, kind: s.kind, candidates: 0 });
+            continue;
           }
-        }
-      }
 
-      const monthSlots = slots.filter((s) => !takenSlot.has(s.id) && monthOf(s.date) === month);
+          // PICK
+          const chosen = pickByTiers(candAll, month, s.date, s.kind);
 
-      // 1) Slots à 1 seul candidat (on *peut* dépasser le quota mensuel si c’est le seul candidat)
-      for (const s of monthSlots) {
-        if (takenSlot.has(s.id)) continue;
-        const set = availBySlot.get(s.id) ?? new Set<string>();
-        if (set.size === 1) {
-          const only = Array.from(set)[0];
-          const totNeed = remainingTotalNeed.get(only) ?? 0;
-          if (totNeed <= 0 && isFiniteTarget(only)) continue; // déjà au total cap
+          if (!chosen) {
+            // personne de disponible sous contraintes/quota → trou
+            holes_list.push({ slot_id: s.id, date: s.date, kind: s.kind, candidates: candAll.length });
+            continue;
+          }
 
-          // si fini & plus de quota mensuel, on accepte *exceptionnellement* pour éviter un trou
-          assignments.push({ slot_id: s.id, user_id: only, score: 1 });
+          // Affectation
+          assignments.push({ slot_id: s.id, user_id: chosen, score: 1 });
           takenSlot.add(s.id);
-          incAssigned(only, month);
-
-          if (isFiniteTarget(only)) {
-            if (totNeed > 0) remainingTotalNeed.set(only, totNeed - 1);
-            const mon = remainingMonthNeed.get(only) ?? 0;
-            if (mon > 0) remainingMonthNeed.set(only, mon - 1);
-          }
-          markAssigned(only, s.date, s.kind);
+          incAssigned(chosen, month);
+          markAssigned(chosen, s.date, s.kind);
         }
-      }
-
-      // 2) Reste des slots rare -> commun
-      const remaining = monthSlots
-        .filter((s) => !takenSlot.has(s.id))
-        .map((s) => ({ s, c: (availBySlot.get(s.id)?.size ?? 0) }))
-        .sort((a, b) => a.c - b.c || String(a.s.start_ts).localeCompare(String(b.s.start_ts)))
-        .map((x) => x.s);
-
-      for (const s of remaining) {
-        const candAll = Array.from(availBySlot.get(s.id) ?? new Set<string>());
-        if (candAll.length === 0) {
-          holes_list.push({ slot_id: s.id, date: s.date, kind: s.kind, candidates: 0 });
-          continue;
-        }
-
-        // --- PRIORITÉS DE POOL ---
-        // P1: finis avec besoin mensuel > 0 (respect cap mensuel)
-        const P1 = candAll.filter(u =>
-          isFiniteTarget(u) &&
-          (remainingTotalNeed.get(u) ?? 0) > 0 &&
-          (remainingMonthNeed.get(u) ?? 0) > 0
-        );
-
-        // P2: Max avec “soft” besoin mensuel > 0
-        const P2 = candAll.filter(u =>
-          !isFiniteTarget(u) &&
-          (remainingMonthNeed.get(u) ?? 0) > 0
-        );
-
-        // P3: autres (Max sans soft besoin) — en dernier recours
-        const P3 = candAll.filter(u => !P1.includes(u) && !P2.includes(u));
-
-        let pool0: string[] =
-          (P1.length > 0) ? P1 :
-          (P2.length > 0) ? P2 :
-          P3;
-
-        // A. interdire 2 créneaux le même jour si alternative
-        const poolNoSameDay = pool0.filter((u) => !userHasSameDay(u, s.date));
-        const poolA = poolNoSameDay.length > 0 ? poolNoSameDay : pool0;
-
-        // B. éviter Nuit->Nuit (J+1) & Nuit->Matin (J+1) si alternative
-        const poolAvoidHeavy = poolA.filter((u) => {
-          if (isNight(s.kind)) {
-            const lastN = lastNightDate.get(u);
-            if (lastN && isNextDay(lastN, s.date)) return false;
-          }
-          if (s.kind === 'SUN_08_14') {
-            const y = addDays(s.date, -1);
-            const kindsY = assignedKindsByUserDate.get(u)?.get(y);
-            if (kindsY) for (const k of kindsY) if (ENDS_AT_MIDNIGHT[k]) return false;
-          }
-          return true;
-        });
-        const poolB = poolAvoidHeavy.length > 0 ? poolAvoidHeavy : poolA;
-
-        // C. réserve criticité future pour finis (si alternative)
-        const poolKeepFuture = poolB.filter((u) => {
-          const cf = criticalFuture.get(u) ?? 0;
-          if (cf <= 0) return true;
-          if (!isFiniteTarget(u)) return true; // Max: ne bloque pas
-          const tot = remainingTotalNeed.get(u) ?? 0;
-          return (tot - 1) >= cf;
-        });
-        const poolC = poolKeepFuture.length > 0 ? poolKeepFuture : poolB;
-
-        // Choix = moins servi globalement, puis rareté globale, puis nom (stable)
-        let minCount = Number.POSITIVE_INFINITY;
-        for (const u of poolC) {
-          const c = assignedCount.get(u) ?? 0;
-          if (c < minCount) minCount = c;
-        }
-        let poolMin = poolC.filter((u) => (assignedCount.get(u) ?? 0) === minCount);
-        if (poolMin.length === 0) poolMin = poolC.slice();
-        poolMin.sort(stableCompareUsers);
-
-        const chosen = poolMin[0] ?? null;
-
-        if (!chosen) {
-          holes_list.push({ slot_id: s.id, date: s.date, kind: s.kind, candidates: candAll.length });
-          continue;
-        }
-
-        // Assignation & décréments
-        assignments.push({ slot_id: s.id, user_id: chosen, score: 1 });
-        takenSlot.add(s.id);
-        incAssigned(chosen, month);
-
-        if (isFiniteTarget(chosen)) {
-          const tot = remainingTotalNeed.get(chosen) ?? 0;
-          if (tot > 0) remainingTotalNeed.set(chosen, tot - 1);
-          const mon = remainingMonthNeed.get(chosen) ?? 0;
-          if (mon > 0) remainingMonthNeed.set(chosen, mon - 1);
-        }
-
-        markAssigned(chosen, s.date, s.kind);
       }
     };
 
-    // 3 passes : M1 -> M2 -> M3
+    // Passes M1 → M2 → M3
     for (const m of months) {
       assignForMonth(m);
     }
@@ -580,7 +489,7 @@ export async function POST(req: NextRequest) {
         return String(a.kind ?? '').localeCompare(String(b.kind ?? ''));
       });
 
-    // candidats by slot si demandé
+    // candidats by slot (avec noms) si demandé
     let out_candidates_by_slot: Record<string, { user_id: string; name: string }[]> | undefined;
     if (include_candidates) {
       out_candidates_by_slot = {};
@@ -619,14 +528,11 @@ export async function POST(req: NextRequest) {
       if (insErr) throw insErr;
     }
 
-    // assigned_count final (pour users_index)
-    const assignedCountOut: Record<string, number> = {};
-    for (const [u, c] of assignedCount.entries()) assignedCountOut[u] = c;
-
+    // Compteurs finaux (si tu veux les renvoyer)
     const users_index_out = Object.fromEntries(
       Object.keys(users_index).map(uid => [
         uid,
-        { ...users_index[uid], assigned_count: assignedCountOut[uid] ?? 0 }
+        { ...users_index[uid], assigned_count: assignedCount.get(uid) ?? 0 }
       ])
     );
 
@@ -642,7 +548,7 @@ export async function POST(req: NextRequest) {
       availability_summary: { availability_by_slot, users_index },
     });
   } catch (e: any) {
-    console.error('[generate-planning hard-filters]', e);
+    console.error('[generate-planning tiers]', e);
     return NextResponse.json({ error: e?.message ?? 'Server error' }, { status: 500 });
   }
 }
