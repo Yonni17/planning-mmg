@@ -1,4 +1,3 @@
-// app/api/admin/email-planning/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
 import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
@@ -7,21 +6,20 @@ import { emailPlanningReady } from '@/lib/emailTemplates';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+// Augmente la durée max si beaucoup de destinataires (Vercel / Node.js)
+export const maxDuration = 300;
 
 /* -------------------- Helpers auth (Bearer / Cookies) -------------------- */
 function getAccessTokenFromReq(req: NextRequest): string | null {
-  // 1) Authorization: Bearer <jwt>
   const auth = req.headers.get('authorization');
   if (auth && auth.toLowerCase().startsWith('bearer ')) {
     return auth.slice(7).trim();
   }
 
-  // 2) Cookie sb-access-token (Supabase helpers)
   const c = cookies();
   const direct = c.get('sb-access-token')?.value;
   if (direct) return direct;
 
-  // 3) Cookie objet sb-<ref>-auth-token .0/.1 ou complet
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || '';
   try {
     const ref = new URL(supabaseUrl).host.split('.')[0];
@@ -37,15 +35,12 @@ function getAccessTokenFromReq(req: NextRequest): string | null {
     const parsed = JSON.parse(txt);
     if (parsed?.access_token) return String(parsed.access_token);
     if (parsed?.currentSession?.access_token) return String(parsed.currentSession.access_token);
-  } catch {
-    // ignore
-  }
+  } catch {}
   return null;
 }
 
 async function requireAdminOrResponse(req: NextRequest) {
   const supabase = getSupabaseAdmin();
-
   const token = getAccessTokenFromReq(req);
   if (!token) {
     return {
@@ -54,7 +49,6 @@ async function requireAdminOrResponse(req: NextRequest) {
       userId: null as string | null,
     };
   }
-
   const { data: userData, error: uErr } = await supabase.auth.getUser(token);
   if (uErr || !userData?.user) {
     return {
@@ -63,7 +57,6 @@ async function requireAdminOrResponse(req: NextRequest) {
       userId: null as string | null,
     };
   }
-
   const uid = userData.user.id;
   const { data: isAdmin, error: aErr } = await supabase.rpc('is_admin', { uid });
   if (aErr || !isAdmin) {
@@ -73,7 +66,6 @@ async function requireAdminOrResponse(req: NextRequest) {
       userId: uid,
     };
   }
-
   return { errorResponse: null as NextResponse | null, supabase, userId: uid };
 }
 
@@ -121,6 +113,23 @@ type AgendaRow = {
   full_name: string | null;
 };
 
+/* ------------------------ Throttle & Retry ------------------------ */
+
+// Respect strictement 2 req/s → on vise 1.4–1.6 req/s
+const MIN_GAP_MS = Number(process.env.EMAIL_MIN_GAP_MS ?? 650); // 650ms entre envois
+const MAX_RETRIES = 5;
+
+// backoff exponentiel (avec jitter) quand 429
+function backoffDelay(attempt: number) {
+  const base = Math.min(1000 * Math.pow(2, attempt), 8000); // 1s, 2s, 4s, 8s (cap)
+  const jitter = Math.floor(Math.random() * 250); // +0–250ms
+  return base + jitter;
+}
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 /* ------------------------ Handler ------------------------ */
 export async function POST(req: NextRequest) {
   const admin = await requireAdminOrResponse(req);
@@ -133,7 +142,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: 'period_id requis' }, { status: 400 });
     }
 
-    // Récupérer la période (label)
+    // Période (label)
     const { data: period, error: perr } = await supabase
       .from('periods')
       .select('id,label')
@@ -144,8 +153,7 @@ export async function POST(req: NextRequest) {
     }
     const periodLabel: string = period.label;
 
-    // Récupérer agenda + emails : si tu as un RPC, utilise-le ;
-    // sinon, fallback join (ici on part sur le RPC existant côté projet).
+    // Agenda + emails (RPC existante)
     const { data: rows, error } = await supabase.rpc('get_agenda_with_emails', {
       q_period_id: period_id,
     });
@@ -161,7 +169,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, sent_count: 0, note: 'Aucune affectation' });
     }
 
-    // Regrouper par email
+    // Group by email
     const byEmail = new Map<string, { name: string; items: AgendaRow[] }>();
     for (const r of list) {
       const email = (r.email || '').trim();
@@ -171,56 +179,52 @@ export async function POST(req: NextRequest) {
       byEmail.set(email, cur);
     }
 
-    // Envoi par batch + retry 429
-    const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || process.env.SITE_URL || process.env.VERCEL_PROJECT_PRODUCTION_URL || '';
+    const siteUrl =
+      process.env.NEXT_PUBLIC_SITE_URL ||
+      process.env.SITE_URL ||
+      process.env.VERCEL_PROJECT_PRODUCTION_URL ||
+      '';
+
     const FROM_EMAIL =
       process.env.PLANNING_FROM_EMAIL ||
       process.env.SMTP_FROM ||
       'planning@mmg.example';
 
-    const recipients = Array.from(byEmail.entries()); // [email, {name, items}]
+    const recipients = Array.from(byEmail.entries()); // [email, { name, items }]
     let sent = 0;
-    const BATCH = 30;
-    const PAUSE_MS = 200;
 
-    const chunk = <T,>(arr: T[], n: number) => {
-      const out: T[][] = [];
-      for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
-      return out;
-    };
+    // On envoie **strictement en série** avec un interstice MIN_GAP_MS entre chaque requête,
+    // et un retry exponentiel en cas de 429. Ainsi, on ne dépassera jamais 2 req/s.
+    let lastSentAt = 0;
 
-    const batches = chunk(recipients, BATCH);
+    for (const [email, { name, items }] of recipients) {
+      // Trie pour un rendu propre
+      items.sort(
+        (a, b) =>
+          a.date.localeCompare(b.date) ||
+          a.kind.localeCompare(b.kind)
+      );
 
-    for (const group of batches) {
-      // Envois séquentiels dans le batch (pour lisser le débit)
-      for (const [email, { name, items }] of group) {
-        items.sort(
-          (a, b) =>
-            a.date.localeCompare(b.date) ||
-            a.kind.localeCompare(b.kind)
-        );
+      const rowsHtml = items.map((it) => {
+        const d = formatDateFR(it.date);
+        const kr = formatKindFR(it.kind);
+        const who = (it.display_name ?? it.full_name ?? '').toString();
+        return `<tr>
+          <td style="padding:6px 8px;border-bottom:1px solid #eee;">${d}</td>
+          <td style="padding:6px 8px;border-bottom:1px solid #eee;">${kr}</td>
+          <td style="padding:6px 8px;border-bottom:1px solid #eee;">${who}</td>
+        </tr>`;
+      }).join('');
 
-        // Corps “agenda” en tableau HTML (pour info visuelle)
-        const table = items
-          .map((it) => {
-            const d = formatDateFR(it.date);
-            const kr = formatKindFR(it.kind);
-            const who = (it.display_name ?? it.full_name ?? '').toString();
-            return `<tr><td style="padding:6px 8px;border-bottom:1px solid #eee;">${d}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;">${kr}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;">${who}</td></tr>`;
-          })
-          .join('');
+      const { subject, html, text } = emailPlanningReady({
+        name,
+        periodLabel,
+        siteUrl: siteUrl || '',
+      });
 
-        // Template pro
-        const { subject, html, text } = emailPlanningReady({
-          name,
-          periodLabel: periodLabel,
-          siteUrl: siteUrl || '',
-        });
-
-        // On injecte la table juste après le premier paragraphe du template
-        const htmlWithTable = html.replace(
-          '</p>\n    <p>Le planning',
-          `</p>
+      const htmlWithTable = html.replace(
+        '</p>\n    <p>Le planning',
+        `</p>
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;margin:8px 0 16px 0;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden">
       <thead>
         <tr style="background:#f3f4f6">
@@ -230,53 +234,48 @@ export async function POST(req: NextRequest) {
         </tr>
       </thead>
       <tbody>
-        ${table}
+        ${rowsHtml}
       </tbody>
     </table>
     <p>Le planning`
-        );
+      );
 
-        const trySend = async () => {
-          try {
-            await sendEmail({
-              to: email,
-              subject,
-              html: htmlWithTable,
-              text,
-              fromOverride: FROM_EMAIL,
-            });
-            return true;
-          } catch (err: any) {
-            // sendEmail (Resend) remonte un message "429: ..." en cas de rate limit
-            const msg = String(err?.message || '');
-            if (msg.startsWith('429')) return 'retry';
-            return false;
-          }
-        };
-
-        // 1er essai
-        const ok1 = await trySend();
-        if (ok1 === true) {
-          sent++;
-          continue;
-        }
-
-        // Retry si 429
-        if (ok1 === 'retry') {
-          await new Promise((r) => setTimeout(r, 800));
-          const ok2 = await trySend();
-          if (ok2 === true) {
-            sent++;
-            continue;
-          }
-        }
-
-        // Sinon : on log et on continue (ne bloque pas les autres)
-        console.warn('[email-planning] Échec d’envoi à', email);
+      // throttling : assure MIN_GAP_MS entre deux requêtes
+      const now = Date.now();
+      const diff = now - lastSentAt;
+      if (lastSentAt > 0 && diff < MIN_GAP_MS) {
+        await sleep(MIN_GAP_MS - diff);
       }
 
-      // Petite pause entre batches pour rester sous les limites
-      await new Promise((r) => setTimeout(r, PAUSE_MS));
+      let ok = false;
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          await sendEmail({
+            to: email,
+            subject,
+            html: htmlWithTable,
+            text,
+            fromOverride: FROM_EMAIL,
+          });
+          ok = true;
+          break;
+        } catch (err: any) {
+          const msg = String(err?.message || '');
+          const is429 = msg.startsWith('429'); // lib/email.ts préfixe "429: ..."
+          if (is429 && attempt < MAX_RETRIES) {
+            const wait = backoffDelay(attempt); // 1s → 2s → 4s → 8s (cap)
+            await sleep(wait);
+            continue;
+          }
+          // autres erreurs : on log et on continue
+          console.warn('[email-planning] Échec d’envoi à', email, msg);
+          break;
+        }
+      }
+
+      lastSentAt = Date.now(); // pour le calcul du prochain gap
+
+      if (ok) sent++;
     }
 
     return NextResponse.json({ ok: true, sent_count: sent });
