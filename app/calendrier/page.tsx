@@ -1,6 +1,7 @@
+// app/calendrier/page.tsx
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { supabase } from '@/lib/supabase';
 import { useRouter } from 'next/navigation';
 
@@ -59,8 +60,12 @@ export default function CalendrierPage() {
   const [deadline, setDeadline] = useState<Date | null>(null);
   const [nowTick, setNowTick] = useState<number>(Date.now()); // tick chaque minute
 
-  // Sauvegarde immédiate : suivi des slots en cours d’écriture
-  const [savingIds, setSavingIds] = useState<Set<string>>(new Set());
+  // autosave silencieux (debounce)
+  const debounceRef = useRef<number | null>(null);
+  const pendingIdsRef = useRef<Set<string>>(new Set());
+
+  // État d’ouverture du bloc d’instructions (ouvert par défaut en ≥ md)
+  const [instOpen, setInstOpen] = useState<boolean>(true);
 
   // --------- INIT ---------
   useEffect(() => {
@@ -93,7 +98,7 @@ export default function CalendrierPage() {
         }
       }
 
-      // 3) Périodes (⚠️ on récupère aussi open_at pour le compte à rebours)
+      // 3) Périodes (on récupère aussi open_at pour le compte à rebours)
       const { data: periodsData } = await supabase
         .from('periods')
         .select('id,label,open_at')
@@ -122,6 +127,14 @@ export default function CalendrierPage() {
       setLoading(false);
     })();
   }, [router]);
+
+  // défaut du bloc d’instructions : ouvert en ≥ md, replié en < md
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const mq = window.matchMedia('(min-width: 768px)');
+      setInstOpen(mq.matches);
+    }
+  }, []);
 
   // --------- TICK du compte à rebours (toutes les minutes) ---------
   useEffect(() => {
@@ -154,7 +167,7 @@ export default function CalendrierPage() {
     for (const row of avData || []) map[(row as any).slot_id as string] = !!(row as any).available;
     setAvailability(map);
 
-    setSavingIds(new Set());
+    pendingIdsRef.current = new Set();
   };
 
   const loadMonthStatus = async (pid: string, uid: string) => {
@@ -208,40 +221,50 @@ export default function CalendrierPage() {
 
   const currentMonthKey = useMemo(() => viewMonth ? yyyymm(viewMonth) : '', [viewMonth]);
 
-  // --------- ACTIONS (sauvegarde immédiate) ---------
-  const toggleLocal = async (slotId: string, locked: boolean) => {
-    if (locked || !userId) return;
-    if (savingIds.has(slotId)) return; // évite double-clic pendant save
+  // --------- AUTOSAVE (debounce) ---------
+  const flushSave = async () => {
+    if (!userId) return;
+    const ids = Array.from(pendingIdsRef.current);
+    if (ids.length === 0) return;
 
-    const next = !availability[slotId];
-
-    // Optimiste: on reflète tout de suite
-    setAvailability(prev => ({ ...prev, [slotId]: next }));
-    setSavingIds(prev => new Set(prev).add(slotId));
+    const payload = ids.map(slot_id => ({
+      user_id: userId,
+      slot_id,
+      available: !!availability[slot_id],
+    }));
 
     try {
-      const { error } = await supabase.from('availability').upsert([{
-        user_id: userId,
-        slot_id: slotId,
-        available: next,
-      }]);
+      const { error } = await supabase.from('availability').upsert(payload);
       if (error) throw error;
-    } catch (e) {
-      // rollback si échec
-      setAvailability(prev => ({ ...prev, [slotId]: !next }));
-      // console.error('save dispo failed', e);
-    } finally {
-      setSavingIds(prev => {
-        const copy = new Set(prev);
-        copy.delete(slotId);
+      pendingIdsRef.current = new Set();
+    } catch {
+      setAvailability(prev => {
+        const copy = { ...prev };
+        for (const slot_id of ids) {
+          copy[slot_id] = !copy[slot_id];
+        }
         return copy;
       });
+      pendingIdsRef.current = new Set();
     }
+  };
+
+  const scheduleSave = () => {
+    if (debounceRef.current) window.clearTimeout(debounceRef.current);
+    debounceRef.current = window.setTimeout(flushSave, 500);
+  };
+
+  // --------- ACTIONS ---------
+  const toggleLocal = (slotId: string, locked: boolean) => {
+    if (locked) return; // si verrouillé : on bloque le toggle
+    setAvailability(prev => ({ ...prev, [slotId]: !prev[slotId] }));
+    pendingIdsRef.current.add(slotId);
+    scheduleSave();
   };
 
   const validateMonth = async (mKey: string) => {
     if (!userId || !periodId) return;
-    const { error } = await supabase
+    await supabase
       .from('doctor_period_months')
       .upsert({
         user_id: userId,
@@ -251,14 +274,14 @@ export default function CalendrierPage() {
         validated_at: new Date().toISOString(),
         opted_out: false,
       }, { onConflict: 'user_id,period_id,month' });
-    if (!error) await loadMonthStatus(periodId, userId);
+    await loadMonthStatus(periodId, userId);
   };
 
   const unlockMonth = async (mKey: string) => {
     if (!userId || !periodId) return;
     const ok = confirm('Déverrouiller ce mois pour modifier vos disponibilités ?');
     if (!ok) return;
-    const { error } = await supabase
+    await supabase
       .from('doctor_period_months')
       .upsert({
         user_id: userId,
@@ -267,7 +290,7 @@ export default function CalendrierPage() {
         locked: false,
         validated_at: null,
       }, { onConflict: 'user_id,period_id,month' });
-    if (!error) await loadMonthStatus(periodId, userId);
+    await loadMonthStatus(periodId, userId);
   };
 
   // --------- COUNTDOWN helpers ---------
@@ -396,44 +419,54 @@ export default function CalendrierPage() {
         )}
       </div>
 
-      {/* Bloc d’explications + compte à rebours */}
-      <div
-        className="rounded-xl border p-4
+      {/* Bloc d’instructions REPLIABLE */}
+      <details
+        className="rounded-xl border
                    border-zinc-300 bg-zinc-50 text-zinc-800
                    dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+        open={instOpen}
+        onToggle={(e) => setInstOpen((e.target as HTMLDetailsElement).open)}
       >
-        <h2 className="text-base font-semibold mb-2">Comment renseigner vos disponibilités ?</h2>
-        <ol className="list-decimal pl-5 space-y-1 text-sm">
-          <li>Choisissez le <strong>trimestre</strong> en haut à gauche.</li>
-          <li>Cliquez sur le <strong>mois</strong> voulu pour l’afficher.</li>
-          <li>Dans chaque jour, <strong>cliquez</strong> les créneaux pour les passer en vert ✅ (disponible) ou en gris (indisponible).</li>
-          <li>Quand tout est ok pour le mois, cliquez sur <strong>“Verrouiller ce mois”</strong> pour signaler que c’est complet.</li>
-          <li>Vous pourrez <strong>déverrouiller</strong> si vous devez corriger avant la date limite.</li>
-        </ol>
+        <summary className="cursor-pointer select-none px-4 py-3 text-sm font-medium flex items-center justify-between">
+          <span>Comment renseigner vos disponibilités ?</span>
+          <span className="ml-4 text-xs text-zinc-500 dark:text-zinc-400">
+            {instOpen ? 'Masquer' : 'Afficher'}
+          </span>
+        </summary>
 
-        {/* Countdown */}
-        <div className="mt-3 text-sm">
-          {deadline ? (
-            <>
-              <div className="font-medium">
-                Clôture des disponibilités (J-21 avant le début du trimestre) :
-                <span className="ml-1">
-                  {fmtDateInParis(deadline)}
-                </span>
+        <div className="px-4 pb-4 -mt-1">
+          <ol className="list-decimal pl-5 space-y-1 text-sm">
+            <li>Choisissez le <strong>trimestre</strong> en haut.</li>
+            <li>Cliquez sur le <strong>mois</strong> voulu pour l’afficher.</li>
+            <li>Dans chaque jour, <strong>cliquez</strong> les créneaux pour les passer en vert ✅ (disponible) ou en gris (indisponible).</li>
+            <li>Quand tout est ok pour le mois, cliquez sur <strong>“Verrouiller ce mois”</strong> pour signaler que c’est complet.</li>
+            <li>Vous pouvez <strong>déverrouiller</strong> si vous devez corriger avant la date limite.</li>
+          </ol>
+
+          {/* Countdown intégré ici pour rester visible au besoin */}
+          <div className="mt-3 text-sm">
+            {deadline ? (
+              <>
+                <div className="font-medium">
+                  Clôture des disponibilités (J-21 avant le début du trimestre) :
+                  <span className="ml-1">
+                    {fmtDateInParis(deadline)}
+                  </span>
+                </div>
+                <div className="mt-1 font-semibold">
+                  {countdown && !countdown.past
+                    ? <>⏳ Il reste <span className="tabular-nums">{countdown.d} j {countdown.h} h {countdown.m} min</span>.</>
+                    : <>⛔ La période de saisie des disponibilités est <span className="font-bold">fermée</span>.</>}
+                </div>
+              </>
+            ) : (
+              <div className="text-zinc-500">
+                La date de clôture sera affichée dès qu’une période est sélectionnée.
               </div>
-              <div className="mt-1 font-semibold">
-                {countdown && !countdown.past
-                  ? <>⏳ Il reste <span className="tabular-nums">{countdown.d} j {countdown.h} h {countdown.m} min</span>.</>
-                  : <>⛔ La période de saisie des disponibilités est <span className="font-bold">fermée</span>.</>}
-              </div>
-            </>
-          ) : (
-            <div className="text-zinc-500">
-              La date de clôture sera affichée dès qu’une période est sélectionnée.
-            </div>
-          )}
+            )}
+          </div>
         </div>
-      </div>
+      </details>
 
       {/* Grille mensuelle */}
       <div className="grid grid-cols-7 gap-2">
@@ -484,8 +517,6 @@ export default function CalendrierPage() {
                   </div>
                 ) : daySlots.map((s) => {
                   const on = !!availability[s.id];
-                  const isSaving = savingIds.has(s.id);
-
                   const onCls =
                     'bg-emerald-600 text-white hover:bg-emerald-500 ' +
                     'dark:bg-emerald-600 dark:hover:bg-emerald-500';
@@ -497,13 +528,12 @@ export default function CalendrierPage() {
                     <button
                       key={s.id}
                       type="button"
-                      disabled={locked || isSaving}
+                      disabled={locked}
                       onClick={() => toggleLocal(s.id, locked)}
                       className={`flex-1 text-[11px] px-2 border-t first:border-t-0
                                   border-zinc-200 dark:border-zinc-700
                                   flex items-center justify-center
-                                  ${on ? onCls : offCls}
-                                  ${isSaving ? 'opacity-60 cursor-wait' : ''}`}
+                                  ${on ? onCls : offCls}`}
                       title={KIND_LABEL[s.kind]}
                     >
                       {KIND_LABEL[s.kind]}
@@ -516,7 +546,7 @@ export default function CalendrierPage() {
         })}
       </div>
 
-      {/* Pas de bouton “Enregistrer” : chaque clic sauvegarde immédiatement */}
+      {/* Pas de bouton “Enregistrer” : autosave silencieux */}
     </div>
   );
 }
