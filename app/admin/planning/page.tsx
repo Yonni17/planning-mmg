@@ -1,7 +1,7 @@
 // app/admin/planning/page.tsx
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(
@@ -85,6 +85,12 @@ export default function PlanningPage() {
   const [avail, setAvail] = useState<Map<string, Set<string>>>(new Map());
   const [monthFilter, setMonthFilter] = useState<string>('');
 
+  // scroll synchronisé (barre du haut)
+  const topScrollerRef = useRef<HTMLDivElement | null>(null);
+  const bottomScrollerRef = useRef<HTMLDivElement | null>(null);
+  const [scrollWidth, setScrollWidth] = useState<number>(0);
+  const syncing = useRef<'top' | 'bottom' | null>(null);
+
   useEffect(() => {
     (async () => {
       const { data } = await supabase.from('periods').select('id,label').order('label');
@@ -106,10 +112,20 @@ export default function PlanningPage() {
       const s: SlotRow[] = (slotsData ?? []) as any;
       setSlots(s);
 
+      // Récupère first_name/last_name aussi pour construire le nom si full_name est nul
       const { data: profData } = await supabase
         .from('profiles')
-        .select('user_id, full_name');
-      setProfiles((profData as any) ?? []);
+        .select('user_id, full_name, first_name, last_name');
+      const profs = (profData as any[]) ?? [];
+      setProfiles(
+        profs.map((p) => ({
+          user_id: p.user_id,
+          full_name:
+            (p.full_name && String(p.full_name).trim()) ||
+            `${(p.first_name ?? '').trim()} ${(p.last_name ?? '').trim()}`.trim() ||
+            p.user_id,
+        }))
+      );
 
       const { data: prefs } = await supabase
         .from('preferences_period')
@@ -155,6 +171,30 @@ export default function PlanningPage() {
     })();
   }, [periodId]);
 
+  // met à jour la largeur à scroller (haut) selon le tableau réel (bas)
+  useEffect(() => {
+    const el = bottomScrollerRef.current;
+    if (!el) return;
+    // petit délai pour laisser le DOM peindre
+    const id = setTimeout(() => setScrollWidth(el.scrollWidth), 0);
+    return () => clearTimeout(id);
+  }, [slots, avail, profiles, monthFilter]);
+
+  const onTopScroll = () => {
+    if (!topScrollerRef.current || !bottomScrollerRef.current) return;
+    if (syncing.current === 'bottom') return;
+    syncing.current = 'top';
+    bottomScrollerRef.current.scrollLeft = topScrollerRef.current.scrollLeft;
+    syncing.current = null;
+  };
+  const onBottomScroll = () => {
+    if (!topScrollerRef.current || !bottomScrollerRef.current) return;
+    if (syncing.current === 'top') return;
+    syncing.current = 'bottom';
+    topScrollerRef.current.scrollLeft = bottomScrollerRef.current.scrollLeft;
+    syncing.current = null;
+  };
+
   const monthOptions = useMemo(() => {
     const set = new Set<string>();
     for (const s of slots) if (s.date) set.add(s.date.slice(0, 7));
@@ -191,7 +231,6 @@ export default function PlanningPage() {
       const json = await res.json();
       if (!res.ok) throw new Error(json?.error ?? 'Erreur serveur');
 
-      // tri par date/kind
       const sorted = (json.assignments as AssignmentRow[]).slice().sort((a, b) => {
         const d = String(a.date ?? '').localeCompare(String(b.date ?? ''));
         if (d !== 0) return d;
@@ -262,7 +301,7 @@ export default function PlanningPage() {
     }
   }
 
-  // Name map (pour l’affichage)
+  // Name map (full_name || first+last || id)
   const nameMap = useMemo(() => {
     const m = new Map<string, string>();
     for (const p of profiles) m.set(p.user_id, p.full_name ?? p.user_id);
@@ -424,9 +463,104 @@ export default function PlanningPage() {
         </div>
       </div>
 
+      {/* SECTION TOUJOURS VISIBLE : Disponibilités par créneau */}
+      {periodId && (
+        <div className="space-y-3">
+          <div className="flex items-end justify-between">
+            <h2 className="text-xl font-bold">Disponibilités par créneau</h2>
+            <div className="flex items-center gap-2">
+              <label className="text-sm">Mois</label>
+              <select
+                value={monthFilter}
+                onChange={(e) => setMonthFilter(e.target.value)}
+                className="rounded border px-2 py-1"
+              >
+                {monthOptions.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {/* barre de scroll en haut (synchronisée) */}
+          <div
+            ref={topScrollerRef}
+            onScroll={onTopScroll}
+            className="overflow-x-auto"
+            style={{ height: 16 }}
+          >
+            <div style={{ width: scrollWidth, height: 1 }} />
+          </div>
+
+          {/* tableau scrollable (bas) */}
+          <div
+            ref={bottomScrollerRef}
+            onScroll={onBottomScroll}
+            className="overflow-x-auto rounded-lg border"
+          >
+            <table className="min-w-max text-xs" style={{ backgroundColor: '#000', color: '#fff' }}>
+              <thead>
+                <tr>
+                  <th className="sticky left-0 z-10 px-2 py-2 text-left border-r" style={{ backgroundColor: '#000' }}>
+                    Créneau
+                  </th>
+                  {doctorOrderForGrid.map((uid) => (
+                    <th
+                      key={uid}
+                      className="px-1 py-2 text-center border-b border-l"
+                      style={{
+                        width: 28,
+                        minWidth: 28,
+                        maxWidth: 28,
+                        writingMode: 'vertical-rl',
+                        transform: 'rotate(180deg)',
+                        whiteSpace: 'nowrap',
+                      }}
+                      title={getName(uid)}
+                    >
+                      {getName(uid)}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {filteredSlots.map((s) => {
+                  const label = `${formatDateLongFR(s.date)} — ${formatKindRange(s.kind)}`;
+                  return (
+                    <tr key={s.id}>
+                      <td className="sticky left-0 z-10 px-2 py-1 border-t border-r" style={{ backgroundColor: '#000' }}>
+                        {label}
+                      </td>
+                      {doctorOrderForGrid.map((uid) => {
+                        const ok = avail.get(s.id)?.has(uid) ?? false;
+                        return (
+                          <td
+                            key={uid}
+                            onClick={() => toggleAvailability(s.id, uid)}
+                            className="text-center align-middle border-t border-l cursor-pointer select-none hover:bg-white/10"
+                            style={{ width: 28, minWidth: 28, maxWidth: 28 }}
+                            title={ok ? 'Cliquer pour retirer la dispo' : 'Cliquer pour ajouter la dispo'}
+                          >
+                            {ok ? <span className="font-bold" style={{ color: '#22c55e' }}>✕</span> : <span> </span>}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <p className="text-xs text-zinc-400">
+            Astuce : cliquez sur une case pour (dé)cocher la disponibilité du médecin pour ce créneau.
+          </p>
+        </div>
+      )}
+
+      {/* SECTIONS qui dépendent d’une génération */}
       {result && (
         <div className="space-y-6">
-          {/* Trous */}
           <div>
             <h2 className="text-xl font-bold">Créneaux sans assignation</h2>
             {result.holes === 0 ? (
@@ -453,7 +587,6 @@ export default function PlanningPage() {
             )}
           </div>
 
-          {/* Aperçu (éditable) */}
           <div>
             <h2 className="text-xl font-bold mb-2">Aperçu des affectations (éditable)</h2>
             <table className="w-full text-sm border">
@@ -498,7 +631,6 @@ export default function PlanningPage() {
             </table>
           </div>
 
-          {/* Répartition */}
           <div>
             <h2 className="text-xl font-bold mb-2">Répartition des gardes (après vos modifications)</h2>
             <table className="w-full text-sm border">
@@ -523,84 +655,6 @@ export default function PlanningPage() {
                 ))}
               </tbody>
             </table>
-          </div>
-
-          {/* Grille de disponibilités (fond noir, textes blancs, croix vertes) */}
-          <div>
-            <div className="flex items-end justify-between mb-2">
-              <h2 className="text-xl font-bold">Disponibilités par créneau</h2>
-              <div className="flex items-center gap-2">
-                <label className="text-sm">Mois</label>
-                <select
-                  value={monthFilter}
-                  onChange={(e) => setMonthFilter(e.target.value)}
-                  className="rounded border px-2 py-1"
-                >
-                  {monthOptions.map((m) => (
-                    <option key={m} value={m}>{m}</option>
-                  ))}
-                </select>
-              </div>
-            </div>
-
-            <div className="overflow-x-auto rounded-lg border">
-              <table className="min-w-max text-xs" style={{ backgroundColor: '#000', color: '#fff' }}>
-                <thead>
-                  <tr>
-                    <th className="sticky left-0 z-10 px-2 py-2 text-left border-r" style={{ backgroundColor: '#000' }}>
-                      Créneau
-                    </th>
-                    {doctorOrderForGrid.map((uid) => (
-                      <th
-                        key={uid}
-                        className="px-1 py-2 text-center border-b border-l"
-                        style={{
-                          width: 28,
-                          minWidth: 28,
-                          maxWidth: 28,
-                          writingMode: 'vertical-rl',
-                          transform: 'rotate(180deg)',
-                          whiteSpace: 'nowrap',
-                        }}
-                        title={nameMap.get(uid) ?? uid}
-                      >
-                        {nameMap.get(uid) ?? uid}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredSlots.map((s) => {
-                    const label = `${formatDateLongFR(s.date)} — ${formatKindRange(s.kind)}`;
-                    return (
-                      <tr key={s.id}>
-                        <td className="sticky left-0 z-10 px-2 py-1 border-t border-r" style={{ backgroundColor: '#000' }}>
-                          {label}
-                        </td>
-                        {doctorOrderForGrid.map((uid) => {
-                          const ok = avail.get(s.id)?.has(uid) ?? false;
-                          return (
-                            <td
-                              key={uid}
-                              onClick={() => toggleAvailability(s.id, uid)}
-                              className="text-center align-middle border-t border-l cursor-pointer select-none hover:bg-white/10"
-                              style={{ width: 28, minWidth: 28, maxWidth: 28 }}
-                              title={ok ? 'Cliquer pour retirer la dispo' : 'Cliquer pour ajouter la dispo'}
-                            >
-                              {ok ? <span className="font-bold" style={{ color: '#22c55e' }}>✕</span> : <span> </span>}
-                            </td>
-                          );
-                        })}
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-
-            <p className="text-xs text-zinc-400 mt-2">
-              Astuce : cliquez sur une case pour (dé)cocher la disponibilité du médecin pour ce créneau.
-            </p>
           </div>
         </div>
       )}
