@@ -242,21 +242,7 @@ export default function PlanningPage() {
         candidates: avail.get(s.id)?.size ?? 0,
       }));
 
-    // Candidats par slot (noms complets) pour l’édition
-    const nameMap = new Map<string, string>();
-    for (const p of profiles) nameMap.set(p.user_id, p.full_name ?? p.user_id);
-    const nameOf = (uid: string) => nameMap.get(uid) ?? uid;
-
-    const candidates_by_slot: CandidatesBySlot = {};
-    for (const s of slots) {
-      const set = avail.get(s.id) ?? new Set<string>();
-      candidates_by_slot[s.id] = Array.from(set).map((uid) => ({
-        user_id: uid,
-        name: nameOf(uid),
-      }));
-    }
-
-    // Tri par date/kind
+    // Payload minimal (candidates_by_slot sera (re)calculé après via useEffect quand avail sera prêt)
     assignments.sort((a, b) => {
       const d = String(a.date ?? '').localeCompare(String(b.date ?? ''));
       if (d !== 0) return d;
@@ -270,7 +256,7 @@ export default function PlanningPage() {
       assignments,
       runs: [{ seed: 0, total_score: assignments.length, holes: holes_list.length }],
       holes_list,
-      candidates_by_slot,
+      candidates_by_slot: undefined, // on laisse vide ici
     };
 
     setEdited({});
@@ -304,6 +290,45 @@ export default function PlanningPage() {
     return slots.filter((s) => s.date.startsWith(monthFilter));
   }, [slots, monthFilter]);
 
+  // === NOUVEAU : recalculer candidates_by_slot dès que avail/slots/profiles changent ===
+  useEffect(() => {
+    if (!result) return;
+
+    // Construit une map candidats { slotId -> [{user_id, name}] }
+    const buildCandidates = (): CandidatesBySlot => {
+      const out: CandidatesBySlot = {};
+      for (const s of slots) {
+        const set = avail.get(s.id) ?? new Set<string>();
+        out[s.id] = Array.from(set).map((uid) => ({
+          user_id: uid,
+          name: nameMap.get(uid) ?? uid,
+        }));
+      }
+      return out;
+    };
+
+    // Compare sommairement pour éviter les boucles d’updates inutiles
+    const shallowEqual = (a?: CandidatesBySlot, b?: CandidatesBySlot) => {
+      if (!a && !b) return true;
+      if (!a || !b) return false;
+      const aKeys = Object.keys(a);
+      const bKeys = Object.keys(b);
+      if (aKeys.length !== bKeys.length) return false;
+      for (const k of aKeys) {
+        const la = a[k]?.length ?? 0;
+        const lb = b[k]?.length ?? 0;
+        if (la !== lb) return false;
+      }
+      return true;
+    };
+
+    const fresh = buildCandidates();
+
+    if (!shallowEqual(result.candidates_by_slot, fresh)) {
+      setResult((prev) => (prev ? { ...prev, candidates_by_slot: fresh } : prev));
+    }
+  }, [result, avail, slots, nameMap]);
+
   // Générer (recalcule une proposition, ne touche pas la DB)
   async function generate() {
     if (!periodId) return;
@@ -334,6 +359,7 @@ export default function PlanningPage() {
         return String(a.kind ?? '').localeCompare(String(b.kind ?? ''));
       });
 
+      // On garde candidates_by_slot du backend si présent, sinon le useEffect ci-dessus le comblera
       setResult({ ...json, assignments: sorted });
     } catch (e: any) {
       alert(e?.message ?? 'Erreur');
@@ -563,7 +589,7 @@ export default function PlanningPage() {
               </span>
             ) : null}
           </div>
-          {!result ? (
+        {!result ? (
             <p className="text-sm text-gray-600">Sélectionnez une période.</p>
           ) : result.holes === 0 ? (
             <p className="text-sm text-gray-600">Aucun trou 🎉</p>
