@@ -1,212 +1,304 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
-import { createClient } from '@supabase/supabase-js';
+import { useEffect, useMemo, useState, ReactNode } from 'react';
+import { supabase } from '@/lib/supabase';
+import { useRouter } from 'next/navigation';
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-);
-
-type SlotKind =
-  | 'WEEKDAY_20_00'
-  | 'SAT_12_18'
-  | 'SAT_18_00'
-  | 'SUN_08_14'
-  | 'SUN_14_20'
-  | 'SUN_20_24';
-
-const KIND_TIME: Record<SlotKind, [string, string]> = {
-  WEEKDAY_20_00: ['20:00', '00:00'],
-  SAT_12_18: ['12:00', '18:00'],
-  SAT_18_00: ['18:00', '00:00'],
-  SUN_08_14: ['08:00', '14:00'],
-  SUN_14_20: ['14:00', '20:00'],
-  SUN_20_24: ['20:00', '00:00'],
+type Slot = {
+  id: string;
+  period_id: string;
+  date: string; // YYYY-MM-DD (locale)
+  start_ts: string;
+  end_ts: string;
+  kind:
+    | 'WEEKDAY_20_00'
+    | 'SAT_12_18'
+    | 'SAT_18_00'
+    | 'SUN_08_14'
+    | 'SUN_14_20'
+    | 'SUN_20_24';
 };
-
-function hmsToFR(s: string) {
-  return s.replace(':', 'h');
-}
-function kindToRange(kind: SlotKind) {
-  const [a, b] = KIND_TIME[kind];
-  return `${hmsToFR(a)} - ${hmsToFR(b)}`;
-}
-function formatDateLongFR(ymd: string) {
-  const d = new Date(`${ymd}T00:00:00`);
-  const day = d.toLocaleDateString('fr-FR', { weekday: 'long' });
-  const month = d.toLocaleDateString('fr-FR', { month: 'long' });
-  const dd = d.getDate();
-  const ddStr = dd === 1 ? '1er' : String(dd);
-  const cap = (x: string) => x.charAt(0).toUpperCase() + x.slice(1);
-  return `${cap(day)} ${ddStr} ${month}`;
-}
 
 type Period = { id: string; label: string };
-type Row = {
-  slot_id: string;
-  date: string;
-  kind: SlotKind;
-  user_id: string | null;
-  display_name: string | null;
+
+const pad = (n: number) => String(n).padStart(2, '0');
+const yyyymm = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
+const ymdLocal = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const frMonthLabel = (d: Date) => d.toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' });
+
+const KIND_LABEL: Record<Slot['kind'], string> = {
+  WEEKDAY_20_00: '20:00–00:00',
+  SAT_12_18: '12:00–18:00',
+  SAT_18_00: '18:00–00:00',
+  SUN_08_14: '08:00–14:00',
+  SUN_14_20: '14:00–20:00',
+  SUN_20_24: '20:00–00:00',
 };
 
+const WEEKDAYS_FR = ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam', 'Dim'];
+
 export default function AgendaPage() {
+  const router = useRouter();
+
   const [periods, setPeriods] = useState<Period[]>([]);
-  const [periodId, setPeriodId] = useState('');
-  const [periodLabel, setPeriodLabel] = useState('');
-  const [rows, setRows] = useState<Row[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [periodId, setPeriodId] = useState<string>('');
+  const [slots, setSlots] = useState<Slot[]>([]);
+  const [assignBySlot, setAssignBySlot] = useState<Record<string, string>>({}); // slot_id -> user_id
+  const [nameMap, setNameMap] = useState<Record<string, string>>({}); // user_id -> "Prénom Nom"
+  const [msg, setMsg] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const [viewMonth, setViewMonth] = useState<Date | null>(null);
+
+  // 👤 nouvel état : id de l'utilisateur connecté
   const [meId, setMeId] = useState<string | null>(null);
 
-  // charge périodes + user courant
   useEffect(() => {
-    (async () => {
-      const [{ data: per }, auth] = await Promise.all([
-        supabase.from('periods').select('id,label').order('open_at', { ascending: false }),
-        supabase.auth.getUser(),
-      ]);
-      const list: Period[] = (per as any) ?? [];
-      setPeriods(list);
-      if (list.length && !periodId) {
-        setPeriodId(list[0].id);
-        setPeriodLabel(list[0].label);
-      }
-      const uid = auth?.data?.user?.id ?? null;
-      setMeId(uid);
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // charge agenda pour la période
-  useEffect(() => {
-    if (!periodId) return;
     (async () => {
       setLoading(true);
 
-      const cur = periods.find((p) => p.id === periodId);
-      setPeriodLabel(cur?.label ?? '');
+      // Auth minimal: juste vérifier qu’on a une session, sinon login
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) { router.replace('/login'); return; }
+      setMeId(user.id); // 🔸 mémorise l'ID pour le surlignage
 
-      const { data, error } = await supabase
-        .from('assignments')
-        .select(`
-          slot_id,
-          user_id,
-          slots!inner(id, date, kind, start_ts),
-          profiles!assignments_user_id_fkey(user_id, full_name, first_name, last_name)
-        `)
-        .eq('period_id', periodId)
-        .order('slots(start_ts)', { ascending: true });
+      // Périodes
+      const { data: periodsData, error: pErr } = await supabase
+        .from('periods')
+        .select('id,label')
+        .order('open_at', { ascending: false });
+      if (pErr) { setMsg(`Erreur périodes: ${pErr.message}`); setLoading(false); return; }
 
-      if (error) {
-        console.error('[agenda] load error', error);
-        setRows([]);
-        setLoading(false);
-        return;
-      }
-
-      const rws: Row[] = (data ?? []).map((r: any) => {
-        const built = [r.profiles?.first_name, r.profiles?.last_name].filter(Boolean).join(' ').trim() || null;
-        const full = (r.profiles?.full_name as string | undefined)?.trim() || built;
-        return {
-          slot_id: r.slots?.id as string,
-          date: r.slots?.date as string,
-          kind: r.slots?.kind as SlotKind,
-          user_id: (r.user_id as string) ?? null,
-          display_name: full,
-        };
-      });
-
-      setRows(rws);
+      setPeriods(periodsData || []);
+      const defId = periodsData?.[0]?.id || '';
+      setPeriodId(defId);
+      if (defId) await loadData(defId);
       setLoading(false);
     })();
-  }, [periodId, periods]);
+  }, [router]);
 
-  const table = useMemo(() => {
-    if (!rows.length) return null;
+  async function loadData(pid: string) {
+    setMsg(null);
+
+    // Slots de la période (on lit la colonne "date" locale)
+    const { data: slotsData, error: sErr } = await supabase
+      .from('slots')
+      .select('id, period_id, date, start_ts, end_ts, kind')
+      .eq('period_id', pid)
+      .order('start_ts', { ascending: true });
+    if (sErr) { setMsg(`Erreur slots: ${sErr.message}`); return; }
+    setSlots((slotsData || []) as Slot[]);
+
+    if (!viewMonth && (slotsData?.length ?? 0) > 0) {
+      const d0 = new Date(slotsData![0].date + 'T00:00:00'); // base locale
+      setViewMonth(new Date(d0.getFullYear(), d0.getMonth(), 1));
+    }
+
+    // Assignations de la période
+    const { data: assigns, error: aErr } = await supabase
+      .from('assignments')
+      .select('slot_id, user_id')
+      .eq('period_id', pid);
+    if (aErr) { setMsg(`Erreur assignations: ${aErr.message}`); return; }
+
+    const map: Record<string, string> = {};
+    const uids = new Set<string>();
+    for (const row of assigns || []) {
+      if (row.slot_id && row.user_id) {
+        map[row.slot_id] = row.user_id;
+        uids.add(row.user_id);
+      }
+    }
+    setAssignBySlot(map);
+
+    // Profils des user_ids utilisés → first_name / last_name
+    if (uids.size > 0) {
+      const { data: profs, error: profErr } = await supabase
+        .from('profiles')
+        .select('user_id, first_name, last_name')
+        .in('user_id', Array.from(uids));
+      if (profErr) { setMsg(`Erreur profils: ${profErr.message}`); return; }
+
+      const nmap: Record<string,string> = {};
+      for (const p of profs || []) {
+        const fn = (p.first_name ?? '').trim();
+        const ln = (p.last_name ?? '').trim();
+        const full = `${fn} ${ln}`.trim();
+        nmap[p.user_id as string] = full || (p.user_id as string);
+      }
+      setNameMap(nmap);
+    } else {
+      setNameMap({});
+    }
+  }
+
+  // Mois présents dans la période (depuis slot.date)
+  const monthsInPeriod = useMemo(() => {
+    const set = new Set<string>();
+    for (const s of slots) {
+      const d = new Date(s.date + 'T00:00:00');
+      set.add(yyyymm(d));
+    }
+    return Array.from(set).sort().map(m => {
+      const d = new Date(m + '-01T00:00:00');
+      return { key: m, date: d, label: frMonthLabel(d) };
+    });
+  }, [slots]);
+
+  // Cellules du mois courant
+  const daysOfMonth = useMemo(() => {
+    if (!viewMonth) return [];
+    const y = viewMonth.getFullYear();
+    const m = viewMonth.getMonth();
+    const first = new Date(y, m, 1);
+    const last = new Date(y, m + 1, 0);
+    const firstWeekday = (first.getDay() + 6) % 7; // 0=Lun ... 6=Dim
+    const cells: (Date | null)[] = [];
+    for (let i = 0; i < firstWeekday; i++) cells.push(null);
+    for (let d = 1; d <= last.getDate(); d++) cells.push(new Date(y, m, d));
+    while (cells.length % 7 !== 0) cells.push(null);
+    return cells;
+  }, [viewMonth]);
+
+  // Slots groupés par date (clé locale YYYY-MM-DD)
+  const slotsByDate = useMemo(() => {
+    const map: Record<string, Slot[]> = {};
+    for (const s of slots) (map[s.date] ||= []).push(s);
+    Object.values(map).forEach(list => list.sort((a, b) => +new Date(a.start_ts) - +new Date(b.start_ts)));
+    return map;
+  }, [slots]);
+
+  const labelFor = (k: Slot['kind']) => KIND_LABEL[k];
+
+  // rendu d'une cellule de jour (compact = mobile)
+  const renderDayCell = (d: Date | null, key: React.Key, compact = false): ReactNode => {
+    if (!d) {
+      return (
+        <div
+          key={key}
+          className={`rounded-xl border border-dashed border-gray-200 bg-gray-50 ${compact ? 'h-24 sm:h-28' : 'h-32'}`}
+        />
+      );
+    }
+
+    const ymd = ymdLocal(d);
+    const daySlots = slotsByDate[ymd] || [];
+    const dayNum = d.getDate();
+
+    const todayYmd = ymdLocal(new Date());
+    const isToday = ymd === todayYmd;
 
     return (
-      <table className="w-full text-sm">
-        <thead className="bg-gray-50 dark:bg-zinc-900/60">
-          <tr>
-            <th className="p-2 text-left font-semibold">Date</th>
-            <th className="p-2 text-left font-semibold">Créneau</th>
-            <th className="p-2 text-left font-semibold">Médecin</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r, i) => {
-            const isMe = !!(meId && r.user_id && meId === r.user_id);
+      <div
+        key={key}
+        className={`rounded-2xl border border-gray-200 overflow-hidden bg-white shadow-sm ${compact ? 'h-24 sm:h-28' : 'h-32'} ${isToday ? 'ring-1 ring-emerald-300' : ''}`}
+      >
+        <div className="px-2 pt-2 pb-1 text-sm font-medium text-gray-700 flex items-center justify-between">
+          <span>{dayNum}</span>
+          <span className="text-xs text-gray-400">
+            {d.toLocaleDateString('fr-FR', { weekday: 'short' })}
+          </span>
+        </div>
 
-            // on garde le même rendu, avec zebra; si c'est "moi", on force un fond + bordure gauche
-            const zebra =
-              i % 2 === 0
-                ? 'bg-white dark:bg-zinc-900/30'
-                : 'bg-gray-50 dark:bg-zinc-900/10';
-
-            const highlight =
-              'ring-1 ring-amber-500/30 !bg-amber-50 dark:!bg-amber-900/30 border-l-4 border-amber-400';
+        <div className="flex flex-col h-[calc(100%-2rem)]">
+          {daySlots.length === 0 ? (
+            <div className="flex-1 text-[11px] px-2 text-gray-400 flex items-center justify-center">Aucun créneau</div>
+          ) : daySlots.map((s) => {
+            const uid = assignBySlot[s.id];
+            const name = uid ? (nameMap[uid] ?? uid) : null;
+            const isMine = !!(meId && uid && meId === uid); // ✅ créneau du médecin connecté ?
 
             return (
-              <tr
-                key={r.slot_id}
-                className={`${zebra} ${isMe ? highlight : 'border-l-4 border-transparent'}`}
-                style={isMe ? { backgroundColor: 'rgba(245, 158, 11, 0.1)' } : undefined} // secours si le theme override
+              <div
+                key={s.id}
+                className={`flex-1 text-[11px] md:text-xs px-2 border-t first:border-t-0 flex items-center justify-between
+                            ${isMine ? 'bg-amber-50/80 dark:bg-amber-900/30 border-l-4 border-amber-400' : 'bg-white text-gray-700'}`}
+                title={labelFor(s.kind)}
+                style={isMine ? { backgroundColor: 'rgba(245, 158, 11, 0.12)' } : undefined} // petit secours
               >
-                <td className="p-2 align-middle">
-                  <span className={isMe ? 'font-semibold text-amber-700 dark:text-amber-300' : undefined}>
-                    {formatDateLongFR(r.date)}
+                <span className="truncate">{labelFor(s.kind)}</span>
+                {name ? (
+                  <span className={`truncate max-w-[55%] md:max-w-none ${isMine ? 'font-semibold text-amber-700 dark:text-amber-300' : 'text-emerald-600 font-semibold'}`}>
+                    {name}{isMine ? ' (vous)' : ''}
                   </span>
-                </td>
-                <td className="p-2 align-middle">{kindToRange(r.kind)}</td>
-                <td className="p-2 align-middle">
-                  <span className={isMe ? 'font-semibold text-amber-700 dark:text-amber-300' : undefined}>
-                    {r.display_name ?? '—'}{isMe ? ' (vous)' : ''}
-                  </span>
-                </td>
-              </tr>
+                ) : (
+                  <span className="italic text-gray-400">—</span>
+                )}
+              </div>
             );
           })}
-        </tbody>
-      </table>
+        </div>
+      </div>
     );
-  }, [rows, meId]);
+  };
+
+  if (loading) return <p>Chargement…</p>;
 
   return (
-    <div className="mx-auto max-w-5xl p-4 space-y-6">
-      <h1 className="text-2xl font-bold">Agenda MMG</h1>
+    <div className="space-y-4">
+      <h1 className="text-xl font-semibold">Agenda MMG</h1>
 
-      <div className="flex flex-col gap-3 md:flex-row md:items-end">
-        <div className="flex flex-col">
-          <label className="text-sm font-medium mb-1">Période</label>
+      {/* Sélecteurs période & mois */}
+      <div className="flex flex-col gap-3 md:flex-row md:items-center">
+        <div className="flex items-center gap-2">
+          <label className="text-sm text-gray-600">Période</label>
           <select
+            className="border rounded p-2 bg-white"
             value={periodId}
-            onChange={(e) => setPeriodId(e.target.value)}
-            className="w-full md:w-auto rounded-lg border px-3 py-2 text-gray-900 bg-white dark:bg-zinc-900 dark:text-zinc-100"
+            onChange={async (e) => {
+              const v = e.target.value;
+              setPeriodId(v);
+              await loadData(v);
+            }}
           >
-            {periods.map((p) => (
-              <option key={p.id} value={p.id}>{p.label}</option>
-            ))}
+            {periods.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
           </select>
-          {periodLabel ? (
-            <p className="text-xs text-zinc-500 mt-1">Période sélectionnée : {periodLabel}</p>
-          ) : null}
+        </div>
+
+        {/* Liste des mois — défilable horizontalement sur mobile */}
+        <div className="md:ml-2 overflow-x-auto">
+          <div className="inline-flex gap-2 pr-1">
+            {monthsInPeriod.map(m => (
+              <button
+                key={m.key}
+                className={`px-3 py-1.5 rounded border transition-colors ${
+                  viewMonth && yyyymm(viewMonth) === m.key
+                    ? 'bg-black text-white border-black'
+                    : 'hover:bg-gray-50 border-gray-300'
+                }`}
+                onClick={() => setViewMonth(m.date)}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
-      <div className="rounded-md border">
-        {loading ? (
-          <div className="p-4 text-sm text-zinc-500">Chargement…</div>
-        ) : !rows.length ? (
-          <div className="p-4 text-sm text-zinc-500">Aucune garde pour cette période.</div>
-        ) : (
-          table
-        )}
+      {msg && (
+        <div className={`p-3 rounded border ${msg.startsWith('Erreur') ? 'bg-red-50 border-red-200 text-red-900' : 'bg-gray-50 border-gray-200 text-gray-800'}`}>
+          {msg}
+        </div>
+      )}
+
+      {/* ======= Desktop / Tablette : vraie grille 7 colonnes ======= */}
+      <div className="hidden md:block">
+        {/* Entête des jours de la semaine (md+) */}
+        <div className="grid grid-cols-7 gap-3 mb-2">
+          {WEEKDAYS_FR.map(w => (
+            <div key={w} className="text-center text-xs uppercase tracking-wide text-gray-500">{w}</div>
+          ))}
+        </div>
+
+        <div className="grid grid-cols-7 gap-3">
+          {daysOfMonth.map((d, i) => renderDayCell(d, i, false))}
+        </div>
       </div>
 
-      <p className="text-xs text-zinc-500">
-        Astuce : vos créneaux sont <span className="font-semibold text-amber-700 dark:text-amber-300">surlignés</span> et marqués d’une barre gauche ambrée.
-      </p>
+      {/* ======= Mobile : grille compacte 2 → 3 colonnes ======= */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 md:hidden">
+        {daysOfMonth.map((d, i) => renderDayCell(d, i, true))}
+      </div>
     </div>
   );
 }
