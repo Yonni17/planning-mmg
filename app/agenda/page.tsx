@@ -3,17 +3,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
 
-/**
- * Client Supabase (navigateur)
- */
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 );
 
-/**
- * Types & helpers d'affichage
- */
 type SlotKind =
   | 'WEEKDAY_20_00'
   | 'SAT_12_18'
@@ -31,68 +25,60 @@ const KIND_TIME: Record<SlotKind, [string, string]> = {
   SUN_20_24: ['20:00', '00:00'],
 };
 
+function hmsToFR(s: string) {
+  return s.replace(':', 'h');
+}
+function kindToRange(kind: SlotKind) {
+  const [a, b] = KIND_TIME[kind];
+  return `${hmsToFR(a)} - ${hmsToFR(b)}`;
+}
 function formatDateLongFR(ymd: string) {
   const d = new Date(`${ymd}T00:00:00`);
   const day = d.toLocaleDateString('fr-FR', { weekday: 'long' });
   const month = d.toLocaleDateString('fr-FR', { month: 'long' });
   const dd = d.getDate();
   const ddStr = dd === 1 ? '1er' : String(dd);
-  const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+  const cap = (x: string) => x.charAt(0).toUpperCase() + x.slice(1);
   return `${cap(day)} ${ddStr} ${month}`;
 }
-function formatKindRange(kind: SlotKind) {
-  const t = KIND_TIME[kind];
-  const h = (s: string) => s.replace(':', 'h');
-  return `${h(t[0])} - ${h(t[1])}`;
-}
 
-/**
- * Données
- */
 type Period = { id: string; label: string };
-type AgendaRow = {
-  date: string; // YYYY-MM-DD
-  kind: SlotKind;
-  start_ts: string;
+type Row = {
   slot_id: string;
+  date: string;
+  kind: SlotKind;
   user_id: string | null;
   display_name: string | null;
 };
 
 export default function AgendaPage() {
   const [periods, setPeriods] = useState<Period[]>([]);
-  const [periodId, setPeriodId] = useState<string>('');
-  const [periodLabel, setPeriodLabel] = useState<string>('');
+  const [periodId, setPeriodId] = useState('');
+  const [periodLabel, setPeriodLabel] = useState('');
+  const [rows, setRows] = useState<Row[]>([]);
   const [loading, setLoading] = useState(false);
+  const [meId, setMeId] = useState<string | null>(null);
 
-  const [rows, setRows] = useState<AgendaRow[]>([]);
-  const [me, setMe] = useState<{ user_id: string; email?: string } | null>(null);
-
-  // Charger périodes + utilisateur connecté
+  // charge périodes + user courant
   useEffect(() => {
     (async () => {
-      const [{ data: per }, { data: { user } = {} }] = await Promise.all([
+      const [{ data: per }, auth] = await Promise.all([
         supabase.from('periods').select('id,label').order('open_at', { ascending: false }),
-        supabase.auth.getUser().then((r) => r?.data ?? { user: null }),
+        supabase.auth.getUser(),
       ]);
-
-      const ps: Period[] = (per as any) ?? [];
-      setPeriods(ps);
-
-      if (ps.length && !periodId) {
-        // Par défaut, sélectionne la plus récente
-        setPeriodId(ps[0].id);
-        setPeriodLabel(ps[0].label);
+      const list: Period[] = (per as any) ?? [];
+      setPeriods(list);
+      if (list.length && !periodId) {
+        setPeriodId(list[0].id);
+        setPeriodLabel(list[0].label);
       }
-
-      if (user) {
-        setMe({ user_id: user.id, email: user.email ?? undefined });
-      }
+      const uid = auth?.data?.user?.id ?? null;
+      setMeId(uid);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Quand la période change → charger l'agenda
+  // charge agenda pour la période
   useEffect(() => {
     if (!periodId) return;
     (async () => {
@@ -101,7 +87,6 @@ export default function AgendaPage() {
       const cur = periods.find((p) => p.id === periodId);
       setPeriodLabel(cur?.label ?? '');
 
-      // assignments + slots + noms profils (left join)
       const { data, error } = await supabase
         .from('assignments')
         .select(`
@@ -120,41 +105,72 @@ export default function AgendaPage() {
         return;
       }
 
-      const rws: AgendaRow[] = (data ?? []).map((r: any) => {
-        const constructed =
-          [r.profiles?.first_name, r.profiles?.last_name].filter(Boolean).join(' ').trim() || null;
-        const full = (r.profiles?.full_name as string | undefined)?.trim() || constructed;
+      const rws: Row[] = (data ?? []).map((r: any) => {
+        const built = [r.profiles?.first_name, r.profiles?.last_name].filter(Boolean).join(' ').trim() || null;
+        const full = (r.profiles?.full_name as string | undefined)?.trim() || built;
         return {
+          slot_id: r.slots?.id as string,
           date: r.slots?.date as string,
           kind: r.slots?.kind as SlotKind,
-          start_ts: r.slots?.start_ts as string,
-          slot_id: r.slots?.id as string,
           user_id: (r.user_id as string) ?? null,
           display_name: full,
         };
       });
-
-      rws.sort(
-        (a, b) =>
-          String(a.date).localeCompare(String(b.date)) ||
-          String(a.kind).localeCompare(String(b.kind))
-      );
 
       setRows(rws);
       setLoading(false);
     })();
   }, [periodId, periods]);
 
-  // Groupement par jour (facultatif, juste pour un affichage plus sympa)
-  const byDay = useMemo(() => {
-    const m = new Map<string, AgendaRow[]>();
-    for (const r of rows) {
-      const k = r.date;
-      if (!m.has(k)) m.set(k, []);
-      m.get(k)!.push(r);
-    }
-    return Array.from(m.entries()).sort((a, b) => a[0].localeCompare(b[0]));
-  }, [rows]);
+  const table = useMemo(() => {
+    if (!rows.length) return null;
+
+    return (
+      <table className="w-full text-sm">
+        <thead className="bg-gray-50 dark:bg-zinc-900/60">
+          <tr>
+            <th className="p-2 text-left font-semibold">Date</th>
+            <th className="p-2 text-left font-semibold">Créneau</th>
+            <th className="p-2 text-left font-semibold">Médecin</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => {
+            const isMe = !!(meId && r.user_id && meId === r.user_id);
+
+            // on garde le même rendu, avec zebra; si c'est "moi", on force un fond + bordure gauche
+            const zebra =
+              i % 2 === 0
+                ? 'bg-white dark:bg-zinc-900/30'
+                : 'bg-gray-50 dark:bg-zinc-900/10';
+
+            const highlight =
+              'ring-1 ring-amber-500/30 !bg-amber-50 dark:!bg-amber-900/30 border-l-4 border-amber-400';
+
+            return (
+              <tr
+                key={r.slot_id}
+                className={`${zebra} ${isMe ? highlight : 'border-l-4 border-transparent'}`}
+                style={isMe ? { backgroundColor: 'rgba(245, 158, 11, 0.1)' } : undefined} // secours si le theme override
+              >
+                <td className="p-2 align-middle">
+                  <span className={isMe ? 'font-semibold text-amber-700 dark:text-amber-300' : undefined}>
+                    {formatDateLongFR(r.date)}
+                  </span>
+                </td>
+                <td className="p-2 align-middle">{kindToRange(r.kind)}</td>
+                <td className="p-2 align-middle">
+                  <span className={isMe ? 'font-semibold text-amber-700 dark:text-amber-300' : undefined}>
+                    {r.display_name ?? '—'}{isMe ? ' (vous)' : ''}
+                  </span>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    );
+  }, [rows, meId]);
 
   return (
     <div className="mx-auto max-w-5xl p-4 space-y-6">
@@ -176,10 +192,6 @@ export default function AgendaPage() {
             <p className="text-xs text-zinc-500 mt-1">Période sélectionnée : {periodLabel}</p>
           ) : null}
         </div>
-
-        <div className="text-xs text-zinc-500 md:ml-auto">
-          {me?.email ? <>Connecté en tant que <span className="font-medium">{me.email}</span></> : null}
-        </div>
       </div>
 
       <div className="rounded-md border">
@@ -188,51 +200,12 @@ export default function AgendaPage() {
         ) : !rows.length ? (
           <div className="p-4 text-sm text-zinc-500">Aucune garde pour cette période.</div>
         ) : (
-          <table className="w-full text-sm">
-            <thead className="bg-gray-50 dark:bg-zinc-900/60">
-              <tr>
-                <th className="p-2 text-left font-semibold">Date</th>
-                <th className="p-2 text-left font-semibold">Créneau</th>
-                <th className="p-2 text-left font-semibold">Médecin</th>
-              </tr>
-            </thead>
-            <tbody>
-              {byDay.map(([date, dayRows]) => (
-                dayRows.map((r, idx) => {
-                  const isMe = !!(me?.user_id && r.user_id && me.user_id === r.user_id);
-                  // surlignage si créneau de l'utilisateur
-                  const trClass = isMe
-                    ? 'bg-amber-50/80 dark:bg-amber-900/30'
-                    : idx % 2 === 0
-                      ? 'bg-white dark:bg-zinc-900/30'
-                      : 'bg-gray-50 dark:bg-zinc-900/10';
-                  const leftBorder = isMe ? 'border-l-4 border-amber-400' : 'border-l-4 border-transparent';
-
-                  return (
-                    <tr key={`${r.slot_id}-${idx}`} className={`${trClass} ${leftBorder}`}>
-                      <td className="p-2 align-middle">
-                        <span className={isMe ? 'font-semibold text-amber-700 dark:text-amber-300' : ''}>
-                          {formatDateLongFR(date)}
-                        </span>
-                      </td>
-                      <td className="p-2 align-middle">{formatKindRange(r.kind)}</td>
-                      <td className="p-2 align-middle">
-                        <span className={isMe ? 'font-semibold text-amber-700 dark:text-amber-300' : ''}>
-                          {r.display_name ?? '—'}
-                          {isMe ? ' (vous)' : ''}
-                        </span>
-                      </td>
-                    </tr>
-                  );
-                })
-              ))}
-            </tbody>
-          </table>
+          table
         )}
       </div>
 
       <p className="text-xs text-zinc-500">
-        Astuce : vos créneaux sont <span className="font-semibold text-amber-700 dark:text-amber-300">surlignés</span> avec une barre gauche <span className="font-semibold text-amber-700 dark:text-amber-300">ambrée</span>.
+        Astuce : vos créneaux sont <span className="font-semibold text-amber-700 dark:text-amber-300">surlignés</span> et marqués d’une barre gauche ambrée.
       </p>
     </div>
   );
