@@ -1,400 +1,219 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { supabase } from '@/lib/supabase';
-import { useRouter } from 'next/navigation';
+import { useEffect, useMemo, useState } from 'react';
+import { createClient } from '@supabase/supabase-js';
 
-type Slot = {
-  id: string;
-  period_id: string;
-  date: string;      // YYYY-MM-DD
-  start_ts: string;
-  end_ts: string;
-  kind: 'WEEKDAY_20_00'|'SAT_12_18'|'SAT_18_00'|'SUN_08_14'|'SUN_14_20'|'SUN_20_24';
-};
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+);
 
-type Period = { id: string; label: string; draw_at: string | null };
+type Period = { id: string; label: string };
 
-const pad = (n: number) => String(n).padStart(2, '0');
-const yyyymm = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
-const ymdLocal = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-const frMonthLabel = (d: Date) => d.toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' });
-
-const KIND_LABEL: Record<Slot['kind'], string> = {
-  WEEKDAY_20_00: '20:00–00:00',
-  SAT_12_18:     '12:00–18:00',
-  SAT_18_00:     '18:00–00:00',
-  SUN_08_14:     '08:00–14:00',
-  SUN_14_20:     '14:00–20:00',
-  SUN_20_24:     '20:00–00:00',
-};
-
-export default function CalendrierPage() {
-  const router = useRouter();
-
+export default function PreferencesPage() {
   const [userId, setUserId] = useState<string | null>(null);
+
+  // Identité
+  const [firstName, setFirstName] = useState('');
+  const [lastName,  setLastName]  = useState('');
+  const identityOK = firstName.trim().length > 0 && lastName.trim().length > 0;
+
+  // Période + target
   const [periods, setPeriods] = useState<Period[]>([]);
   const [periodId, setPeriodId] = useState<string>('');
-  const [drawAt, setDrawAt] = useState<Date | null>(null); // date de tirage
-  const [countdown, setCountdown] = useState<string>('');
-  const [slots, setSlots] = useState<Slot[]>([]);
-  const [availability, setAvailability] = useState<Record<string, boolean>>({});
-  const [viewMonth, setViewMonth] = useState<Date | null>(null);
-  const [optedOut, setOptedOut] = useState<boolean>(false);
+  const [targetLevel, setTargetLevel] = useState<number>(3);
+
   const [loading, setLoading] = useState(true);
+  const [savingId, setSavingId] = useState(false);
+  const [savingPref, setSavingPref] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
 
-  // autosave silencieux
-  const debounceRef = useRef<number | null>(null);
-  const pendingIdsRef = useRef<Set<string>>(new Set());
-
-  // --------- INIT ---------
   useEffect(() => {
     (async () => {
       setLoading(true);
-
-      // auth
       const { data: { user } } = await supabase.auth.getUser();
-      if (!user) { router.replace('/login'); return; }
+      if (!user) { window.location.href = '/login'; return; }
       setUserId(user.id);
 
-      // profil minimal (pour FK éventuels)
-      const { data: prof } = await supabase
+      // Charger profil (first/last)
+      const { data: prof, error: pErr } = await supabase
         .from('profiles')
-        .select('user_id, first_name, last_name')
+        .select('first_name, last_name')
         .eq('user_id', user.id)
         .maybeSingle();
-
-      if (!prof) {
-        await supabase.from('profiles').insert({ user_id: user.id, role: 'doctor' } as any);
-      } else if (!prof.first_name || !prof.last_name) {
-        router.replace('/preferences?missing=1');
-        return;
+      if (!pErr && prof) {
+        setFirstName(prof.first_name ?? '');
+        setLastName(prof.last_name ?? '');
       }
 
-      // périodes (on lit draw_at)
-      const { data: periodsData } = await supabase
-        .from('periods')
-        .select('id,label,draw_at')
-        .order('open_at', { ascending: false });
+      // Charger périodes
+      const { data: per, error: ePer } = await supabase
+        .from('periods').select('id,label').order('open_at', { ascending: false });
+      if (!ePer && per) {
+        setPeriods(per);
+        const def = per[0]?.id ?? '';
+        setPeriodId(def);
 
-      const list = (periodsData ?? []) as Period[];
-      setPeriods(list);
-
-      const defId = list[0]?.id || '';
-      setPeriodId(defId);
-      setDrawAt(list[0]?.draw_at ? new Date(list[0].draw_at) : null);
-
-      if (defId) {
-        await Promise.all([
-          loadSlotsAndAvail(defId, user.id),
-          loadFlags(defId, user.id),
-        ]);
+        if (def) {
+          // Charger target existante
+          const { data: pref, error: prErr } = await supabase
+            .from('preferences_period')
+            .select('target_level')
+            .eq('user_id', user.id)
+            .eq('period_id', def)
+            .maybeSingle();
+          if (!prErr && pref?.target_level) setTargetLevel(pref.target_level);
+        }
       }
 
       setLoading(false);
     })();
-  }, [router]);
+  }, []);
 
-  // --------- Compte à rebours ---------
-  useEffect(() => {
-    if (!drawAt) { setCountdown(''); return; }
-    const tick = () => {
-      const now = new Date();
-      const diff = drawAt.getTime() - now.getTime();
-      if (diff <= 0) { setCountdown('Clôturé — le planning n’est plus modifiable.'); return; }
-      const d = Math.floor(diff / (24*3600*1000));
-      const h = Math.floor((diff % (24*3600*1000)) / (3600*1000));
-      const m = Math.floor((diff % (3600*1000)) / (60*1000));
-      const s = Math.floor((diff % (60*1000)) / 1000);
-      setCountdown(`J-${d} ${pad(h)}:${pad(m)}:${pad(s)}`);
-    };
-    tick();
-    const id = window.setInterval(tick, 1000);
-    return () => window.clearInterval(id);
-  }, [drawAt]);
-
-  // --------- LOADERS ---------
-  const loadSlotsAndAvail = async (pid: string, uid: string) => {
-    const { data: slotsData } = await supabase
-      .from('slots')
-      .select('id, period_id, date, start_ts, end_ts, kind')
-      .eq('period_id', pid)
-      .order('start_ts', { ascending: true });
-
-    const sList = (slotsData || []) as Slot[];
-    setSlots(sList);
-
-    if (!viewMonth && sList.length > 0) {
-      const d0 = new Date(sList[0].date + 'T00:00:00');
-      setViewMonth(new Date(d0.getFullYear(), d0.getMonth(), 1));
-    }
-
-    const { data: avData } = await supabase
-      .from('availability')
-      .select('slot_id, available')
-      .eq('user_id', uid);
-
-    const map: Record<string, boolean> = {};
-    for (const row of avData || []) map[(row as any).slot_id as string] = !!(row as any).available;
-    setAvailability(map);
-
-    pendingIdsRef.current = new Set();
-  };
-
-  const loadFlags = async (pid: string, uid: string) => {
-    // on lit opted_out depuis doctor_period_flags
-    const { data } = await supabase
-      .from('doctor_period_flags')
-      .select('opted_out')
-      .eq('user_id', uid)
-      .eq('period_id', pid)
-      .maybeSingle();
-
-    setOptedOut(!!data?.opted_out);
-  };
-
-  // --------- DERIVED ---------
-  const monthsInPeriod = useMemo(() => {
-    const set = new Set<string>();
-    for (const s of slots) set.add(yyyymm(new Date(s.date + 'T00:00:00')));
-    return Array.from(set).sort().map(m => {
-      const d = new Date(m + '-01T00:00:00');
-      return { key: m, date: d, label: frMonthLabel(d) };
-    });
-  }, [slots]);
-
-  const daysOfMonth = useMemo(() => {
-    if (!viewMonth) return [];
-    const y = viewMonth.getFullYear();
-    const m = viewMonth.getMonth();
-    const first = new Date(y, m, 1);
-    const last = new Date(y, m + 1, 0);
-    const firstWeekday = (first.getDay() + 6) % 7; // 0=Lun ... 6=Dim
-    const cells: (Date | null)[] = [];
-    for (let i = 0; i < firstWeekday; i++) cells.push(null);
-    for (let d = 1; d <= last.getDate(); d++) cells.push(new Date(y, m, d));
-    while (cells.length % 7 !== 0) cells.push(null);
-    return cells;
-  }, [viewMonth]);
-
-  const slotsByDate = useMemo(() => {
-    const map: Record<string, Slot[]> = {};
-    for (const s of slots) (map[s.date] ||= []).push(s);
-    Object.values(map).forEach(list => list.sort((a, b) => +new Date(a.start_ts) - +new Date(b.start_ts)));
-    return map;
-  }, [slots]);
-
-  // édition autorisée tant que tirage pas passé et pas opt-out
-  const isReadOnly = useMemo(() => {
-    if (optedOut) return true;
-    if (!drawAt) return false;
-    return new Date() >= drawAt;
-  }, [drawAt, optedOut]);
-
-  // --------- AUTOSAVE (debounce) ---------
-  const flushSave = async () => {
+  async function saveIdentity() {
     if (!userId) return;
-    const ids = Array.from(pendingIdsRef.current);
-    if (ids.length === 0) return;
-
-    const payload = ids.map(slot_id => ({
-      user_id: userId,
-      slot_id,
-      available: !!availability[slot_id],
-    }));
-
+    setSavingId(true);
+    setMsg(null);
     try {
-      const { error } = await supabase.from('availability').upsert(payload);
+      const { error } = await supabase
+        .from('profiles')
+        .update({ first_name: firstName.trim(), last_name: lastName.trim() })
+        .eq('user_id', userId);
       if (error) throw error;
-      pendingIdsRef.current = new Set();
-    } catch {
-      // rollback silencieux
-      setAvailability(prev => {
-        const copy = { ...prev };
-        for (const slot_id of ids) copy[slot_id] = !copy[slot_id];
-        return copy;
-      });
-      pendingIdsRef.current = new Set();
+      setMsg('✅ Identité enregistrée.');
+    } catch (e: any) {
+      setMsg(`❌ ${e.message ?? 'Erreur enregistrement identité'}`);
+    } finally {
+      setSavingId(false);
     }
-  };
+  }
 
-  const scheduleSave = () => {
-    if (debounceRef.current) window.clearTimeout(debounceRef.current);
-    debounceRef.current = window.setTimeout(flushSave, 500);
-  };
-
-  // --------- ACTIONS ---------
-  const toggleLocal = (slotId: string) => {
-    if (isReadOnly) return;
-    setAvailability(prev => ({ ...prev, [slotId]: !prev[slotId] }));
-    pendingIdsRef.current.add(slotId);
-    scheduleSave();
-  };
-
-  const toggleOptOut = async () => {
+  async function saveTarget() {
     if (!userId || !periodId) return;
-    const wantOptOut = !optedOut;
-
-    // petite confirmation si on active l'opt-out
-    if (wantOptOut) {
-      const ok = confirm("Confirmer : vous ne souhaitez pas prendre de garde ce trimestre ?");
-      if (!ok) return;
+    setSavingPref(true);
+    setMsg(null);
+    try {
+      const { error } = await supabase
+        .from('preferences_period')
+        .upsert({ user_id: userId, period_id: periodId, target_level: targetLevel }, { onConflict: 'user_id,period_id' });
+      if (error) throw error;
+      setMsg('✅ Préférences enregistrées.');
+    } catch (e: any) {
+      setMsg(`❌ ${e.message ?? 'Erreur enregistrement préférences'}`);
+    } finally {
+      setSavingPref(false);
     }
+  }
 
-    await supabase
-      .from('doctor_period_flags')
-      .upsert({
-        user_id: userId,
-        period_id: periodId,
-        opted_out: wantOptOut,
-        all_validated: false, // on ne l’utilise plus mais garde une valeur
-      }, { onConflict: 'user_id,period_id' });
-
-    setOptedOut(wantOptOut);
-  };
-
-  // --------- RENDER ---------
-  if (loading) return <p>Chargement…</p>;
+  if (loading) return <div className="p-4 text-zinc-300">Chargement…</div>;
 
   return (
-    <div className="space-y-4">
-      <h1 className="text-xl font-semibold">Mes disponibilités</h1>
+    <div className="max-w-3xl mx-auto p-6 space-y-8 text-zinc-200">
+      <h1 className="text-2xl font-semibold">Mes préférences</h1>
 
-      {/* Période + mois */}
-      <div className="flex flex-wrap gap-2 items-center">
-        <select
-          className="border rounded p-2 bg-zinc-900 text-zinc-100 border-zinc-700"
-          value={periodId}
-          onChange={async (e) => {
-            const v = e.target.value;
-            setPeriodId(v);
-            const p = periods.find(pp => pp.id === v);
-            setDrawAt(p?.draw_at ? new Date(p.draw_at) : null);
-            if (userId) {
-              await Promise.all([
-                loadSlotsAndAvail(v, userId),
-                loadFlags(v, userId),
-              ]);
-            }
-          }}
-        >
-          {periods.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
-        </select>
+      {msg && (
+        <div className={`p-3 rounded border ${msg.startsWith('✅')
+          ? 'border-green-700 bg-green-900/30 text-green-200'
+          : 'border-red-700 bg-red-900/30 text-red-200'}`}>
+          {msg}
+        </div>
+      )}
 
-        {monthsInPeriod.map(m => {
-          const isActive = viewMonth ? yyyymm(viewMonth) === m.key : false;
-          const base = isActive
-            ? 'bg-white text-black border border-zinc-300'
-            : 'bg-zinc-100 text-zinc-700 border border-zinc-200 hover:bg-white hover:text-black';
-        return (
-            <button
-              key={m.key}
-              className={`px-3 py-1.5 rounded ${base}`}
-              onClick={() => setViewMonth(m.date)}
-            >
-              {m.label}
-            </button>
-          );
-        })}
-
-        <div className="ml-auto flex items-center gap-2">
+      {/* Étape 1 — Identité */}
+      <section className="rounded-xl border border-zinc-700 bg-zinc-800/60 p-4 space-y-3">
+        <h2 className="text-lg font-medium">1) Mon identité</h2>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label className="block text-sm text-zinc-400 mb-1">Prénom</label>
+            <input
+              className="w-full rounded-lg border border-zinc-700 bg-zinc-900 text-zinc-100 px-3 py-2"
+              value={firstName}
+              onChange={(e) => setFirstName(e.target.value)}
+              placeholder="ex: Alice"
+            />
+          </div>
+          <div>
+            <label className="block text-sm text-zinc-400 mb-1">Nom</label>
+            <input
+              className="w-full rounded-lg border border-zinc-700 bg-zinc-900 text-zinc-100 px-3 py-2"
+              value={lastName}
+              onChange={(e) => setLastName(e.target.value)}
+              placeholder="ex: Martin"
+            />
+          </div>
+        </div>
+        <div className="pt-2">
           <button
-            onClick={toggleOptOut}
-            className={`px-3 py-1.5 rounded border ${
-              optedOut
-                ? 'bg-amber-100 border-amber-300 text-amber-900 hover:bg-amber-200'
-                : 'bg-zinc-100 border-zinc-300 text-zinc-800 hover:bg-zinc-200'
-            }`}
+            onClick={saveIdentity}
+            disabled={savingId || !identityOK}
+            className="px-4 py-2 rounded-lg border border-blue-500 text-white bg-blue-600 hover:bg-blue-500 disabled:opacity-50"
           >
-            {optedOut ? 'Je souhaite finalement proposer des gardes' : 'Je ne souhaite pas prendre de garde ce trimestre'}
+            {savingId ? 'Enregistrement…' : 'Confirmer mon identité'}
           </button>
         </div>
-      </div>
-
-      {/* Bloc explicatif + compte à rebours */}
-      <div className="rounded-xl border border-zinc-700 bg-zinc-900/50 p-4 space-y-2">
-        <p className="text-sm text-zinc-200">
-          Indiquez vos disponibilités en <strong>cliquant simplement</strong> sur les créneaux proposés. 
-          Chaque clic active/désactive le créneau (vert = disponible). L’enregistrement est <strong>automatique</strong>.
-        </p>
-        <p className="text-sm text-zinc-400">
-          Vous pouvez modifier vos choix à tout moment <em>jusqu’à la date de tirage</em>. 
-          Après le tirage, le planning n’est plus modifiable.
-        </p>
-        {drawAt && (
-          <div className="mt-2 font-semibold text-zinc-100">
-            Vous avez jusqu’au {drawAt.toLocaleString('fr-FR', { dateStyle: 'full', timeStyle: 'short' })} pour saisir vos disponibilités.
-            {countdown && (
-              <span className="block mt-1 text-lg">
-                ⏳ {countdown}
-              </span>
-            )}
-          </div>
+        {!identityOK && (
+          <p className="text-xs text-zinc-400">⚠️ Saisissez votre prénom et votre nom pour accéder à vos préférences.</p>
         )}
-        {optedOut && (
-          <div className="mt-2 text-amber-300">
-            Vous avez indiqué ne pas souhaiter prendre de garde ce trimestre. La grille est désactivée.
+      </section>
+
+      {/* Étape 2 — Cible (affichée uniquement si identité OK) */}
+      <section className={`rounded-xl border border-zinc-700 p-4 space-y-3 ${identityOK ? 'bg-zinc-800/60' : 'bg-zinc-900/50 opacity-60 pointer-events-none'}`}>
+        <h2 className="text-lg font-medium">2) Ma cible de gardes </h2>
+
+        <div className="flex flex-wrap gap-2 items-center">
+          <label className="text-sm text-zinc-400">Période</label>
+          <select
+            className="border border-zinc-700 bg-zinc-900 text-zinc-100 rounded px-3 py-2"
+            value={periodId}
+            onChange={async (e) => {
+              const pid = e.target.value;
+              setPeriodId(pid);
+              // recharger la valeur de cible pour cette période
+              if (userId && pid) {
+                const { data: pref } = await supabase
+                  .from('preferences_period')
+                  .select('target_level')
+                  .eq('user_id', userId)
+                  .eq('period_id', pid)
+                  .maybeSingle();
+                setTargetLevel(pref?.target_level ?? 3);
+              }
+            }}
+          >
+            {periods.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
+          </select>
+        </div>
+
+        <div>
+          <label className="block text-sm text-zinc-400 mb-1">Nombre de gardes souhaité par mois</label>
+          <div className="flex flex-wrap gap-2">
+            {[1,2,3,4,5].map(n => (
+              <button
+                key={n}
+                onClick={() => setTargetLevel(n)}
+                className={[
+                  'px-3 py-1.5 rounded-lg border',
+                  targetLevel === n
+                    ? 'bg-green-600 border-green-500 text-white'
+                    : 'bg-zinc-900 border-zinc-700 text-zinc-200 hover:bg-zinc-800'
+                ].join(' ')}
+              >
+                {n === 5 ? 'Max' : n}
+              </button>
+            ))}
           </div>
-        )}
-        {isReadOnly && !optedOut && (
-          <div className="mt-2 text-red-300">
-            Le tirage a eu lieu. Le planning est désormais en lecture seule.
-          </div>
-        )}
-      </div>
+        </div>
 
-      {/* Grille mensuelle */}
-      <div className="grid grid-cols-7 gap-2">
-        {['Lun','Mar','Mer','Jeu','Ven','Sam','Dim'].map(w => (
-          <div key={w} className="text-center text-xs uppercase tracking-wide text-gray-500">{w}</div>
-        ))}
-
-        {daysOfMonth.map((d, i) => {
-          if (!d) return <div key={i} className="h-32 rounded-xl border border-dashed border-gray-200 bg-gray-50" />;
-
-          const key = ymdLocal(d);
-          const daySlots = slotsByDate[key] || [];
-          const dayNum = d.getDate();
-
-          return (
-            <div
-              key={i}
-              className="h-32 rounded-2xl border border-gray-200 overflow-hidden bg-white shadow-sm text-left"
-            >
-              <div className="px-2 pt-2 pb-1 text-sm font-medium text-gray-700 flex items-center justify-between">
-                <span>{dayNum}</span>
-                <span className="text-xs text-gray-400">
-                  {d.toLocaleDateString('fr-FR', { weekday: 'short' })}
-                </span>
-              </div>
-
-              <div className="flex flex-col h-[calc(100%-2rem)]">
-                {daySlots.length === 0 ? (
-                  <div className="flex-1 text-xs px-2 text-gray-400 flex items-center justify-center">Aucun créneau</div>
-                ) : daySlots.map((s) => {
-                  const on = !!availability[s.id];
-                  const cellClass = on
-                    ? (isReadOnly ? 'bg-emerald-700 text-white' : 'bg-emerald-600 text-white hover:bg-emerald-500')
-                    : (isReadOnly ? 'bg-zinc-200 text-zinc-500' : 'bg-zinc-100 text-zinc-600 hover:bg-zinc-200');
-
-                  return (
-                    <button
-                      key={s.id}
-                      type="button"
-                      disabled={isReadOnly}
-                      onClick={() => toggleLocal(s.id)}
-                      className={`flex-1 text-[11px] px-2 border-t first:border-t-0 ${cellClass} flex items-center justify-center`}
-                      title={KIND_LABEL[s.kind]}
-                    >
-                      {KIND_LABEL[s.kind]}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          );
-        })}
-      </div>
+        <div className="pt-2">
+          <button
+            onClick={saveTarget}
+            disabled={savingPref || !periodId}
+            className="px-4 py-2 rounded-lg border border-emerald-500 text-white bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50"
+          >
+            {savingPref ? 'Enregistrement…' : 'Enregistrer ma cible'}
+          </button>
+        </div>
+      </section>
     </div>
   );
 }
