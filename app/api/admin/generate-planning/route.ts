@@ -116,7 +116,6 @@ async function buildAvailabilitySummary(
     for (let i = 0; i < ids.length; i += idBatch) {
       const chunk = ids.slice(i, i + idBatch);
       let from = 0;
-      // eslint-disable-next-line no-constant-condition
       while (true) {
         const to = from + pageSize - 1;
         const { data, error } = await supabase
@@ -238,23 +237,8 @@ export async function GET(req: NextRequest) {
   }
 }
 
-// ===== Helpers quotas mensuels & criticité =====
+// ===== Helpers quotas mensuels =====
 type PrefMonthRow = { user_id: string; month: string; target_total: number };
-
-function largestRemainderDistribution(total: number, weights: number[]) {
-  const sum = weights.reduce((a, b) => a + b, 0);
-  if (sum <= 0) return Array(weights.length).fill(0);
-  const raw = weights.map(w => (total * (w / sum)));
-  const base = raw.map(Math.floor);
-  let rest = total - base.reduce((a, b) => a + b, 0);
-  const frac = raw.map((x, i) => ({ i, f: x - Math.floor(x) }))
-                  .sort((a, b) => b.f - a.f);
-  for (let k = 0; k < frac.length && rest > 0; k++) {
-    base[frac[k].i] += 1;
-    rest -= 1;
-  }
-  return base;
-}
 
 // ============== POST ==============
 export async function POST(req: NextRequest) {
@@ -288,12 +272,12 @@ export async function POST(req: NextRequest) {
 
     const fullNameOf = (uid: string) => users_index[uid]?.name ?? uid;
 
-    // Targets (∞ si target_level null ou == 5)
-    const targetCap = new Map<string, number>();
+    // Targets: 5/null = Max (∞), 1..4 = cap mensuel
+    const perMonthCap = new Map<string, number | 'MAX'>(); // 'MAX' pour infini
     for (const u of allUsers) {
       const tl = users_index[u]?.target_level;
-      if (tl == null || tl === 5) targetCap.set(u, Number.POSITIVE_INFINITY);
-      else targetCap.set(u, Math.max(1, Math.min(5, tl)));
+      if (tl == null || tl === 5) perMonthCap.set(u, 'MAX');
+      else perMonthCap.set(u, Math.max(1, Math.min(4, tl))); // 1..4
     }
 
     // Rareté globale par user
@@ -317,7 +301,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // preferences_month
+    // preferences_month (si existant)
     const { data: pmRows } = await supabase
       .from('preferences_month')
       .select('user_id, month, target_total')
@@ -328,26 +312,41 @@ export async function POST(req: NextRequest) {
       pmByUser.get(r.user_id)!.set(r.month, Math.max(0, Number(r.target_total || 0)));
     }
 
-    // Quotas mensuels (durs si target finie; “soft 1/mois” pour Max)
+    // Quotas mensuels
     const quotaByUserMonth = new Map<string, Map<string, number>>();
     for (const u of allUsers) {
-      const cap = targetCap.get(u)!; // ∞ ou 1..5
+      const capM = perMonthCap.get(u)!; // 'MAX' ou 1..4
       const prefU = pmByUser.get(u);
       const dispU = disposByUserMonth.get(u) ?? new Map();
       const out = new Map<string, number>();
 
       if (prefU && Array.from(prefU.values()).some(v => (v ?? 0) > 0)) {
-        for (const m of months) out.set(m, prefU.get(m) ?? 0);
+        // Respecte preferences_month
+        for (const m of months) out.set(m, Math.max(0, prefU.get(m) ?? 0));
       } else {
-        if (Number.isFinite(cap)) {
-          const weights = months.map(m => (dispU.get(m) ?? 0));
-          const dist = largestRemainderDistribution(cap, weights);
-          months.forEach((m, i) => out.set(m, dist[i] ?? 0));
+        if (capM === 'MAX') {
+          // Max -> soft 1 par mois avec dispo (pour étaler)
+          months.forEach(m => out.set(m, (dispU.get(m) ?? 0) > 0 ? 1 : 0));
         } else {
-          months.forEach(m => out.set(m, (dispU.get(m) ?? 0) > 0 ? 1 : 0)); // soft
+          // Cap mensuel dur = tl par mois (0 si aucune dispo ce mois)
+          months.forEach(m => out.set(m, (dispU.get(m) ?? 0) > 0 ? capM as number : 0));
         }
       }
       quotaByUserMonth.set(u, out);
+    }
+
+    // Cap global = somme des quotas mensuels (infini pour MAX)
+    const totalCapByUser = new Map<string, number>();
+    for (const u of allUsers) {
+      const capM = perMonthCap.get(u)!;
+      if (capM === 'MAX') {
+        totalCapByUser.set(u, Number.POSITIVE_INFINITY);
+      } else {
+        const q = quotaByUserMonth.get(u)!;
+        let sum = 0;
+        for (const m of months) sum += (q.get(m) ?? 0);
+        totalCapByUser.set(u, sum);
+      }
     }
 
     // Structures d’assignation cross-mois
@@ -394,14 +393,11 @@ export async function POST(req: NextRequest) {
 
     const userHasSameDay = (u: string, date: string) => assignedUsersByDate.get(date)?.has(u) ?? false;
 
-    // Besoins restants globaux (cap total dur pour finis)
+    // Besoins restants globaux
     const remainingTotalNeed = new Map<string, number>();
-    for (const u of allUsers) {
-      const cap = targetCap.get(u)!;
-      remainingTotalNeed.set(u, Number.isFinite(cap) ? cap : Number.POSITIVE_INFINITY);
-    }
+    for (const u of allUsers) remainingTotalNeed.set(u, totalCapByUser.get(u)!);
 
-    const isFiniteTarget = (u: string) => Number.isFinite(targetCap.get(u)!);
+    const isFiniteTarget = (u: string) => perMonthCap.get(u)! !== 'MAX';
 
     // Tri stable
     const stableCompareUsers = (u1: string, u2: string) => {
@@ -423,7 +419,7 @@ export async function POST(req: NextRequest) {
         remainingMonthNeed.set(u, Math.max(0, q - already));
       }
 
-      // criticité future (mois suivants)
+      // criticité future (mois suivants) — pour éviter de “manger” les uniques
       const mIndex = months.indexOf(month);
       const futureMonths = months.slice(mIndex + 1);
       const criticalFuture = new Map<string, number>();
@@ -443,25 +439,26 @@ export async function POST(req: NextRequest) {
 
       const monthSlots = slots.filter((s) => !takenSlot.has(s.id) && monthOf(s.date) === month);
 
-      // 1) Slots à 1 seul candidat
+      // 1) Slots à 1 seul candidat (on *peut* dépasser le quota mensuel si c’est le seul candidat)
       for (const s of monthSlots) {
         if (takenSlot.has(s.id)) continue;
         const set = availBySlot.get(s.id) ?? new Set<string>();
         if (set.size === 1) {
           const only = Array.from(set)[0];
           const totNeed = remainingTotalNeed.get(only) ?? 0;
-          const eligibleTotal = totNeed > 0 || !isFiniteTarget(only);
-          if (eligibleTotal) {
-            assignments.push({ slot_id: s.id, user_id: only, score: 1 });
-            takenSlot.add(s.id);
-            incAssigned(only, month);
-            if (isFiniteTarget(only)) {
-              remainingTotalNeed.set(only, Math.max(0, totNeed - 1));
-              const mon = remainingMonthNeed.get(only) ?? 0;
-              if (mon > 0) remainingMonthNeed.set(only, mon - 1);
-            }
-            markAssigned(only, s.date, s.kind);
+          if (totNeed <= 0 && isFiniteTarget(only)) continue; // déjà au total cap
+
+          // si fini & plus de quota mensuel, on accepte *exceptionnellement* pour éviter un trou
+          assignments.push({ slot_id: s.id, user_id: only, score: 1 });
+          takenSlot.add(s.id);
+          incAssigned(only, month);
+
+          if (isFiniteTarget(only)) {
+            if (totNeed > 0) remainingTotalNeed.set(only, totNeed - 1);
+            const mon = remainingMonthNeed.get(only) ?? 0;
+            if (mon > 0) remainingMonthNeed.set(only, mon - 1);
           }
+          markAssigned(only, s.date, s.kind);
         }
       }
 
@@ -480,28 +477,26 @@ export async function POST(req: NextRequest) {
         }
 
         // --- PRIORITÉS DE POOL ---
-        // P1: finis avec besoin mensuel > 0 et besoin total > 0
-        const P1 = candAll.filter(u => isFiniteTarget(u)
-          && (remainingTotalNeed.get(u) ?? 0) > 0
-          && (remainingMonthNeed.get(u) ?? 0) > 0);
+        // P1: finis avec besoin mensuel > 0 (respect cap mensuel)
+        const P1 = candAll.filter(u =>
+          isFiniteTarget(u) &&
+          (remainingTotalNeed.get(u) ?? 0) > 0 &&
+          (remainingMonthNeed.get(u) ?? 0) > 0
+        );
 
-        // P2: finis avec besoin total > 0 (on autorise dépassement mensuel si pas de P1)
-        const P2 = candAll.filter(u => isFiniteTarget(u)
-          && (remainingTotalNeed.get(u) ?? 0) > 0
-          && (remainingMonthNeed.get(u) ?? 0) === 0);
+        // P2: Max avec “soft” besoin mensuel > 0
+        const P2 = candAll.filter(u =>
+          !isFiniteTarget(u) &&
+          (remainingMonthNeed.get(u) ?? 0) > 0
+        );
 
-        // P3: Max avec “soft” besoin mensuel > 0
-        const P3 = candAll.filter(u => !isFiniteTarget(u)
-          && (remainingMonthNeed.get(u) ?? 0) > 0);
-
-        // P4: le reste (Max sans soft besoin ou tout autre)
-        const P4 = candAll.filter(u => !P1.includes(u) && !P2.includes(u) && !P3.includes(u));
+        // P3: autres (Max sans soft besoin) — en dernier recours
+        const P3 = candAll.filter(u => !P1.includes(u) && !P2.includes(u));
 
         let pool0: string[] =
           (P1.length > 0) ? P1 :
           (P2.length > 0) ? P2 :
-          (P3.length > 0) ? P3 :
-          P4;
+          P3;
 
         // A. interdire 2 créneaux le même jour si alternative
         const poolNoSameDay = pool0.filter((u) => !userHasSameDay(u, s.date));
@@ -522,7 +517,7 @@ export async function POST(req: NextRequest) {
         });
         const poolB = poolAvoidHeavy.length > 0 ? poolAvoidHeavy : poolA;
 
-        // C. réserve criticité future: si fini et totNeed-1 < criticalFuture[u], on évite (si alternative)
+        // C. réserve criticité future pour finis (si alternative)
         const poolKeepFuture = poolB.filter((u) => {
           const cf = criticalFuture.get(u) ?? 0;
           if (cf <= 0) return true;
