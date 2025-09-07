@@ -50,17 +50,17 @@ export default function AgendaPage() {
 
   const [viewMonth, setViewMonth] = useState<Date | null>(null);
 
-  // 👤 nouvel état : id de l'utilisateur connecté
+  // 👤 id de l'utilisateur connecté
   const [meId, setMeId] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
       setLoading(true);
 
-      // Auth minimal: juste vérifier qu’on a une session, sinon login
+      // Auth minimal
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) { router.replace('/login'); return; }
-      setMeId(user.id); // 🔸 mémorise l'ID pour le surlignage
+      setMeId(user.id);
 
       // Périodes
       const { data: periodsData, error: pErr } = await supabase
@@ -80,7 +80,7 @@ export default function AgendaPage() {
   async function loadData(pid: string) {
     setMsg(null);
 
-    // Slots de la période (on lit la colonne "date" locale)
+    // Slots
     const { data: slotsData, error: sErr } = await supabase
       .from('slots')
       .select('id, period_id, date, start_ts, end_ts, kind')
@@ -90,11 +90,11 @@ export default function AgendaPage() {
     setSlots((slotsData || []) as Slot[]);
 
     if (!viewMonth && (slotsData?.length ?? 0) > 0) {
-      const d0 = new Date(slotsData![0].date + 'T00:00:00'); // base locale
+      const d0 = new Date(slotsData![0].date + 'T00:00:00');
       setViewMonth(new Date(d0.getFullYear(), d0.getMonth(), 1));
     }
 
-    // Assignations de la période
+    // Assignations
     const { data: assigns, error: aErr } = await supabase
       .from('assignments')
       .select('slot_id, user_id')
@@ -111,7 +111,7 @@ export default function AgendaPage() {
     }
     setAssignBySlot(map);
 
-    // Profils des user_ids utilisés → first_name / last_name
+    // Profils
     if (uids.size > 0) {
       const { data: profs, error: profErr } = await supabase
         .from('profiles')
@@ -132,7 +132,7 @@ export default function AgendaPage() {
     }
   }
 
-  // Mois présents dans la période (depuis slot.date)
+  // Mois présents dans la période
   const monthsInPeriod = useMemo(() => {
     const set = new Set<string>();
     for (const s of slots) {
@@ -160,7 +160,7 @@ export default function AgendaPage() {
     return cells;
   }, [viewMonth]);
 
-  // Slots groupés par date (clé locale YYYY-MM-DD)
+  // Slots groupés par date
   const slotsByDate = useMemo(() => {
     const map: Record<string, Slot[]> = {};
     for (const s of slots) (map[s.date] ||= []).push(s);
@@ -212,13 +212,20 @@ export default function AgendaPage() {
               <div
                 key={s.id}
                 className={`flex-1 text-[11px] md:text-xs px-2 border-t first:border-t-0 flex items-center justify-between
-                            ${isMine ? 'bg-amber-50/80 dark:bg-amber-900/30 border-l-4 border-amber-400' : 'bg-white text-gray-700'}`}
+                            ${isMine ? 'bg-amber-100 border-l-4 border-amber-500' : 'bg-white text-gray-700'}`}
                 title={labelFor(s.kind)}
-                style={isMine ? { backgroundColor: 'rgba(245, 158, 11, 0.12)' } : undefined} // petit secours
               >
-                <span className="truncate">{labelFor(s.kind)}</span>
+                {/* Créneau toujours lisible sur fond ambré */}
+                <span className={`truncate ${isMine ? 'text-gray-800 font-medium' : ''}`}>
+                  {labelFor(s.kind)}
+                </span>
+
                 {name ? (
-                  <span className={`truncate max-w-[55%] md:max-w-none ${isMine ? 'font-semibold text-amber-700 dark:text-amber-300' : 'text-emerald-600 font-semibold'}`}>
+                  <span
+                    className={`truncate max-w-[55%] md:max-w-none ${
+                      isMine ? 'font-bold text-black' : 'font-semibold text-emerald-600'
+                    }`}
+                  >
                     {name}{isMine ? ' (vous)' : ''}
                   </span>
                 ) : (
@@ -276,7 +283,7 @@ export default function AgendaPage() {
       </div>
 
       {msg && (
-        <div className={`p-3 rounded border ${msg.startsWith('Erreur') ? 'bg-red-50 border-red-200 text-red-900' : 'bg-gray-50 border-gray-200 text-gray-800'}`}>
+        <div className={`p-3 rounded border ${msg?.startsWith('Erreur') ? 'bg-red-50 border-red-200 text-red-900' : 'bg-gray-50 border-gray-200 text-gray-800'}`}>
           {msg}
         </div>
       )}
