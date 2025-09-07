@@ -282,7 +282,7 @@ export default function CalendrierPage() {
       {/* Sélecteurs période & mois */}
       <div className="flex flex-wrap gap-2 items-center">
         <select
-          className="border rounded p-2 bg-zinc-900 text-zinc-100 border-zinc-700"
+          className="border rounded p-2 bg-white text-gray-600 border-zinc-300"
           value={periodId}
           onChange={async (e) => {
             const v = e.target.value;
