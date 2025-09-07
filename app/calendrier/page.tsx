@@ -13,7 +13,7 @@ type Slot = {
   kind: 'WEEKDAY_20_00'|'SAT_12_18'|'SAT_18_00'|'SUN_08_14'|'SUN_14_20'|'SUN_20_24';
 };
 
-type Period = { id: string; label: string; draw_at: string | null };
+type Period = { id: string; label: string; draw_at?: string | null };
 
 const pad = (n: number) => String(n).padStart(2, '0');
 const yyyymm = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
@@ -35,15 +35,16 @@ export default function CalendrierPage() {
   const [userId, setUserId] = useState<string | null>(null);
   const [periods, setPeriods] = useState<Period[]>([]);
   const [periodId, setPeriodId] = useState<string>('');
-  const [drawAt, setDrawAt] = useState<Date | null>(null); // date de tirage
+  const [drawAt, setDrawAt] = useState<Date | null>(null);
   const [countdown, setCountdown] = useState<string>('');
+
   const [slots, setSlots] = useState<Slot[]>([]);
   const [availability, setAvailability] = useState<Record<string, boolean>>({});
   const [viewMonth, setViewMonth] = useState<Date | null>(null);
   const [optedOut, setOptedOut] = useState<boolean>(false);
   const [loading, setLoading] = useState(true);
 
-  // autosave silencieux
+  // autosave silencieux (debounce)
   const debounceRef = useRef<number | null>(null);
   const pendingIdsRef = useRef<Set<string>>(new Set());
 
@@ -52,42 +53,47 @@ export default function CalendrierPage() {
     (async () => {
       setLoading(true);
 
-      // auth
+      // Auth
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) { router.replace('/login'); return; }
       setUserId(user.id);
 
-      // profil minimal (pour FK éventuels)
+      // Profil minimal
       const { data: prof } = await supabase
         .from('profiles')
-        .select('user_id, first_name, last_name')
+        .select('user_id, first_name, last_name, role')
         .eq('user_id', user.id)
         .maybeSingle();
 
       if (!prof) {
-        await supabase.from('profiles').insert({ user_id: user.id, role: 'doctor' } as any);
+        await supabase.from('profiles').insert({
+          user_id: user.id,
+          first_name: null,
+          last_name: null,
+          role: 'doctor',
+        } as any);
       } else if (!prof.first_name || !prof.last_name) {
         router.replace('/preferences?missing=1');
         return;
       }
 
-      // périodes (on lit draw_at)
+      // Périodes (on lit aussi draw_at)
       const { data: periodsData } = await supabase
         .from('periods')
         .select('id,label,draw_at')
         .order('open_at', { ascending: false });
 
-      const list = (periodsData ?? []) as Period[];
+      const list = (periodsData || []) as Period[];
       setPeriods(list);
 
       const defId = list[0]?.id || '';
       setPeriodId(defId);
-      setDrawAt(list[0]?.draw_at ? new Date(list[0].draw_at) : null);
+      setDrawAt(list[0]?.draw_at ? new Date(list[0]!.draw_at!) : null);
 
       if (defId) {
         await Promise.all([
           loadSlotsAndAvail(defId, user.id),
-          loadFlags(defId, user.id),
+          loadOptOut(defId, user.id),
         ]);
       }
 
@@ -141,15 +147,13 @@ export default function CalendrierPage() {
     pendingIdsRef.current = new Set();
   };
 
-  const loadFlags = async (pid: string, uid: string) => {
-    // on lit opted_out depuis doctor_period_flags
+  const loadOptOut = async (pid: string, uid: string) => {
     const { data } = await supabase
       .from('doctor_period_flags')
       .select('opted_out')
       .eq('user_id', uid)
       .eq('period_id', pid)
       .maybeSingle();
-
     setOptedOut(!!data?.opted_out);
   };
 
@@ -184,7 +188,7 @@ export default function CalendrierPage() {
     return map;
   }, [slots]);
 
-  // édition autorisée tant que tirage pas passé et pas opt-out
+  // Édition autorisée si pas opt-out et avant draw_at
   const isReadOnly = useMemo(() => {
     if (optedOut) return true;
     if (!drawAt) return false;
@@ -234,20 +238,17 @@ export default function CalendrierPage() {
   const toggleOptOut = async () => {
     if (!userId || !periodId) return;
     const wantOptOut = !optedOut;
-
-    // petite confirmation si on active l'opt-out
     if (wantOptOut) {
-      const ok = confirm("Confirmer : vous ne souhaitez pas prendre de garde ce trimestre ?");
+      const ok = confirm('Confirmer : vous ne souhaitez pas prendre de garde ce trimestre ?');
       if (!ok) return;
     }
-
     await supabase
       .from('doctor_period_flags')
       .upsert({
         user_id: userId,
         period_id: periodId,
         opted_out: wantOptOut,
-        all_validated: false, // on ne l’utilise plus mais garde une valeur
+        all_validated: false,
       }, { onConflict: 'user_id,period_id' });
 
     setOptedOut(wantOptOut);
@@ -256,11 +257,13 @@ export default function CalendrierPage() {
   // --------- RENDER ---------
   if (loading) return <p>Chargement…</p>;
 
+  const currentMonthKey = viewMonth ? yyyymm(viewMonth) : '';
+
   return (
     <div className="space-y-4">
       <h1 className="text-xl font-semibold">Mes disponibilités</h1>
 
-      {/* Période + mois */}
+      {/* Sélecteurs période & mois */}
       <div className="flex flex-wrap gap-2 items-center">
         <select
           className="border rounded p-2 bg-zinc-900 text-zinc-100 border-zinc-700"
@@ -273,7 +276,7 @@ export default function CalendrierPage() {
             if (userId) {
               await Promise.all([
                 loadSlotsAndAvail(v, userId),
-                loadFlags(v, userId),
+                loadOptOut(v, userId),
               ]);
             }
           }}
@@ -282,11 +285,14 @@ export default function CalendrierPage() {
         </select>
 
         {monthsInPeriod.map(m => {
-          const isActive = viewMonth ? yyyymm(viewMonth) === m.key : false;
+          const isActive = currentMonthKey === m.key;
+
+          const activeCls = 'bg-white text-black border border-zinc-300';
           const base = isActive
-            ? 'bg-white text-black border border-zinc-300'
+            ? activeCls
             : 'bg-zinc-100 text-zinc-700 border border-zinc-200 hover:bg-white hover:text-black';
-        return (
+
+          return (
             <button
               key={m.key}
               className={`px-3 py-1.5 rounded ${base}`}
@@ -314,21 +320,16 @@ export default function CalendrierPage() {
       {/* Bloc explicatif + compte à rebours */}
       <div className="rounded-xl border border-zinc-700 bg-zinc-900/50 p-4 space-y-2">
         <p className="text-sm text-zinc-200">
-          Indiquez vos disponibilités en <strong>cliquant simplement</strong> sur les créneaux proposés. 
+          Indiquez vos disponibilités en <strong>cliquant</strong> sur les créneaux proposés. 
           Chaque clic active/désactive le créneau (vert = disponible). L’enregistrement est <strong>automatique</strong>.
         </p>
         <p className="text-sm text-zinc-400">
-          Vous pouvez modifier vos choix à tout moment <em>jusqu’à la date de tirage</em>. 
-          Après le tirage, le planning n’est plus modifiable.
+          Vous pouvez modifier vos choix à tout moment <em>jusqu’à la date de tirage</em>. Après le tirage, le planning n’est plus modifiable.
         </p>
         {drawAt && (
           <div className="mt-2 font-semibold text-zinc-100">
             Vous avez jusqu’au {drawAt.toLocaleString('fr-FR', { dateStyle: 'full', timeStyle: 'short' })} pour saisir vos disponibilités.
-            {countdown && (
-              <span className="block mt-1 text-lg">
-                ⏳ {countdown}
-              </span>
-            )}
+            {countdown && <span className="block mt-1 text-lg">⏳ {countdown}</span>}
           </div>
         )}
         {optedOut && (
@@ -343,7 +344,7 @@ export default function CalendrierPage() {
         )}
       </div>
 
-      {/* Grille mensuelle */}
+      {/* Grille mensuelle : clic direct = toggle */}
       <div className="grid grid-cols-7 gap-2">
         {['Lun','Mar','Mer','Jeu','Ven','Sam','Dim'].map(w => (
           <div key={w} className="text-center text-xs uppercase tracking-wide text-gray-500">{w}</div>
@@ -395,6 +396,8 @@ export default function CalendrierPage() {
           );
         })}
       </div>
+
+      {/* Pas de bouton “Enregistrer” : tout est auto-sauvé */}
     </div>
   );
 }
