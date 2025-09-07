@@ -11,27 +11,28 @@ const supabase = createClient(
 type Period = {
   id: string;
   label: string;
-  open_at: string;     // timestamptz (début réel du trimestre)
-  close_at: string;    // timestamptz (fin du trimestre)
-  generate_at: string; // timestamptz (utilisé pour le compte à rebours côté app)
+  open_at: string;     // timestamptz
+  close_at: string;    // timestamptz
+  generate_at: string; // timestamptz (compte à rebours côté app)
   timezone: string | null;
 };
 
 type AutoRow = {
   period_id: string;
-  // J-x (valeurs entières)
-  slots_generate_before_days: number;     // J-x pour "générer les slots + ouverture des dispos"
-  avail_deadline_before_days: number;     // J-x pour "clôture des dispos"
-  planning_generate_before_days: number;  // J-x pour "générer automatiquement le planning"
 
-  // Emails de rappel
+  // J - x
+  slots_generate_before_days: number;     // ouverture des dispos + génération des slots
+  avail_deadline_before_days: number;     // clôture des dispos
+  planning_generate_before_days: number;  // génération auto du planning (en brouillon)
+
+  // rappels
   weekly_reminder: boolean;
-  extra_reminder_hours: number[]; // ex: [48,24,1]
+  extra_reminder_hours: number[];
 
-  // Divers
+  // publication
   lock_assignments: boolean;
 
-  // pré-calcul (lecture seule, pour affichage)
+  // dérivés (info)
   avail_open_at?: string | null;
   avail_deadline?: string | null;
   updated_at?: string | null;
@@ -40,22 +41,31 @@ type AutoRow = {
 function parseCsvInts(s: string): number[] {
   return s
     .split(/[,\s]+/)
-    .map(x => x.trim())
+    .map((x) => x.trim())
     .filter(Boolean)
-    .map(x => Number.parseInt(x, 10))
-    .filter(n => Number.isFinite(n));
+    .map((x) => Number.parseInt(x, 10))
+    .filter((n) => Number.isFinite(n));
 }
 
 function fmtDateFR(iso?: string | null) {
   if (!iso) return '—';
   try {
-    return new Date(iso).toLocaleString('fr-FR', { dateStyle: 'full', timeStyle: 'short' });
-  } catch { return iso || '—'; }
+    return new Date(iso).toLocaleString('fr-FR', {
+      dateStyle: 'full',
+      timeStyle: 'short',
+    });
+  } catch {
+    return iso || '—';
+  }
 }
 
 async function parseJsonSafe(res: Response) {
   const txt = await res.text();
-  try { return txt ? JSON.parse(txt) : {}; } catch { return { __raw: txt }; }
+  try {
+    return txt ? JSON.parse(txt) : {};
+  } catch {
+    return { __raw: txt };
+  }
 }
 
 export default function AutomationAdminPage() {
@@ -66,7 +76,7 @@ export default function AutomationAdminPage() {
   const [msg, setMsg] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // champs éditables (pour éviter de muter row directement)
+  // états du formulaire
   const [leadSlots, setLeadSlots] = useState<number>(45);
   const [leadDeadline, setLeadDeadline] = useState<number>(15);
   const [leadGenerate, setLeadGenerate] = useState<number>(21);
@@ -74,7 +84,7 @@ export default function AutomationAdminPage() {
   const [extraHoursCsv, setExtraHoursCsv] = useState<string>('48,24,1');
   const [lockAssign, setLockAssign] = useState<boolean>(false);
 
-  // --- chargement initial
+  // ------------------ Init
   useEffect(() => {
     (async () => {
       setLoading(true);
@@ -83,19 +93,18 @@ export default function AutomationAdminPage() {
         const { data: { session } } = await supabase.auth.getSession();
         const token = session?.access_token;
 
-        const res = await fetch('/api/admin/automation', {
-          headers: token ? { Authorization: `Bearer ${token}` } : {}
+        const res = await fetch('/api/admin/automation-settings', {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
         });
         const json = await parseJsonSafe(res);
         if (!res.ok) throw new Error((json as any)?.error || `HTTP ${res.status}`);
 
         const list = (json as any)?.periods as Period[] || [];
         setPeriods(list);
+
         const def = list[0]?.id || '';
         setPeriodId(def);
-        if (def) {
-          await load(def);
-        }
+        if (def) await load(def);
       } catch (e: any) {
         setMsg(`❌ ${e?.message || 'Erreur chargement'}`);
       } finally {
@@ -110,8 +119,8 @@ export default function AutomationAdminPage() {
       const { data: { session } } = await supabase.auth.getSession();
       const token = session?.access_token;
 
-      const res = await fetch(`/api/admin/automation?period_id=${encodeURIComponent(pid)}`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      const res = await fetch(`/api/admin/automation-settings?period_id=${encodeURIComponent(pid)}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
       const json = await parseJsonSafe(res);
       if (!res.ok) throw new Error((json as any)?.error || `HTTP ${res.status}`);
@@ -123,17 +132,17 @@ export default function AutomationAdminPage() {
       setLeadDeadline(r?.avail_deadline_before_days ?? 15);
       setLeadGenerate(r?.planning_generate_before_days ?? 21);
       setWeekly(!!r?.weekly_reminder);
-      setExtraHoursCsv((r?.extra_reminder_hours ?? [48,24,1]).join(','));
+      setExtraHoursCsv((r?.extra_reminder_hours ?? [48, 24, 1]).join(','));
       setLockAssign(!!r?.lock_assignments);
     } catch (e: any) {
       setMsg(`❌ ${e?.message || 'Erreur chargement période'}`);
     }
   }
 
-  // prévisualisation des dates calculées en fonction des J-x saisis
+  // aperçu des dates calculées
   const preview = useMemo(() => {
     if (!row) return null;
-    const p = periods.find(pp => pp.id === (row as any).period_id);
+    const p = periods.find(pp => pp.id === row.period_id);
     if (!p) return null;
 
     const start = new Date(p.open_at);
@@ -166,7 +175,7 @@ export default function AutomationAdminPage() {
         lock_assignments: lockAssign,
       };
 
-      const res = await fetch('/api/admin/automation', {
+      const res = await fetch('/api/admin/automation-settings', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -177,7 +186,6 @@ export default function AutomationAdminPage() {
       const json = await parseJsonSafe(res);
       if (!res.ok) throw new Error((json as any)?.error || `HTTP ${res.status}`);
 
-      // recharger
       await load(periodId);
       setMsg('✅ Paramètres enregistrés. Les dates calculées ont été mises à jour.');
     } catch (e: any) {
@@ -216,7 +224,7 @@ export default function AutomationAdminPage() {
         <div className="text-zinc-400">Chargement…</div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          {/* Bloc gauche */}
+          {/* Création & Dispos */}
           <div className="rounded-xl border border-zinc-700 bg-zinc-800/60 p-4 space-y-4">
             <h2 className="text-lg font-medium text-white">Création & disponibilités</h2>
 
@@ -225,13 +233,11 @@ export default function AutomationAdminPage() {
               <input
                 className="mt-1 w-full rounded-lg border border-zinc-700 bg-zinc-900 text-zinc-100 px-3 py-2"
                 value={leadSlots}
-                onChange={e => setLeadSlots(parseInt(e.target.value || '0', 10))}
+                onChange={(e) => setLeadSlots(parseInt(e.target.value || '0', 10))}
                 type="number"
                 min={0}
               />
-              <div className="text-xs text-zinc-400 mt-1">
-                Ouvre le {preview?.open ?? '—'}
-              </div>
+              <div className="text-xs text-zinc-400 mt-1">Ouvre le {preview?.open ?? '—'}</div>
             </label>
 
             <label className="block text-sm text-zinc-300">
@@ -239,13 +245,11 @@ export default function AutomationAdminPage() {
               <input
                 className="mt-1 w-full rounded-lg border border-zinc-700 bg-zinc-900 text-zinc-100 px-3 py-2"
                 value={leadDeadline}
-                onChange={e => setLeadDeadline(parseInt(e.target.value || '0', 10))}
+                onChange={(e) => setLeadDeadline(parseInt(e.target.value || '0', 10))}
                 type="number"
                 min={0}
               />
-              <div className="text-xs text-zinc-400 mt-1">
-                Clôture le {preview?.deadline ?? '—'}
-              </div>
+              <div className="text-xs text-zinc-400 mt-1">Clôture le {preview?.deadline ?? '—'}</div>
             </label>
 
             <div className="pt-2 border-t border-zinc-700/60">
@@ -271,7 +275,7 @@ export default function AutomationAdminPage() {
             </div>
           </div>
 
-          {/* Bloc droit */}
+          {/* Planning */}
           <div className="rounded-xl border border-zinc-700 bg-zinc-800/60 p-4 space-y-4">
             <h2 className="text-lg font-medium text-white">Génération du planning</h2>
 
@@ -280,13 +284,11 @@ export default function AutomationAdminPage() {
               <input
                 className="mt-1 w-full rounded-lg border border-zinc-700 bg-zinc-900 text-zinc-100 px-3 py-2"
                 value={leadGenerate}
-                onChange={e => setLeadGenerate(parseInt(e.target.value || '0', 10))}
+                onChange={(e) => setLeadGenerate(parseInt(e.target.value || '0', 10))}
                 type="number"
                 min={0}
               />
-              <div className="text-xs text-zinc-400 mt-1">
-                Génération prévue le {preview?.generate ?? '—'}
-              </div>
+              <div className="text-xs text-zinc-400 mt-1">Génération prévue le {preview?.generate ?? '—'}</div>
             </label>
 
             <label className="inline-flex items-center gap-2 text-sm text-zinc-300">
@@ -296,7 +298,7 @@ export default function AutomationAdminPage() {
                 checked={lockAssign}
                 onChange={(e) => setLockAssign(e.target.checked)}
               />
-              Verrouiller les assignations après validation (publication)
+              Verrouiller les assignations après publication
             </label>
 
             <div className="pt-2">
@@ -308,11 +310,11 @@ export default function AutomationAdminPage() {
               </button>
               {row.updated_at && (
                 <div className="mt-2 text-xs text-zinc-400">
-                  Dernière mise à jour: {fmtDateFR(row.updated_at)}
+                  Dernière mise à jour : {fmtDateFR(row.updated_at)}
                 </div>
               )}
               <div className="mt-2 text-xs text-zinc-400">
-                Astuce: la date de génération est recopiée dans <code>periods.generate_at</code> (utilisée pour le compte à rebours côté utilisateurs).
+                Note : la date calculée est recopiée dans <code>periods.generate_at</code> pour le compte à rebours côté utilisateurs.
               </div>
             </div>
           </div>
