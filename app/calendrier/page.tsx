@@ -206,14 +206,12 @@ export default function CalendrierPage() {
       available: !!availability[slot_id],
     }));
 
-    // on tente la sauvegarde ; en cas d’échec on rollback localement
+    // tentative de sauvegarde ; rollback silencieux en cas d’échec
     try {
       const { error } = await supabase.from('availability').upsert(payload);
       if (error) throw error;
-
       pendingIdsRef.current = new Set(); // ok
     } catch {
-      // rollback silencieux
       setAvailability(prev => {
         const copy = { ...prev };
         for (const slot_id of ids) {
@@ -231,8 +229,7 @@ export default function CalendrierPage() {
   };
 
   // --------- ACTIONS ---------
-  const toggleLocal = (slotId: string, locked: boolean) => {
-    if (locked) return; // si mois verrouillé : pas de modif
+  const toggleLocal = (slotId: string) => {
     setAvailability(prev => {
       const next = { ...prev, [slotId]: !prev[slotId] };
       return next;
@@ -241,48 +238,21 @@ export default function CalendrierPage() {
     scheduleSave();
   };
 
-  const validateMonth = async (mKey: string) => {
-    if (!userId || !periodId) return;
-    await supabase
-      .from('doctor_period_months')
-      .upsert({
-        user_id: userId,
-        period_id: periodId,
-        month: mKey,
-        locked: true,
-        validated_at: new Date().toISOString(),
-        opted_out: false,
-      }, { onConflict: 'user_id,period_id,month' });
-    await loadMonthStatus(periodId, userId);
-  };
-
-  const unlockMonth = async (mKey: string) => {
-    if (!userId || !periodId) return;
-    const ok = confirm('Déverrouiller ce mois pour modifier vos disponibilités ?');
-    if (!ok) return;
-    await supabase
-      .from('doctor_period_months')
-      .upsert({
-        user_id: userId,
-        period_id: periodId,
-        month: mKey,
-        locked: false,
-        validated_at: null,
-      }, { onConflict: 'user_id,period_id,month' });
-    await loadMonthStatus(periodId, userId);
-  };
-
   // --------- RENDER ---------
-  if (loading) return <p>Chargement…</p>;
+  if (loading) return <p className="text-zinc-300">Chargement…</p>;
 
   return (
     <div className="space-y-4">
-      <h1 className="text-xl font-semibold">Mes disponibilités</h1>
+      <h1 className="text-xl font-semibold text-zinc-100">Mes disponibilités</h1>
 
       {/* Sélecteurs période & mois */}
       <div className="flex flex-wrap gap-2 items-center">
+        {/* Sélecteur période : texte noir, fond selon thème */}
         <select
-          className="border rounded p-2 bg-white text-Black border-zinc-300"
+          className="border rounded p-2 text-black
+                     bg-white dark:bg-zinc-800
+                     border-zinc-300 dark:border-zinc-600
+                     shadow-sm focus:outline-none focus:ring-2 focus:ring-emerald-400"
           value={periodId}
           onChange={async (e) => {
             const v = e.target.value;
@@ -298,102 +268,111 @@ export default function CalendrierPage() {
           {periods.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
         </select>
 
-        {monthsInPeriod.map(m => {
-          const st = monthStatus[m.key];
-          const isActive = currentMonthKey === m.key;
+        {/* Onglets Mois */}
+        <div className="flex flex-wrap gap-2">
+          {monthsInPeriod.map(m => {
+            const st = monthStatus[m.key];
+            const isActive = currentMonthKey === m.key;
 
-          const activeCls = 'bg-white-150 text-black border border-zinc-300';
-          const greenCls  = 'bg-green-150 text-green-900 border border-green-200';
-          const redCls    = 'bg-red-150 text-red-900 border border-red-200';
-          const hoverCls  = 'hover:bg-white hover:text-black';
+            // Couleurs moins pâles (vert = validé, rouge = à valider), avec variantes dark
+            const greenTab =
+              'bg-green-200 text-green-900 border border-green-400 ' +
+              'dark:bg-emerald-700 dark:text-white dark:border-emerald-500';
+            const redTab =
+              'bg-red-200 text-red-900 border border-red-400 ' +
+              'dark:bg-red-700 dark:text-white dark:border-red-500';
+            const neutralTab =
+              'bg-zinc-100 text-zinc-800 border border-zinc-300 ' +
+              'dark:bg-zinc-800 dark:text-zinc-100 dark:border-zinc-600';
 
-          const base = isActive
-            ? activeCls
-            : (st?.locked ? `${greenCls} ${hoverCls}` : `${redCls} ${hoverCls}`);
+            const base = st?.locked ? greenTab : redTab; // ton code historique: locked ≈ validé
+            const notActive = `${base} hover:opacity-90 transition`;
+            const active =
+              'bg-white text-black border-2 border-emerald-400 shadow-sm ' +
+              'dark:bg-zinc-900 dark:text-white dark:border-emerald-500';
 
-          return (
-            <button
-              key={m.key}
-              className={`px-3 py-1.5 rounded ${base}`}
-              onClick={() => setViewMonth(m.date)}
-              title={st?.locked ? 'Validé' : 'À valider'}
-            >
-              {m.label}
-            </button>
-          );
-        })}
-
-        {/* Actions mois courant (silencieuses) */}
-        {!!currentMonthKey && (
-          <div className="ml-auto flex items-center gap-2">
-            {monthStatus[currentMonthKey]?.locked ? (
-              <>
-                <span className="text-sm text-green-700">Mois validé</span>
-                <button
-                  className="px-3 py-1.5 rounded border border-zinc-300 hover:bg-zinc-50"
-                  onClick={() => unlockMonth(currentMonthKey)}
-                >
-                  Déverrouiller
-                </button>
-              </>
-            ) : (
-              <>
-                <span className="text-sm text-red-700">Mois à valider</span>
-                <button
-                  className="px-3 py-1.5 rounded border border-emerald-300 text-emerald-900 bg-emerald-50 hover:bg-emerald-100"
-                  onClick={() => validateMonth(currentMonthKey)}
-                >
-                  Valider ce mois
-                </button>
-              </>
-            )}
-          </div>
-        )}
+            return (
+              <button
+                key={m.key}
+                className={`px-3 py-1.5 rounded ${isActive ? active : notActive}`}
+                onClick={() => setViewMonth(m.date)}
+                title={st?.locked ? 'Validé' : 'À valider'}
+              >
+                {m.label}
+              </button>
+            );
+          })}
+          {monthsInPeriod.length === 0 && (
+            <div className="text-sm text-zinc-400">
+              Aucun créneau pour l’instant.
+            </div>
+          )}
+        </div>
       </div>
 
-      {/* Grille mensuelle : clic direct = toggle (pas de sheet, pas de bandeau) */}
+      {/* Grille mensuelle : clic = toggle, styles adaptés light/dark */}
       <div className="grid grid-cols-7 gap-2">
         {['Lun','Mar','Mer','Jeu','Ven','Sam','Dim'].map(w => (
-          <div key={w} className="text-center text-xs uppercase tracking-wide text-gray-500">{w}</div>
+          <div key={w} className="text-center text-xs uppercase tracking-wide text-zinc-500">{w}</div>
         ))}
 
         {daysOfMonth.map((d, i) => {
-          if (!d) return <div key={i} className="h-32 rounded-xl border border-dashed border-gray-200 bg-gray-50" />;
+          if (!d) {
+            return (
+              <div
+                key={i}
+                className="h-32 rounded-xl border border-dashed
+                           border-zinc-300 bg-zinc-100
+                           dark:border-zinc-700 dark:bg-zinc-900"
+              />
+            );
+          }
 
           const key = ymdLocal(d);
           const daySlots = slotsByDate[key] || [];
           const dayNum = d.getDate();
-          const mKey = yyyymm(d);
-          const locked = !!monthStatus[mKey]?.locked;
 
           return (
             <div
               key={i}
-              className="h-32 rounded-2xl border border-gray-200 overflow-hidden bg-white shadow-sm text-left"
+              className="h-32 rounded-2xl overflow-hidden shadow-sm
+                         border border-zinc-300 bg-white
+                         dark:border-zinc-700 dark:bg-zinc-900"
             >
-              <div className="px-2 pt-2 pb-1 text-sm font-medium text-gray-700 flex items-center justify-between">
+              <div className="px-2 pt-2 pb-1 text-sm font-medium
+                              text-zinc-700 dark:text-zinc-200
+                              flex items-center justify-between">
                 <span>{dayNum}</span>
-                <span className="text-xs text-gray-400">
+                <span className="text-xs text-zinc-400">
                   {d.toLocaleDateString('fr-FR', { weekday: 'short' })}
                 </span>
               </div>
 
               <div className="flex flex-col h-[calc(100%-2rem)]">
                 {daySlots.length === 0 ? (
-                  <div className="flex-1 text-xs px-2 text-gray-400 flex items-center justify-center">Aucun créneau</div>
+                  <div className="flex-1 text-xs px-2
+                                  text-zinc-500 dark:text-zinc-400
+                                  flex items-center justify-center">
+                    Aucun créneau
+                  </div>
                 ) : daySlots.map((s) => {
                   const on = !!availability[s.id];
-                  const cellClass = on
-                    ? (locked ? 'bg-emerald-700 text-white' : 'bg-emerald-600 text-white hover:bg-emerald-500')
-                    : (locked ? 'bg-zinc-200 text-zinc-500' : 'bg-zinc-100 text-zinc-600 hover:bg-zinc-200');
+                  const onCls =
+                    'bg-emerald-600 text-white hover:bg-emerald-500 ' +
+                    'dark:bg-emerald-600 dark:hover:bg-emerald-500';
+                  const offCls =
+                    'bg-zinc-100 text-zinc-700 hover:bg-zinc-200 ' +
+                    'dark:bg-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-700';
 
                   return (
                     <button
                       key={s.id}
                       type="button"
-                      disabled={locked}
-                      onClick={() => toggleLocal(s.id, locked)}
-                      className={`flex-1 text-[11px] px-2 border-t first:border-t-0 ${cellClass} flex items-center justify-center`}
+                      onClick={() => toggleLocal(s.id)}
+                      className={`flex-1 text-[11px] px-2 border-t first:border-t-0
+                                  border-zinc-200 dark:border-zinc-700
+                                  flex items-center justify-center
+                                  ${on ? onCls : offCls}`}
                       title={KIND_LABEL[s.kind]}
                     >
                       {KIND_LABEL[s.kind]}
@@ -406,7 +385,7 @@ export default function CalendrierPage() {
         })}
       </div>
 
-      {/* Pas de bouton “Enregistrer” ni de bandeau : tout est auto-sauvé en silence */}
+      {/* Pas de bouton “Enregistrer” : autosave silencieux */}
     </div>
   );
 }
