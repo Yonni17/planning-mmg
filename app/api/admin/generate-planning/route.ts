@@ -15,12 +15,9 @@ type SlotRow = {
 };
 
 // ------- util dates & kinds -------
-function toDate(d: string) {
-  return new Date(`${d}T00:00:00`);
-}
+function toDate(d: string) { return new Date(`${d}T00:00:00`); }
 function addDays(ymd: string, n: number) {
-  const d = toDate(ymd);
-  d.setDate(d.getDate() + n);
+  const d = toDate(ymd); d.setDate(d.getDate() + n);
   return d.toISOString().slice(0, 10);
 }
 function isNextDay(d1: string, d2: string) {
@@ -30,29 +27,20 @@ function isNight(kind: string) {
   return kind === 'WEEKDAY_20_00' || kind === 'SAT_18_00' || kind === 'SUN_20_24';
 }
 const ENDS_AT_MIDNIGHT: Record<string, boolean> = {
-  WEEKDAY_20_00: true,
-  SAT_18_00: true,
-  SUN_20_24: true,
-  SUN_08_14: false,
-  SUN_14_20: false,
-  SAT_12_18: false,
+  WEEKDAY_20_00: true, SAT_18_00: true, SUN_20_24: true,
+  SUN_08_14: false, SUN_14_20: false, SAT_12_18: false,
 };
 // ----------------------------------
 
 // ---- Auth helpers (Bearer / cookies) ----
 function getAccessTokenFromReq(req: NextRequest): string | null {
-  // 1) Authorization: Bearer <jwt>
   const auth = req.headers.get('authorization');
-  if (auth && auth.toLowerCase().startsWith('bearer ')) {
-    return auth.slice(7).trim();
-  }
+  if (auth && auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim();
 
-  // 2) Cookie direct sb-access-token (supabase-js côté client)
   const c = cookies();
   const direct = c.get('sb-access-token')?.value;
   if (direct) return direct;
 
-  // 3) Cookie objet sb-<ref>-auth-token (Helpers) éventuellement splitté .0/.1
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || '';
   try {
     const ref = new URL(supabaseUrl).host.split('.')[0];
@@ -64,54 +52,178 @@ function getAccessTokenFromReq(req: NextRequest): string | null {
     if (!raw) return null;
 
     let txt = raw;
-    try {
-      txt = decodeURIComponent(raw);
-    } catch {}
+    try { txt = decodeURIComponent(raw); } catch {}
     const parsed = JSON.parse(txt);
     if (parsed?.access_token) return String(parsed.access_token);
     if (parsed?.currentSession?.access_token) return String(parsed.currentSession.access_token);
-  } catch {
-    // ignore
-  }
+  } catch {}
   return null;
 }
 
 async function requireAdminOrResponse(req: NextRequest) {
   const supabase = getSupabaseAdmin();
-
   const token = getAccessTokenFromReq(req);
   if (!token) {
-    return {
-      errorResponse: NextResponse.json({ error: 'Unauthorized' }, { status: 401 }),
-      supabase,
-      userId: null as string | null,
-    };
+    return { errorResponse: NextResponse.json({ error: 'Unauthorized' }, { status: 401 }), supabase, userId: null as string | null };
   }
-
   const { data: userData, error: uErr } = await supabase.auth.getUser(token);
   if (uErr || !userData?.user) {
-    return {
-      errorResponse: NextResponse.json({ error: 'Unauthorized' }, { status: 401 }),
-      supabase,
-      userId: null,
-    };
+    return { errorResponse: NextResponse.json({ error: 'Unauthorized' }, { status: 401 }), supabase, userId: null };
   }
-
   const uid = userData.user.id;
   const { data: isAdmin, error: aErr } = await supabase.rpc('is_admin', { uid });
   if (aErr || !isAdmin) {
-    return {
-      errorResponse: NextResponse.json({ error: 'Forbidden' }, { status: 403 }),
-      supabase,
-      userId: uid,
+    return { errorResponse: NextResponse.json({ error: 'Forbidden' }, { status: 403 }), supabase, userId: uid };
+  }
+  return { errorResponse: null as NextResponse | null, supabase, userId: uid };
+}
+// -----------------------------------------
+
+/**
+ * Construit:
+ * - slots de la période
+ * - disponibilités par slot (avec user names)
+ * - index utilisateurs (name, target_level, avail_count)
+ */
+async function buildAvailabilitySummary(supabase: ReturnType<typeof getSupabaseAdmin>, period_id: string) {
+  // Slots
+  const { data: slotsData, error: slotsErr } = await supabase
+    .from('slots')
+    .select('id, kind, period_id, start_ts, date')
+    .eq('period_id', period_id)
+    .order('start_ts', { ascending: true });
+  if (slotsErr) throw slotsErr;
+
+  const slots: SlotRow[] = (slotsData ?? []) as SlotRow[];
+  if (!slots.length) return { slots: [], availability_by_slot: {}, users_index: {} };
+
+  const slotIds = slots.map(s => s.id);
+
+  // Availability (batch paginé)
+  async function fetchAvailabilityByBatches(ids: string[], idBatch = 200, pageSize = 1000) {
+    const out: { user_id: string; slot_id: string; available: boolean }[] = [];
+    for (let i = 0; i < ids.length; i += idBatch) {
+      const chunk = ids.slice(i, i + idBatch);
+      let from = 0;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const to = from + pageSize - 1;
+        const { data, error } = await supabase
+          .from('availability')
+          .select('user_id, slot_id, available')
+          .in('slot_id', chunk)
+          .range(from, to);
+        if (error) throw error;
+        const len = data?.length ?? 0;
+        if (len) out.push(...(data ?? []));
+        if (len < pageSize) break;
+        from += pageSize;
+      }
+    }
+    return out;
+  }
+  const avRows = await fetchAvailabilityByBatches(slotIds, 200, 1000);
+
+  // Avail map & user set
+  const availBySlot = new Map<string, Set<string>>();
+  const allUsers = new Set<string>();
+  for (const a of avRows) {
+    if (!a.available) continue;
+    if (!availBySlot.has(a.slot_id)) availBySlot.set(a.slot_id, new Set());
+    availBySlot.get(a.slot_id)!.add(a.user_id);
+    allUsers.add(a.user_id);
+  }
+
+  // Profiles (seulement ceux utiles)
+  let profIndex = new Map<string, { first_name: string|null; last_name: string|null }>();
+  if (allUsers.size > 0) {
+    const { data: profiles, error: profErr } = await supabase
+      .from('profiles')
+      .select('user_id, first_name, last_name')
+      .in('user_id', Array.from(allUsers));
+    if (profErr) throw profErr;
+    (profiles ?? []).forEach((p: any) => {
+      profIndex.set(p.user_id, { first_name: p.first_name ?? null, last_name: p.last_name ?? null });
+    });
+  }
+
+  const fullNameOf = (uid: string) => {
+    const p = profIndex.get(uid);
+    if (!p) return uid;
+    const fn = (p.first_name ?? '').trim();
+    const ln = (p.last_name ?? '').trim();
+    const full = `${fn} ${ln}`.trim();
+    return full || uid;
+  };
+
+  // Prefs pour target_level
+  const { data: prefs, error: prefsErr } = await supabase
+    .from('preferences_period')
+    .select('user_id, target_level')
+    .eq('period_id', period_id);
+  if (prefsErr) throw prefsErr;
+
+  const targetCap = new Map<string, number>();
+  (prefs ?? []).forEach((p: any) => targetCap.set(p.user_id, p.target_level ?? 5));
+
+  // avail count par user
+  const availCountByUser = new Map<string, number>();
+  for (const u of allUsers) availCountByUser.set(u, 0);
+  for (const s of slots) {
+    for (const u of availBySlot.get(s.id) ?? new Set<string>()) {
+      availCountByUser.set(u, (availCountByUser.get(u) ?? 0) + 1);
+    }
+  }
+
+  // availability_by_slot (avec noms)
+  const availability_by_slot: Record<string, { date: string; kind: string; candidates: { user_id: string; name: string }[] }> = {};
+  for (const s of slots) {
+    const set = availBySlot.get(s.id) ?? new Set<string>();
+    availability_by_slot[s.id] = {
+      date: s.date,
+      kind: s.kind,
+      candidates: Array.from(set).map(u => ({ user_id: u, name: fullNameOf(u) })),
     };
   }
 
-  return { errorResponse: null as NextResponse | null, supabase, userId: uid };
+  // users_index
+  const users_index: Record<string, { name: string; target_level: number | null; avail_count: number }> = {};
+  for (const u of allUsers) {
+    users_index[u] = {
+      name: fullNameOf(u),
+      target_level: targetCap.has(u) ? (targetCap.get(u) as number) : null,
+      avail_count: availCountByUser.get(u) ?? 0,
+    };
+  }
+
+  return { slots, availability_by_slot, users_index };
 }
 
-// -----------------------------------------
+// ============== GET ==============
+// Résumé disponibilités (pour afficher "Disponibilités par créneau" tout le temps)
+export async function GET(req: NextRequest) {
+  try {
+    const { errorResponse, supabase } = await requireAdminOrResponse(req);
+    if (errorResponse) return errorResponse;
 
+    const period_id = req.nextUrl.searchParams.get('period_id') || '';
+    if (!period_id) return NextResponse.json({ error: 'period_id requis' }, { status: 400 });
+
+    const { slots, availability_by_slot, users_index } = await buildAvailabilitySummary(supabase, period_id);
+
+    return NextResponse.json({
+      period_id,
+      slots_count: slots.length,
+      availability_by_slot,
+      users_index,
+    });
+  } catch (e: any) {
+    console.error('[generate-planning GET]', e);
+    return NextResponse.json({ error: e?.message ?? 'Server error' }, { status: 500 });
+  }
+}
+
+// ============== POST ==============
 export async function POST(req: NextRequest) {
   try {
     const { errorResponse, supabase } = await requireAdminOrResponse(req);
@@ -128,114 +240,34 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'period_id requis' }, { status: 400 });
     }
 
-    // Slots
-    const { data: slotsData, error: slotsErr } = await supabase
-      .from('slots')
-      .select('id, kind, period_id, start_ts, date')
-      .eq('period_id', period_id)
-      .order('start_ts', { ascending: true });
+    // ---- Base: slots + summary (sert aussi pour l’UI même sans génération)
+    const { slots, availability_by_slot, users_index } = await buildAvailabilitySummary(supabase, period_id);
+    if (!slots.length) return NextResponse.json({ error: 'Aucun slot pour cette période' }, { status: 400 });
 
-    if (slotsErr) throw slotsErr;
-    const slots: SlotRow[] = (slotsData ?? []) as SlotRow[];
-    if (!slots.length) {
-      return NextResponse.json({ error: 'Aucun slot pour cette période' }, { status: 400 });
-    }
+    const slotIds = slots.map(s => s.id);
 
-    const slotIds = slots.map((s) => s.id);
-
-    // Availability (pagination)
-    async function fetchAvailabilityByBatches(ids: string[], idBatch = 200, pageSize = 1000) {
-      const out: { user_id: string; slot_id: string; available: boolean }[] = [];
-      for (let i = 0; i < ids.length; i += idBatch) {
-        const chunk = ids.slice(i, i + idBatch);
-        let from = 0;
-        // eslint-disable-next-line no-constant-condition
-        while (true) {
-          const to = from + pageSize - 1;
-          const { data, error } = await supabase
-            .from('availability')
-            .select('user_id, slot_id, available')
-            .in('slot_id', chunk)
-            .range(from, to);
-
-          if (error) throw error;
-          const len = data?.length ?? 0;
-          if (len) out.push(...(data ?? []));
-          if (len < pageSize) break;
-          from += pageSize;
-        }
-      }
-      return out;
-    }
-
-    const avRows = await fetchAvailabilityByBatches(slotIds, 200, 1000);
-
-    // Build maps
+    // Reconstituer structures à partir du summary
     const availBySlot = new Map<string, Set<string>>();
     const allUsers = new Set<string>();
-    for (const a of avRows) {
-      if (!a.available) continue;
-      if (!availBySlot.has(a.slot_id)) availBySlot.set(a.slot_id, new Set());
-      availBySlot.get(a.slot_id)!.add(a.user_id);
-      allUsers.add(a.user_id);
-    }
+    Object.entries(availability_by_slot).forEach(([slot_id, v]) => {
+      const set = new Set<string>(v.candidates.map(c => c.user_id));
+      availBySlot.set(slot_id, set);
+      for (const u of set) allUsers.add(u);
+    });
 
-    // Targets
-    const { data: prefs, error: prefsErr } = await supabase
-      .from('preferences_period')
-      .select('user_id, target_level')
-      .eq('period_id', period_id);
-    if (prefsErr) throw prefsErr;
+    const fullNameOf = (uid: string) => users_index[uid]?.name ?? uid;
 
-    const targetCap = new Map<string, number>(); // Infinity = Max
-    const hasPref = new Set((prefs ?? []).map((p) => p.user_id));
+    // Targets (∞ si target_level null ou == 5)
+    const targetCap = new Map<string, number>();
     for (const u of allUsers) {
-      if (!hasPref.has(u)) targetCap.set(u, Number.POSITIVE_INFINITY);
-    }
-    for (const p of prefs ?? []) {
-      if (!allUsers.has(p.user_id)) continue;
-      const tl = Math.max(1, Math.min(5, (p as any).target_level ?? 5));
-      targetCap.set(p.user_id, tl === 5 ? Number.POSITIVE_INFINITY : tl);
-    }
-
-    // Noms (first/last -> full)
-    const { data: profiles, error: profErr } = await supabase
-      .from('profiles')
-      .select('user_id, first_name, last_name');
-    if (profErr) throw profErr;
-
-    type Prof = { user_id: string; first_name: string | null; last_name: string | null };
-    const profIndex = new Map<string, Prof>();
-    (profiles ?? []).forEach((p: any) => profIndex.set(p.user_id, p as Prof));
-
-    const fullNameOf = (uid: string) => {
-      const p = profIndex.get(uid);
-      if (!p) return uid;
-      const fn = (p.first_name ?? '').trim();
-      const ln = (p.last_name ?? '').trim();
-      const full = `${fn} ${ln}`.trim();
-      return full || uid;
-    };
-
-    const candidates_by_slot: Record<string, { user_id: string; name: string }[]> = {};
-    if (include_candidates) {
-      for (const s of slots) {
-        const set = availBySlot.get(s.id) ?? new Set<string>();
-        candidates_by_slot[s.id] = Array.from(set).map((u) => ({
-          user_id: u,
-          name: fullNameOf(u),
-        }));
-      }
+      const tl = users_index[u]?.target_level;
+      if (tl == null || tl === 5) targetCap.set(u, Number.POSITIVE_INFINITY);
+      else targetCap.set(u, Math.max(1, Math.min(5, tl)));
     }
 
     // Rareté
     const availCountByUser = new Map<string, number>();
-    for (const u of allUsers) availCountByUser.set(u, 0);
-    for (const s of slots) {
-      for (const u of availBySlot.get(s.id) ?? new Set<string>()) {
-        availCountByUser.set(u, (availCountByUser.get(u) ?? 0) + 1);
-      }
-    }
+    for (const u of allUsers) availCountByUser.set(u, users_index[u]?.avail_count ?? 0);
 
     // Structures d’assignation & suivi
     const assignedCount = new Map<string, number>();
@@ -246,11 +278,11 @@ export async function POST(req: NextRequest) {
     const takenSlot = new Set<string>();
 
     // anti-enchaînements
-    const assignedUsersByDate = new Map<string, Set<string>>(); // date -> users (évite 2/jour)
-    const lastAssignedDate = new Map<string, string | null>(); // user -> dernière date
-    const lastNightDate = new Map<string, string | null>(); // user -> dernière date "nuit"
-    const nightStreak = new Map<string, number>(); // user -> nb nuits consécutives
-    const assignedKindsByUserDate = new Map<string, Map<string, Set<string>>>(); // user -> (date -> kinds)
+    const assignedUsersByDate = new Map<string, Set<string>>();
+    const lastAssignedDate = new Map<string, string | null>();
+    const lastNightDate = new Map<string, string | null>();
+    const nightStreak = new Map<string, number>();
+    const assignedKindsByUserDate = new Map<string, Map<string, Set<string>>>();
 
     function markAssigned(u: string, date: string, kind: string) {
       if (!assignedUsersByDate.has(date)) assignedUsersByDate.set(date, new Set());
@@ -272,7 +304,6 @@ export async function POST(req: NextRequest) {
     }
 
     const userHasSameDay = (u: string, date: string) => assignedUsersByDate.get(date)?.has(u) ?? false;
-
     const eligible = (u: string) => {
       const cap = targetCap.get(u);
       const cnt = assignedCount.get(u) ?? 0;
@@ -281,14 +312,11 @@ export async function POST(req: NextRequest) {
       return cnt < cap;
     };
 
-    // Tri stable utilisateurs : rareté -> nom -> id
     const stableCompareUsers = (u1: string, u2: string) => {
       const c1 = availCountByUser.get(u1) ?? 0;
       const c2 = availCountByUser.get(u2) ?? 0;
       if (c1 !== c2) return c1 - c2;
-      const n1 = fullNameOf(u1),
-        n2 = fullNameOf(u2);
-      const dn = n1.localeCompare(n2, 'fr');
+      const dn = fullNameOf(u1).localeCompare(fullNameOf(u2), 'fr');
       if (dn !== 0) return dn;
       return u1.localeCompare(u2);
     };
@@ -320,23 +348,19 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
-      // cap d’abord
       const notCapped = candAll.filter(eligible);
       const pool0 = notCapped.length > 0 ? notCapped : candAll.slice();
 
-      // ======= FILTRES “HARD AVANT CHOIX” =======
-      // A. interdire 2 créneaux le même jour si au moins une alternative existe
+      // A. interdire 2 créneaux le même jour si alternative
       const poolNoSameDay = pool0.filter((u) => !userHasSameDay(u, s.date));
       const poolA = poolNoSameDay.length > 0 ? poolNoSameDay : pool0;
 
       // B. éviter Nuit->Nuit (J+1) et 00:00->Matin (J+1) si alternative
       const poolAvoidHeavy = poolA.filter((u) => {
-        // nuit->nuit
         if (isNight(s.kind)) {
           const lastN = lastNightDate.get(u);
-          if (lastN && isNextDay(lastN, s.date)) return false; // exclure si possible
+          if (lastN && isNextDay(lastN, s.date)) return false;
         }
-        // 00:00 -> matin
         if (s.kind === 'SUN_08_14') {
           const y = addDays(s.date, -1);
           const kindsY = assignedKindsByUserDate.get(u)?.get(y);
@@ -345,9 +369,8 @@ export async function POST(req: NextRequest) {
         return true;
       });
       const poolB = poolAvoidHeavy.length > 0 ? poolAvoidHeavy : poolA;
-      // ==========================================
 
-      // Choix = “pool minimal” sur nb de gardes déjà attribuées
+      // Choix = “pool minimal” sur nb déjà attribuées
       let minCount = Number.POSITIVE_INFINITY;
       for (const u of poolB) {
         const c = assignedCount.get(u) ?? 0;
@@ -356,7 +379,6 @@ export async function POST(req: NextRequest) {
       let poolMin = poolB.filter((u) => (assignedCount.get(u) ?? 0) === minCount);
       if (poolMin.length === 0) poolMin = poolB.slice();
 
-      // Tie-break doux (rareté, nom, id)
       poolMin.sort(stableCompareUsers);
       const chosen = poolMin[0] ?? null;
 
@@ -369,13 +391,6 @@ export async function POST(req: NextRequest) {
       takenSlot.add(s.id);
       assignedCount.set(chosen, (assignedCount.get(chosen) ?? 0) + 1);
       markAssigned(chosen, s.date, s.kind);
-    }
-
-    // Sanity : slots sans candidats
-    for (const s of slots) {
-      if (takenSlot.has(s.id)) continue;
-      const c = availBySlot.get(s.id)?.size ?? 0;
-      if (c === 0) holes_list.push({ slot_id: s.id, date: s.date, kind: s.kind, candidates: 0 });
     }
 
     // Enrichissement UI
@@ -393,6 +408,16 @@ export async function POST(req: NextRequest) {
         return String(a.kind ?? '').localeCompare(String(b.kind ?? ''));
       });
 
+    // candidats by slot (avec noms) si demandé
+    let candidates_by_slot: Record<string, { user_id: string; name: string }[]> | undefined;
+    if (include_candidates) {
+      candidates_by_slot = {};
+      for (const s of slots) {
+        const set = availBySlot.get(s.id) ?? new Set<string>();
+        candidates_by_slot[s.id] = Array.from(set).map((u) => ({ user_id: u, name: fullNameOf(u) }));
+      }
+    }
+
     if (dry_run) {
       return NextResponse.json({
         period_id,
@@ -401,7 +426,14 @@ export async function POST(req: NextRequest) {
         assignments: enriched,
         runs: [{ seed: 0, total_score: enriched.length, holes: holes_list.length }],
         holes_list,
-        ...(include_candidates ? { candidates_by_slot } : {}),
+        ...(candidates_by_slot ? { candidates_by_slot } : {}),
+        users_index: Object.fromEntries(
+          Array.from(new Set(Object.keys(users_index))).map(uid => [
+            uid,
+            { ...users_index[uid], /* placeholder */ assigned_count: 0 }
+          ])
+        ),
+        availability_summary: { availability_by_slot, users_index },
       });
     }
 
@@ -409,24 +441,33 @@ export async function POST(req: NextRequest) {
     const { error: delErr } = await supabase.from('assignments').delete().eq('period_id', period_id);
     if (delErr) throw delErr;
 
-    const rows = assignments.map((a) => ({
-      period_id,
-      slot_id: a.slot_id,
-      user_id: a.user_id,
-      score: a.score,
-    }));
-
+    const rows = assignments.map((a) => ({ period_id, slot_id: a.slot_id, user_id: a.user_id, score: a.score }));
     if (rows.length) {
       const { error: insErr } = await supabase.from('assignments').insert(rows);
       if (insErr) throw insErr;
     }
 
+    // assigned_count final (pour users_index)
+    const assignedCountOut: Record<string, number> = {};
+    for (const [u, c] of assignedCount.entries()) assignedCountOut[u] = c;
+
+    const users_index_out = Object.fromEntries(
+      Object.keys(users_index).map(uid => [
+        uid,
+        { ...users_index[uid], assigned_count: assignedCountOut[uid] ?? 0 }
+      ])
+    );
+
     return NextResponse.json({
       ok: true,
       period_id,
       holes: holes_list.length,
-      total_score: assignments.length,
+      total_score: rows.length,
       inserted: rows.length,
+      assignments: enriched,
+      ...(candidates_by_slot ? { candidates_by_slot } : {}),
+      users_index: users_index_out,
+      availability_summary: { availability_by_slot, users_index },
     });
   } catch (e: any) {
     console.error('[generate-planning hard-filters]', e);
