@@ -282,10 +282,7 @@ export default function CalendrierPage() {
       {/* Sélecteurs période & mois */}
       <div className="flex flex-wrap gap-2 items-center">
         <select
-          className="border rounded p-2 text-black
-             bg-white dark:bg-zinc-800
-             border-zinc-300 dark:border-zinc-600
-             shadow-sm focus:outline-none focus:ring-2 focus:ring-emerald-400"
+          className="border rounded p-2 bg-white text-Black border-zinc-300"
           value={periodId}
           onChange={async (e) => {
             const v = e.target.value;
@@ -305,9 +302,9 @@ export default function CalendrierPage() {
           const st = monthStatus[m.key];
           const isActive = currentMonthKey === m.key;
 
-          const activeCls = 'bg-white text-black border border-zinc-300';
-          const greenCls  = 'bg-green-50 text-green-900 border border-green-200';
-          const redCls    = 'bg-red-50 text-red-900 border border-red-200';
+          const activeCls = 'bg-white-150 text-black border border-zinc-300';
+          const greenCls  = 'bg-green-150 text-green-900 border border-green-200';
+          const redCls    = 'bg-red-150 text-red-900 border border-red-200';
           const hoverCls  = 'hover:bg-white hover:text-black';
 
           const base = isActive
