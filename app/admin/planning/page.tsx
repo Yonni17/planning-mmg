@@ -1,7 +1,7 @@
 // app/admin/planning/page.tsx
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(
@@ -17,7 +17,7 @@ type SlotKind =
   | 'SUN_14_20'
   | 'SUN_20_24';
 
-const KIND_TIME: Record<string, [string, string]> = {
+const KIND_TIME: Record<SlotKind, [string, string]> = {
   WEEKDAY_20_00: ['20:00', '00:00'],
   SAT_12_18: ['12:00', '18:00'],
   SAT_18_00: ['18:00', '00:00'],
@@ -36,16 +36,15 @@ function formatDateLongFR(ymd?: string | null) {
   const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
   return `${cap(day)} ${ddStr} ${month}`;
 }
-function formatKindRange(kind?: string | null) {
+function formatKindRange(kind?: SlotKind | null) {
   if (!kind) return '—';
   const t = KIND_TIME[kind];
-  if (!t) return kind;
   const h = (s: string) => s.replace(':', 'h');
   return `${h(t[0])} - ${h(t[1])}`;
 }
 
 type Period = { id: string; label: string };
-type SlotRow = { id: string; kind: string; date: string; start_ts: string };
+type SlotRow = { id: string; kind: SlotKind; date: string; start_ts: string };
 
 type AssignmentRow = {
   slot_id: string;
@@ -53,7 +52,7 @@ type AssignmentRow = {
   display_name: string;
   score: number;
   date: string | null;
-  kind: string | null;
+  kind: SlotKind | null;
 };
 
 type Candidate = { user_id: string; name: string };
@@ -65,15 +64,17 @@ type ResultPayload = {
   total_score: number;
   assignments: AssignmentRow[];
   runs: { seed: number; total_score: number; holes: number }[];
-  holes_list: { slot_id: string; date: string; kind: string; candidates: number }[];
+  holes_list: { slot_id: string; date: string; kind: SlotKind; candidates: number }[];
   candidates_by_slot?: CandidatesBySlot;
 };
 
 export default function PlanningPage() {
   const [periods, setPeriods] = useState<Period[]>([]);
   const [periodId, setPeriodId] = useState<string>('');
+  const [periodLabel, setPeriodLabel] = useState<string>('');
   const [loading, setLoading] = useState(false);
 
+  // “result” = proposition OU données DB existantes
   const [result, setResult] = useState<ResultPayload | null>(null);
   const [edited, setEdited] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
@@ -85,37 +86,48 @@ export default function PlanningPage() {
   const [avail, setAvail] = useState<Map<string, Set<string>>>(new Map());
   const [monthFilter, setMonthFilter] = useState<string>('');
 
-  // scroll synchronisé (barre du haut)
-  const topScrollerRef = useRef<HTMLDivElement | null>(null);
-  const bottomScrollerRef = useRef<HTMLDivElement | null>(null);
-  const [scrollWidth, setScrollWidth] = useState<number>(0);
-  const syncing = useRef<'top' | 'bottom' | null>(null);
+  // Flag : existe-t-il déjà un planning enregistré en base ?
+  const hasDbAssignments = !!(result && result.assignments && result.assignments.length > 0);
 
+  // charge la liste des périodes
   useEffect(() => {
     (async () => {
       const { data } = await supabase.from('periods').select('id,label').order('label');
-      setPeriods((data as any) ?? []);
+      const rows = (data as Period[]) ?? [];
+      setPeriods(rows);
     })();
   }, []);
 
-  // Charge données auxiliaires (slots, profiles, targets, availability)
+  // Charge données auxiliaires + **planning existant**
   useEffect(() => {
     if (!periodId) return;
     (async () => {
       setLoading(true);
 
+      // Retenir label pour email/sommaire
+      const cur = periods.find((p) => p.id === periodId);
+      setPeriodLabel(cur?.label ?? '');
+
+      // Slots
       const { data: slotsData } = await supabase
         .from('slots')
-        .select('id, kind, date, start_ts')
+        .select('id, kind, date, start_ts, period_id')
         .eq('period_id', periodId)
         .order('start_ts', { ascending: true });
-      const s: SlotRow[] = (slotsData ?? []) as any;
+
+      const s: SlotRow[] = ((slotsData ?? []) as any[]).map((r) => ({
+        id: r.id,
+        kind: r.kind as SlotKind,
+        date: r.date,
+        start_ts: r.start_ts,
+      }));
       setSlots(s);
 
-      // Récupère first_name/last_name aussi pour construire le nom si full_name est nul
+      // Profiles (inclut prénom/nom pour fallback)
       const { data: profData } = await supabase
         .from('profiles')
         .select('user_id, full_name, first_name, last_name');
+
       const profs = (profData as any[]) ?? [];
       setProfiles(
         profs.map((p) => ({
@@ -127,10 +139,12 @@ export default function PlanningPage() {
         }))
       );
 
+      // Targets
       const { data: prefs } = await supabase
         .from('preferences_period')
         .select('user_id, target_level')
         .eq('period_id', periodId);
+
       const t = new Map<string, number>();
       for (const p of prefs ?? []) {
         const tl = Math.max(1, Math.min(5, (p as any).target_level ?? 5));
@@ -138,6 +152,7 @@ export default function PlanningPage() {
       }
       setTargets(t);
 
+      // Availability (par batch)
       const slotIds = s.map((x) => x.id);
       const bigSet = new Map<string, Set<string>>();
       for (let i = 0; i < slotIds.length; i += 200) {
@@ -164,36 +179,118 @@ export default function PlanningPage() {
       }
       setAvail(bigSet);
 
+      // Premier mois par défaut
       const first = s[0]?.date;
       if (first) setMonthFilter(first.slice(0, 7));
 
+      // Hydratation depuis la base (afficher tout immédiatement s'il y a un planning)
+      await hydrateAssignmentsFromDB(periodId);
+
       setLoading(false);
     })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [periodId]);
 
-  // met à jour la largeur à scroller (haut) selon le tableau réel (bas)
-  useEffect(() => {
-    const el = bottomScrollerRef.current;
-    if (!el) return;
-    // petit délai pour laisser le DOM peindre
-    const id = setTimeout(() => setScrollWidth(el.scrollWidth), 0);
-    return () => clearTimeout(id);
-  }, [slots, avail, profiles, monthFilter]);
+  // Récupère les assignations **déjà enregistrées** pour la période
+  async function hydrateAssignmentsFromDB(pid: string) {
+    const { data, error } = await supabase
+      .from('assignments')
+      .select(`
+        slot_id,
+        user_id,
+        score,
+        period_id,
+        slots!inner(id, date, kind, start_ts),
+        profiles!assignments_user_id_fkey(user_id, full_name, first_name, last_name)
+      `)
+      .eq('period_id', pid)
+      .order('slots(start_ts)', { ascending: true });
 
-  const onTopScroll = () => {
-    if (!topScrollerRef.current || !bottomScrollerRef.current) return;
-    if (syncing.current === 'bottom') return;
-    syncing.current = 'top';
-    bottomScrollerRef.current.scrollLeft = topScrollerRef.current.scrollLeft;
-    syncing.current = null;
-  };
-  const onBottomScroll = () => {
-    if (!topScrollerRef.current || !bottomScrollerRef.current) return;
-    if (syncing.current === 'top') return;
-    syncing.current = 'bottom';
-    topScrollerRef.current.scrollLeft = bottomScrollerRef.current.scrollLeft;
-    syncing.current = null;
-  };
+    if (error) {
+      console.error('[hydrateAssignmentsFromDB]', error);
+      setResult(null);
+      return;
+    }
+
+    const assignments: AssignmentRow[] = (data ?? []).map((r: any) => {
+      const constructed = [r.profiles?.first_name, r.profiles?.last_name]
+        .filter(Boolean)
+        .join(' ')
+        .trim();
+      const full =
+        (r.profiles?.full_name as string | undefined)?.trim() ||
+        (constructed || r.user_id);
+
+      return {
+        slot_id: r.slot_id as string,
+        user_id: r.user_id as string,
+        display_name: full,
+        score: Number(r.score ?? 1),
+        date: (r.slots?.date as string | null) ?? null,
+        kind: (r.slots?.kind as SlotKind | null) ?? null,
+      };
+    });
+
+    // trous
+    const taken = new Set(assignments.map((a) => a.slot_id));
+    const holes_list = slots
+      .filter((s) => !taken.has(s.id))
+      .map((s) => ({
+        slot_id: s.id,
+        date: s.date,
+        kind: s.kind,
+        candidates: avail.get(s.id)?.size ?? 0,
+      }));
+
+    // Candidats par slot (noms complets) pour l’édition
+    const nameMap = new Map<string, string>();
+    for (const p of profiles) nameMap.set(p.user_id, p.full_name ?? p.user_id);
+    const nameOf = (uid: string) => nameMap.get(uid) ?? uid;
+
+    const candidates_by_slot: CandidatesBySlot = {};
+    for (const s of slots) {
+      const set = avail.get(s.id) ?? new Set<string>();
+      candidates_by_slot[s.id] = Array.from(set).map((uid) => ({
+        user_id: uid,
+        name: nameOf(uid),
+      }));
+    }
+
+    // Tri par date/kind
+    assignments.sort((a, b) => {
+      const d = String(a.date ?? '').localeCompare(String(b.date ?? ''));
+      if (d !== 0) return d;
+      return String(a.kind ?? '').localeCompare(String(b.kind ?? ''));
+    });
+
+    const payload: ResultPayload = {
+      period_id: pid,
+      holes: holes_list.length,
+      total_score: assignments.length,
+      assignments,
+      runs: [{ seed: 0, total_score: assignments.length, holes: holes_list.length }],
+      holes_list,
+      candidates_by_slot,
+    };
+
+    setEdited({});
+    setResult(payload);
+  }
+
+  const nameMap = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const p of profiles) m.set(p.user_id, p.full_name ?? p.user_id);
+    if (result) {
+      for (const a of result.assignments) {
+        if (!m.has(a.user_id)) m.set(a.user_id, a.display_name ?? a.user_id);
+      }
+      const cands = result.candidates_by_slot ?? {};
+      for (const list of Object.values(cands)) {
+        for (const c of list) if (!m.has(c.user_id)) m.set(c.user_id, c.name ?? c.user_id);
+      }
+    }
+    return m;
+  }, [profiles, result]);
 
   const monthOptions = useMemo(() => {
     const set = new Set<string>();
@@ -206,11 +303,10 @@ export default function PlanningPage() {
     return slots.filter((s) => s.date.startsWith(monthFilter));
   }, [slots, monthFilter]);
 
-  // Générer (appel simple à l’API)
+  // Générer (appel l’API – recalcul d'une proposition, ne touche pas la DB)
   async function generate() {
     if (!periodId) return;
     setLoading(true);
-    setResult(null);
     setEdited({});
     try {
       const { data: { session } } = await supabase.auth.getSession();
@@ -272,6 +368,8 @@ export default function PlanningPage() {
       const json = await res.json();
       if (!res.ok) throw new Error(json?.error ?? "Erreur d'enregistrement");
 
+      // Recharge depuis la base pour afficher d’office
+      await hydrateAssignmentsFromDB(periodId);
       alert(`Assignations enregistrées (${json.inserted}) ✅`);
     } catch (e: any) {
       alert(e?.message ?? 'Impossible d’enregistrer');
@@ -281,7 +379,7 @@ export default function PlanningPage() {
   }
 
   async function sendEmails() {
-    if (!periodId) return;
+    if (!periodId || !result || !result.assignments?.length) return;
     try {
       const { data: { session } } = await supabase.auth.getSession();
       const token = session?.access_token;
@@ -300,22 +398,6 @@ export default function PlanningPage() {
       alert(e?.message ?? 'Impossible d’envoyer les emails');
     }
   }
-
-  // Name map (full_name || first+last || id)
-  const nameMap = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const p of profiles) m.set(p.user_id, p.full_name ?? p.user_id);
-    if (result) {
-      for (const a of result.assignments) {
-        if (!m.has(a.user_id)) m.set(a.user_id, a.display_name ?? a.user_id);
-      }
-      const cands = result.candidates_by_slot ?? {};
-      for (const list of Object.values(cands)) {
-        for (const c of list) if (!m.has(c.user_id)) m.set(c.user_id, c.name ?? c.user_id);
-      }
-    }
-    return m;
-  }, [profiles, result]);
 
   // Répartition
   const doctorRows = useMemo(() => {
@@ -376,7 +458,7 @@ export default function PlanningPage() {
     return ids;
   }, [profiles, targets, avail, nameMap]);
 
-  // Toggle dispo (cellule cliquable)
+  // Toggle dispo
   async function toggleAvailability(slot_id: string, user_id: string) {
     const current = avail.get(slot_id)?.has(user_id) ?? false;
     const next = !current;
@@ -403,7 +485,7 @@ export default function PlanningPage() {
       });
       const json = await res.json();
       if (!res.ok || !json?.ok) throw new Error(json?.error ?? 'Échec mise à jour');
-    } catch {
+    } catch (e) {
       // revert si erreur
       setAvail((prev) => {
         const m = new Map(prev);
@@ -413,11 +495,10 @@ export default function PlanningPage() {
         m.set(slot_id, s);
         return m;
       });
+      console.error(e);
       alert('Impossible de modifier la disponibilité');
     }
   }
-
-  const getName = (uid: string) => nameMap.get(uid) ?? uid;
 
   return (
     <div className="mx-auto max-w-7xl p-4 space-y-6">
@@ -436,6 +517,7 @@ export default function PlanningPage() {
               <option key={p.id} value={p.id}>{p.label}</option>
             ))}
           </select>
+          {periodLabel ? <p className="text-xs text-zinc-500 mt-1">Période sélectionnée : {periodLabel}</p> : null}
         </div>
 
         <div className="flex gap-2">
@@ -443,8 +525,13 @@ export default function PlanningPage() {
             onClick={generate}
             disabled={!periodId || loading}
             className="rounded-lg bg-blue-600 text-white px-4 py-2 disabled:opacity-50"
+            title={hasDbAssignments ? 'Recalculer une proposition sans toucher à la base' : 'Calculer une proposition'}
           >
-            {loading ? 'Calcul…' : 'Générer'}
+            {loading
+              ? 'Calcul…'
+              : hasDbAssignments
+                ? 'Re-générer (proposition)'
+                : 'Générer (proposition)'}
           </button>
           <button
             onClick={save}
@@ -455,7 +542,7 @@ export default function PlanningPage() {
           </button>
           <button
             onClick={sendEmails}
-            disabled={!periodId || !result || loading}
+            disabled={!periodId || !result || !result.assignments?.length || loading}
             className="rounded-lg bg-indigo-600 text-white px-4 py-2 disabled:opacity-50"
           >
             Envoyer le planning aux médecins
@@ -463,132 +550,50 @@ export default function PlanningPage() {
         </div>
       </div>
 
-      {/* SECTION TOUJOURS VISIBLE : Disponibilités par créneau */}
-      {periodId && (
-        <div className="space-y-3">
-          <div className="flex items-end justify-between">
-            <h2 className="text-xl font-bold">Disponibilités par créneau</h2>
-            <div className="flex items-center gap-2">
-              <label className="text-sm">Mois</label>
-              <select
-                value={monthFilter}
-                onChange={(e) => setMonthFilter(e.target.value)}
-                className="rounded border px-2 py-1"
-              >
-                {monthOptions.map((m) => (
-                  <option key={m} value={m}>{m}</option>
-                ))}
-              </select>
-            </div>
+      {/* === SECTIONS toujours visibles après sélection période (hydratation DB) === */}
+      <div className="space-y-6">
+        {/* Trous */}
+        <div>
+          <div className="flex items-center gap-3">
+            <h2 className="text-xl font-bold">Créneaux sans assignation</h2>
+            {result ? (
+              <span className="inline-flex items-center rounded-full bg-red-100 text-red-700 text-xs font-semibold px-2 py-0.5">
+                {result.holes}
+              </span>
+            ) : null}
           </div>
-
-          {/* barre de scroll en haut (synchronisée) */}
-          <div
-            ref={topScrollerRef}
-            onScroll={onTopScroll}
-            className="overflow-x-auto"
-            style={{ height: 16 }}
-          >
-            <div style={{ width: scrollWidth, height: 1 }} />
-          </div>
-
-          {/* tableau scrollable (bas) */}
-          <div
-            ref={bottomScrollerRef}
-            onScroll={onBottomScroll}
-            className="overflow-x-auto rounded-lg border"
-          >
-            <table className="min-w-max text-xs" style={{ backgroundColor: '#000', color: '#fff' }}>
+          {!result ? (
+            <p className="text-sm text-gray-600">Sélectionnez une période.</p>
+          ) : result.holes === 0 ? (
+            <p className="text-sm text-gray-600">Aucun trou 🎉</p>
+          ) : (
+            <table className="w-full text-sm mt-2 border">
               <thead>
-                <tr>
-                  <th className="sticky left-0 z-10 px-2 py-2 text-left border-r" style={{ backgroundColor: '#000' }}>
-                    Créneau
-                  </th>
-                  {doctorOrderForGrid.map((uid) => (
-                    <th
-                      key={uid}
-                      className="px-1 py-2 text-center border-b border-l"
-                      style={{
-                        width: 28,
-                        minWidth: 28,
-                        maxWidth: 28,
-                        writingMode: 'vertical-rl',
-                        transform: 'rotate(180deg)',
-                        whiteSpace: 'nowrap',
-                      }}
-                      title={getName(uid)}
-                    >
-                      {getName(uid)}
-                    </th>
-                  ))}
+                <tr className="bg-red-50">
+                  <th className="p-2 text-left font-bold text-red-700">Date</th>
+                  <th className="p-2 text-left font-bold text-red-700">Créneau</th>
+                  <th className="p-2 text-left font-bold text-red-700"># Candidats</th>
                 </tr>
               </thead>
               <tbody>
-                {filteredSlots.map((s) => {
-                  const label = `${formatDateLongFR(s.date)} — ${formatKindRange(s.kind)}`;
-                  return (
-                    <tr key={s.id}>
-                      <td className="sticky left-0 z-10 px-2 py-1 border-t border-r" style={{ backgroundColor: '#000' }}>
-                        {label}
-                      </td>
-                      {doctorOrderForGrid.map((uid) => {
-                        const ok = avail.get(s.id)?.has(uid) ?? false;
-                        return (
-                          <td
-                            key={uid}
-                            onClick={() => toggleAvailability(s.id, uid)}
-                            className="text-center align-middle border-t border-l cursor-pointer select-none hover:bg-white/10"
-                            style={{ width: 28, minWidth: 28, maxWidth: 28 }}
-                            title={ok ? 'Cliquer pour retirer la dispo' : 'Cliquer pour ajouter la dispo'}
-                          >
-                            {ok ? <span className="font-bold" style={{ color: '#22c55e' }}>✕</span> : <span> </span>}
-                          </td>
-                        );
-                      })}
-                    </tr>
-                  );
-                })}
+                {result.holes_list.map((h) => (
+                  <tr key={h.slot_id} className="border-t">
+                    <td className="p-2 font-bold text-red-700">{formatDateLongFR(h.date)}</td>
+                    <td className="p-2 font-bold text-red-700">{formatKindRange(h.kind)}</td>
+                    <td className="p-2 font-bold text-red-700">{h.candidates}</td>
+                  </tr>
+                ))}
               </tbody>
             </table>
-          </div>
-
-          <p className="text-xs text-zinc-400">
-            Astuce : cliquez sur une case pour (dé)cocher la disponibilité du médecin pour ce créneau.
-          </p>
+          )}
         </div>
-      )}
 
-      {/* SECTIONS qui dépendent d’une génération */}
-      {result && (
-        <div className="space-y-6">
-          <div>
-            <h2 className="text-xl font-bold">Créneaux sans assignation</h2>
-            {result.holes === 0 ? (
-              <p className="text-sm text-gray-600">Aucun trou 🎉</p>
-            ) : (
-              <table className="w-full text-sm mt-2 border">
-                <thead>
-                  <tr className="bg-red-50">
-                    <th className="p-2 text-left font-bold text-red-700">Date</th>
-                    <th className="p-2 text-left font-bold text-red-700">Créneau</th>
-                    <th className="p-2 text-left font-bold text-red-700"># Candidats</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {result.holes_list.map((h, i) => (
-                    <tr key={i} className="border-t">
-                      <td className="p-2 font-bold text-red-700">{formatDateLongFR(h.date)}</td>
-                      <td className="p-2 font-bold text-red-700">{formatKindRange(h.kind)}</td>
-                      <td className="p-2 font-bold text-red-700">{h.candidates}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </div>
-
-          <div>
-            <h2 className="text-xl font-bold mb-2">Aperçu des affectations (éditable)</h2>
+        {/* Aperçu (éditable) */}
+        <div>
+          <h2 className="text-xl font-bold mb-2">Aperçu des affectations (éditable)</h2>
+          {!result ? (
+            <p className="text-sm text-gray-600">Aucune assignation pour l’instant.</p>
+          ) : (
             <table className="w-full text-sm border">
               <thead>
                 <tr className="bg-gray-50">
@@ -603,7 +608,7 @@ export default function PlanningPage() {
                   const cands = result.candidates_by_slot?.[a.slot_id] ?? [];
                   const userSel = edited[a.slot_id] ?? a.user_id;
                   return (
-                    <tr key={a.slot_id + i} className="border-t">
+                    <tr key={`${a.slot_id}-${i}`} className="border-t">
                       <td className="p-2">{formatDateLongFR(a.date)}</td>
                       <td className="p-2">{formatKindRange(a.kind)}</td>
                       <td className="p-2">
@@ -629,35 +634,123 @@ export default function PlanningPage() {
                 })}
               </tbody>
             </table>
+          )}
+        </div>
+
+        {/* Répartition */}
+        <div>
+          <h2 className="text-xl font-bold mb-2">Répartition des gardes (après vos modifications)</h2>
+          <table className="w-full text-sm border">
+            <thead>
+              <tr className="bg-gray-50">
+                <th className="p-2 text-left text-gray-800 font-semibold">Médecin</th>
+                <th className="p-2 text-left text-gray-800 font-semibold"># Gardes</th>
+                <th className="p-2 text-left text-gray-800 font-semibold">Target</th>
+                <th className="p-2 text-left text-gray-800 font-semibold"># Dispos</th>
+                <th className="p-2 text-left text-gray-800 font-semibold">Écart</th>
+              </tr>
+            </thead>
+            <tbody>
+              {Array.from(
+                new Map(result?.assignments?.map(a => [a.user_id, true]) ?? []).keys()
+              )}
+              {/* rows */}
+              {doctorRows.map((r, idx) => (
+                <tr key={`${r.user_id}-${idx}`} className="border-t">
+                  <td className="p-2">{r.name}</td>
+                  <td className="p-2">{r.assigned}</td>
+                  <td className="p-2">{r.targetLabel}</td>
+                  <td className="p-2">{r.dispos}</td>
+                  <td className="p-2">{r.ecart}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Grille de disponibilités */}
+        <div>
+          <div className="flex items-end justify-between mb-2">
+            <h2 className="text-xl font-bold">Disponibilités par créneau</h2>
+            <div className="flex items-center gap-2">
+              <label className="text-sm">Mois</label>
+              <select
+                value={monthFilter}
+                onChange={(e) => setMonthFilter(e.target.value)}
+                className="rounded border px-2 py-1"
+              >
+                {monthOptions.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+            </div>
           </div>
 
-          <div>
-            <h2 className="text-xl font-bold mb-2">Répartition des gardes (après vos modifications)</h2>
-            <table className="w-full text-sm border">
-              <thead>
-                <tr className="bg-gray-50">
-                  <th className="p-2 text-left text-gray-800 font-semibold">Médecin</th>
-                  <th className="p-2 text-left text-gray-800 font-semibold"># Gardes</th>
-                  <th className="p-2 text-left text-gray-800 font-semibold">Target</th>
-                  <th className="p-2 text-left text-gray-800 font-semibold"># Dispos</th>
-                  <th className="p-2 text-left text-gray-800 font-semibold">Écart</th>
-                </tr>
-              </thead>
-              <tbody>
-                {doctorRows.map((r, idx) => (
-                  <tr key={idx} className="border-t">
-                    <td className="p-2">{r.name}</td>
-                    <td className="p-2">{r.assigned}</td>
-                    <td className="p-2">{r.targetLabel}</td>
-                    <td className="p-2">{r.dispos}</td>
-                    <td className="p-2">{r.ecart}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          {/* Top scrollbar */}
+          <div className="overflow-x-auto">
+            <div className="overflow-x-auto rounded-lg border" style={{ direction: 'rtl' }}>
+              <div style={{ direction: 'ltr' }}>
+                <table className="min-w-max text-xs" style={{ backgroundColor: '#000', color: '#fff' }}>
+                  <thead>
+                    <tr>
+                      <th className="sticky left-0 z-10 px-2 py-2 text-left border-r" style={{ backgroundColor: '#000' }}>
+                        Créneau
+                      </th>
+                      {doctorOrderForGrid.map((uid) => (
+                        <th
+                          key={uid}
+                          className="px-1 py-2 text-center border-b border-l"
+                          style={{
+                            width: 28,
+                            minWidth: 28,
+                            maxWidth: 28,
+                            writingMode: 'vertical-rl',
+                            transform: 'rotate(180deg)',
+                            whiteSpace: 'nowrap',
+                          }}
+                          title={nameMap.get(uid) ?? uid}
+                        >
+                          {nameMap.get(uid) ?? uid}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredSlots.map((s) => {
+                      const label = `${formatDateLongFR(s.date)} — ${formatKindRange(s.kind)}`;
+                      return (
+                        <tr key={s.id}>
+                          <td className="sticky left-0 z-10 px-2 py-1 border-t border-r" style={{ backgroundColor: '#000' }}>
+                            {label}
+                          </td>
+                          {doctorOrderForGrid.map((uid) => {
+                            const ok = avail.get(s.id)?.has(uid) ?? false;
+                            return (
+                              <td
+                                key={uid}
+                                onClick={() => toggleAvailability(s.id, uid)}
+                                className="text-center align-middle border-t border-l cursor-pointer select-none hover:bg-white/10"
+                                style={{ width: 28, minWidth: 28, maxWidth: 28 }}
+                                title={ok ? 'Cliquer pour retirer la dispo' : 'Cliquer pour ajouter la dispo'}
+                              >
+                                {ok ? <span className="font-bold" style={{ color: '#22c55e' }}>✕</span> : <span> </span>}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
           </div>
+
+          <p className="text-xs text-zinc-400 mt-2">
+            Astuce : cliquez sur une case pour (dé)cocher la disponibilité du médecin pour ce créneau.
+          </p>
         </div>
-      )}
+      </div>
     </div>
   );
 }
