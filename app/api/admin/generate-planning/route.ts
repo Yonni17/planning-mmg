@@ -30,7 +30,7 @@ const ENDS_AT_MIDNIGHT: Record<string, boolean> = {
   WEEKDAY_20_00: true, SAT_18_00: true, SUN_20_24: true,
   SUN_08_14: false, SUN_14_20: false, SAT_12_18: false,
 };
-// Ajout: util mois (YYYY-MM)
+// util mois
 const monthOf = (ymd: string) => ymd.slice(0, 7);
 // ----------------------------------
 
@@ -274,8 +274,8 @@ export async function POST(req: NextRequest) {
 
     const fullNameOf = (uid: string) => users_index[uid]?.name ?? uid;
 
-    // === NOUVEAU : cap mensuel ===
-    // perMonthCap[u] = ∞ si target_level null/5, sinon 1..4
+    // === Cap mensuel uniquement ===
+    // perMonthCap[u] = ∞ si target_level null/5, sinon 1..4 (interprété comme quota PAR MOIS)
     const perMonthCap = new Map<string, number>();
     for (const u of allUsers) {
       const tl = users_index[u]?.target_level;
@@ -283,18 +283,18 @@ export async function POST(req: NextRequest) {
       else perMonthCap.set(u, Math.max(1, Math.min(4, tl)));
     }
 
-    // Rareté (poids tie-breaker inchangé)
+    // Rareté (tie-breaker inchangé)
     const availCountByUser = new Map<string, number>();
     for (const u of allUsers) availCountByUser.set(u, users_index[u]?.avail_count ?? 0);
 
     // Structures d’assignation & suivi
-    const assignedCount = new Map<string, number>(); // global (trimestre)
+    const assignedCount = new Map<string, number>(); // global (pour l'équité)
     for (const u of allUsers) assignedCount.set(u, 0);
 
-    // NOUVEAU : compte mensuel
+    // Compteurs mensuels
     const assignedCountByMonth = new Map<string, Map<string, number>>();
     const incAssigned = (u: string, date: string) => {
-      assignedCount.set(u, (assignedCount.get(u) ?? 0) + 1);
+      assignedCount.set(u, (assignedCount.get(u) ?? 0) + 1); // équité globale conservée
       const m = monthOf(date);
       if (!assignedCountByMonth.has(u)) assignedCountByMonth.set(u, new Map());
       const mm = assignedCountByMonth.get(u)!;
@@ -305,7 +305,7 @@ export async function POST(req: NextRequest) {
     const holes_list: { slot_id: string; date: string; kind: string; candidates: number }[] = [];
     const takenSlot = new Set<string>();
 
-    // anti-enchaînements (inchangé)
+    // anti-enchaînements
     const assignedUsersByDate = new Map<string, Set<string>>();
     const lastAssignedDate = new Map<string, string | null>();
     const lastNightDate = new Map<string, string | null>();
@@ -333,21 +333,12 @@ export async function POST(req: NextRequest) {
 
     const userHasSameDay = (u: string, date: string) => assignedUsersByDate.get(date)?.has(u) ?? false;
 
-    // === NOUVEAU : éligibilité inclut le cap mensuel ===
+    // === éligibilité : **uniquement** le cap mensuel + garde-fous ===
     function eligible(u: string, date: string) {
-      // cap global “Max” = ∞ (inchangé)
-      const globalCap = users_index[u]?.target_level == null || users_index[u]?.target_level === 5
-        ? Number.POSITIVE_INFINITY
-        : Math.max(1, Math.min(5, users_index[u]!.target_level!));
-      const gCnt = assignedCount.get(u) ?? 0;
-      if (isFinite(globalCap) && gCnt >= globalCap) return false;
-
-      // cap mensuel dur pour 1..4 ; ∞ pour 5/null
       const m = monthOf(date);
       const mCap = perMonthCap.get(u) ?? Number.POSITIVE_INFINITY;
       const mCnt = assignedCountByMonth.get(u)?.get(m) ?? 0;
-      if (isFinite(mCap) && mCnt >= mCap) return false;
-
+      if (isFinite(mCap) && mCnt >= mCap) return false; // plafond mensuel respecté
       return true;
     }
 
@@ -365,10 +356,10 @@ export async function POST(req: NextRequest) {
       const candSet = availBySlot.get(s.id) ?? new Set<string>();
       if (candSet.size === 1) {
         const only = Array.from(candSet)[0];
-        if (!eligible(only, s.date)) continue; // <-- tient compte du mois
+        if (!eligible(only, s.date)) continue;
         assignments.push({ slot_id: s.id, user_id: only, score: 1 });
         takenSlot.add(s.id);
-        incAssigned(only, s.date);            // <-- incrémente global + mois
+        incAssigned(only, s.date);
         markAssigned(only, s.date, s.kind);
       }
     }
@@ -387,7 +378,6 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
-      // filtrage par cap mensuel/global
       const notCapped = candAll.filter((u) => eligible(u, s.date));
       const pool0 = notCapped.length > 0 ? notCapped : candAll.slice();
 
@@ -427,7 +417,7 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
-      // Vérif finale cap mensuel (si on avait dû “retomber” sur un non-eligible)
+      // garde-fou (au cas où)
       if (!eligible(chosen, s.date)) {
         holes_list.push({ slot_id: s.id, date: s.date, kind: s.kind, candidates: candAll.length });
         continue;
@@ -435,7 +425,7 @@ export async function POST(req: NextRequest) {
 
       assignments.push({ slot_id: s.id, user_id: chosen, score: 1 });
       takenSlot.add(s.id);
-      incAssigned(chosen, s.date);     // <-- global + mensuel
+      incAssigned(chosen, s.date);
       markAssigned(chosen, s.date, s.kind);
     }
 
@@ -516,7 +506,7 @@ export async function POST(req: NextRequest) {
       availability_summary: { availability_by_slot, users_index },
     });
   } catch (e: any) {
-    console.error('[generate-planning hard-filters + monthly cap]', e);
+    console.error('[generate-planning monthly-only cap]', e);
     return NextResponse.json({ error: e?.message ?? 'Server error' }, { status: 500 });
   }
 }
