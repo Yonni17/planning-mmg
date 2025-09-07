@@ -17,7 +17,7 @@ type SlotKind =
   | 'SUN_14_20'
   | 'SUN_20_24';
 
-const KIND_TIME: Record<string, [string, string]> = {
+const KIND_TIME: Record<SlotKind, [string, string]> = {
   WEEKDAY_20_00: ['20:00', '00:00'],
   SAT_12_18: ['12:00', '18:00'],
   SAT_18_00: ['18:00', '00:00'],
@@ -36,16 +36,16 @@ function formatDateLongFR(ymd?: string | null) {
   const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
   return `${cap(day)} ${ddStr} ${month}`;
 }
-function formatKindRange(kind?: string | null) {
+
+function formatKindRange(kind?: SlotKind | null) {
   if (!kind) return '—';
   const t = KIND_TIME[kind];
-  if (!t) return kind!;
   const h = (s: string) => s.replace(':', 'h');
   return `${h(t[0])} - ${h(t[1])}`;
 }
 
 type Period = { id: string; label: string };
-type SlotRow = { id: string; kind: string; date: string; start_ts: string };
+type SlotRow = { id: string; kind: SlotKind; date: string; start_ts: string };
 
 type AssignmentRow = {
   slot_id: string;
@@ -53,7 +53,7 @@ type AssignmentRow = {
   display_name: string;
   score: number;
   date: string | null;
-  kind: string | null;
+  kind: SlotKind | null;
 };
 
 type Candidate = { user_id: string; name: string };
@@ -65,7 +65,7 @@ type ResultPayload = {
   total_score: number;
   assignments: AssignmentRow[];
   runs: { seed: number; total_score: number; holes: number }[];
-  holes_list: { slot_id: string; date: string; kind: string; candidates: number }[];
+  holes_list: { slot_id: string; date: string; kind: SlotKind; candidates: number }[];
   candidates_by_slot?: CandidatesBySlot;
 };
 
@@ -90,11 +90,11 @@ export default function PlanningPage() {
   useEffect(() => {
     (async () => {
       const { data } = await supabase.from('periods').select('id,label').order('label');
-      setPeriods((data as any) ?? []);
+      setPeriods((data as Period[]) ?? []);
     })();
   }, []);
 
-  // Charge données auxiliaires (slots, profiles, targets, availability) + **planning existant**
+  // Charge données auxiliaires + **planning existant**
   useEffect(() => {
     if (!periodId) return;
     (async () => {
@@ -103,17 +103,20 @@ export default function PlanningPage() {
       // Slots
       const { data: slotsData } = await supabase
         .from('slots')
-        .select('id, kind, date, start_ts')
+        .select('id, kind, date, start_ts, period_id')
         .eq('period_id', periodId)
         .order('start_ts', { ascending: true });
-      const s: SlotRow[] = (slotsData ?? []) as any;
+      const s = ((slotsData ?? []) as any[]).map((r) => ({
+        id: r.id as string,
+        kind: r.kind as SlotKind,
+        date: r.date as string,
+        start_ts: r.start_ts as string,
+      })) as SlotRow[];
       setSlots(s);
 
-      // Profiles (nom complet)
-      const { data: profData } = await supabase
-        .from('profiles')
-        .select('user_id, full_name');
-      setProfiles((profData as any) ?? []);
+      // Profiles
+      const { data: profData } = await supabase.from('profiles').select('user_id, full_name');
+      setProfiles((profData as any[]) ?? []);
 
       // Targets
       const { data: prefs } = await supabase
@@ -158,17 +161,15 @@ export default function PlanningPage() {
       const first = s[0]?.date;
       if (first) setMonthFilter(first.slice(0, 7));
 
-      // <<<<<< NOUVEAU : hydratation depuis la base >>>>>>
+      // Hydratation depuis la base
       await hydrateAssignmentsFromDB(periodId);
 
       setLoading(false);
     })();
   }, [periodId]);
 
-  // Récupère les assignations **déjà enregistrées** pour la période,
-  // et construit un “result-like payload” pour afficher directement toutes les sections.
+  // Récupère les assignations **déjà enregistrées** pour la période
   async function hydrateAssignmentsFromDB(pid: string) {
-    // assignments + slots + noms profils (left join)
     const { data, error } = await supabase
       .from('assignments')
       .select(`
@@ -188,40 +189,39 @@ export default function PlanningPage() {
       return;
     }
 
-    // Transforme en AssignmentRow[]
     const assignments: AssignmentRow[] = (data ?? []).map((r: any) => {
+      const constructed = [r.profiles?.first_name, r.profiles?.last_name].filter(Boolean).join(' ').trim();
       const full =
-        r.profiles?.full_name ||
-        [r.profiles?.first_name, r.profiles?.last_name].filter(Boolean).join(' ') ||
-        r.user_id;
+        (r.profiles?.full_name as string | undefined)?.trim() ||
+        (constructed || r.user_id);
+
       return {
-        slot_id: r.slot_id,
-        user_id: r.user_id,
+        slot_id: r.slot_id as string,
+        user_id: r.user_id as string,
         display_name: full,
         score: Number(r.score ?? 1),
-        date: r.slots?.date ?? null,
-        kind: r.slots?.kind ?? null,
+        date: (r.slots?.date as string | null) ?? null,
+        kind: (r.slots?.kind as SlotKind | null) ?? null,
       };
     });
 
     // trous
-    // (on peut recomparer les slots de la période vs ceux présents dans assignments)
-    const taken = new Set(assignments.map(a => a.slot_id));
+    const taken = new Set(assignments.map((a) => a.slot_id));
     const holes_list = slots
-      .filter(s => !taken.has(s.id))
-      .map(s => ({
+      .filter((s) => !taken.has(s.id))
+      .map((s) => ({
         slot_id: s.id,
         date: s.date,
         kind: s.kind,
-        candidates: (avail.get(s.id)?.size ?? 0),
+        candidates: avail.get(s.id)?.size ?? 0,
       }));
 
-    // Candidats par slot (noms complets) pour l’édition
+    // Candidats par slot
     const nameOf = (uid: string) => nameMapRef().get(uid) ?? uid;
     const candidates_by_slot: CandidatesBySlot = {};
     for (const s of slots) {
-      const set = avail.get(s.id) ?? new Set();
-      candidates_by_slot[s.id] = Array.from(set).map(uid => ({
+      const set = avail.get(s.id) ?? new Set<string>();
+      candidates_by_slot[s.id] = Array.from(set).map((uid) => ({
         user_id: uid,
         name: nameOf(uid),
       }));
@@ -234,7 +234,6 @@ export default function PlanningPage() {
       return String(a.kind ?? '').localeCompare(String(b.kind ?? ''));
     });
 
-    // Payload “result-like” pour réutiliser l’UI existante
     const payload: ResultPayload = {
       period_id: pid,
       holes: holes_list.length,
@@ -245,7 +244,7 @@ export default function PlanningPage() {
       candidates_by_slot,
     };
 
-    setEdited({}); // reset des modifications locales
+    setEdited({});
     setResult(payload);
   }
 
@@ -260,14 +259,16 @@ export default function PlanningPage() {
     return slots.filter((s) => s.date.startsWith(monthFilter));
   }, [slots, monthFilter]);
 
-  // Générer (appel l’API – reste utile si tu veux recalculer une proposition)
+  // Générer (appel l’API – reste utile pour recalculer une proposition)
   async function generate() {
     if (!periodId) return;
     setLoading(true);
     setResult(null);
     setEdited({});
     try {
-      const { data: { session } } = await supabase.auth.getSession();
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
       const token = session?.access_token;
 
       const res = await fetch('/api/admin/generate-planning', {
@@ -312,7 +313,9 @@ export default function PlanningPage() {
         user_id: edited[row.slot_id] ?? row.user_id,
         score: row.score,
       }));
-      const { data: { session } } = await supabase.auth.getSession();
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
       const token = session?.access_token;
 
       const res = await fetch('/api/admin/save-assignments', {
@@ -326,9 +329,7 @@ export default function PlanningPage() {
       const json = await res.json();
       if (!res.ok) throw new Error(json?.error ?? "Erreur d'enregistrement");
 
-      // Après enregistrement, **on recharge depuis la base** pour afficher d’office
       await hydrateAssignmentsFromDB(periodId);
-
       alert(`Assignations enregistrées (${json.inserted}) ✅`);
     } catch (e: any) {
       alert(e?.message ?? 'Impossible d’enregistrer');
@@ -340,7 +341,9 @@ export default function PlanningPage() {
   async function sendEmails() {
     if (!periodId) return;
     try {
-      const { data: { session } } = await supabase.auth.getSession();
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
       const token = session?.access_token;
       const res = await fetch('/api/admin/email-planning', {
         method: 'POST',
@@ -449,7 +452,9 @@ export default function PlanningPage() {
     });
 
     try {
-      const { data: { session } } = await supabase.auth.getSession();
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
       const token = session?.access_token;
       const res = await fetch('/api/admin/toggle-availability', {
         method: 'POST',
@@ -475,8 +480,6 @@ export default function PlanningPage() {
     }
   }
 
-  const getName = (uid: string) => nameMap.get(uid) ?? uid;
-
   return (
     <div className="mx-auto max-w-7xl p-4 space-y-6">
       <h1 className="text-2xl font-bold">Générer le planning</h1>
@@ -491,7 +494,9 @@ export default function PlanningPage() {
           >
             <option value="">Choisir une période…</option>
             {periods.map((p) => (
-              <option key={p.id} value={p.id}>{p.label}</option>
+              <option key={p.id} value={p.id}>
+                {p.label}
+              </option>
             ))}
           </select>
         </div>
@@ -540,8 +545,8 @@ export default function PlanningPage() {
                 </tr>
               </thead>
               <tbody>
-                {result.holes_list.map((h, i) => (
-                  <tr key={i} className="border-t">
+                {result.holes_list.map((h) => (
+                  <tr key={h.slot_id} className="border-t">
                     <td className="p-2 font-bold text-red-700">{formatDateLongFR(h.date)}</td>
                     <td className="p-2 font-bold text-red-700">{formatKindRange(h.kind)}</td>
                     <td className="p-2 font-bold text-red-700">{h.candidates}</td>
@@ -572,7 +577,7 @@ export default function PlanningPage() {
                   const cands = result.candidates_by_slot?.[a.slot_id] ?? [];
                   const userSel = edited[a.slot_id] ?? a.user_id;
                   return (
-                    <tr key={a.slot_id + i} className="border-t">
+                    <tr key={`${a.slot_id}-${i}`} className="border-t">
                       <td className="p-2">{formatDateLongFR(a.date)}</td>
                       <td className="p-2">{formatKindRange(a.kind)}</td>
                       <td className="p-2">
@@ -616,7 +621,7 @@ export default function PlanningPage() {
             </thead>
             <tbody>
               {doctorRows.map((r, idx) => (
-                <tr key={idx} className="border-t">
+                <tr key={`${r.user_id}-${idx}`} className="border-t">
                   <td className="p-2">{r.name}</td>
                   <td className="p-2">{r.assigned}</td>
                   <td className="p-2">{r.targetLabel}</td>
@@ -640,7 +645,9 @@ export default function PlanningPage() {
                 className="rounded border px-2 py-1"
               >
                 {monthOptions.map((m) => (
-                  <option key={m} value={m}>{m}</option>
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
                 ))}
               </select>
             </div>
@@ -653,7 +660,10 @@ export default function PlanningPage() {
                 <table className="min-w-max text-xs" style={{ backgroundColor: '#000', color: '#fff' }}>
                   <thead>
                     <tr>
-                      <th className="sticky left-0 z-10 px-2 py-2 text-left border-r" style={{ backgroundColor: '#000' }}>
+                      <th
+                        className="sticky left-0 z-10 px-2 py-2 text-left border-r"
+                        style={{ backgroundColor: '#000' }}
+                      >
                         Créneau
                       </th>
                       {doctorOrderForGrid.map((uid) => (
@@ -680,7 +690,10 @@ export default function PlanningPage() {
                       const label = `${formatDateLongFR(s.date)} — ${formatKindRange(s.kind)}`;
                       return (
                         <tr key={s.id}>
-                          <td className="sticky left-0 z-10 px-2 py-1 border-t border-r" style={{ backgroundColor: '#000' }}>
+                          <td
+                            className="sticky left-0 z-10 px-2 py-1 border-t border-r"
+                            style={{ backgroundColor: '#000' }}
+                          >
                             {label}
                           </td>
                           {doctorOrderForGrid.map((uid) => {
@@ -693,7 +706,13 @@ export default function PlanningPage() {
                                 style={{ width: 28, minWidth: 28, maxWidth: 28 }}
                                 title={ok ? 'Cliquer pour retirer la dispo' : 'Cliquer pour ajouter la dispo'}
                               >
-                                {ok ? <span className="font-bold" style={{ color: '#22c55e' }}>✕</span> : <span> </span>}
+                                {ok ? (
+                                  <span className="font-bold" style={{ color: '#22c55e' }}>
+                                    ✕
+                                  </span>
+                                ) : (
+                                  <span> </span>
+                                )}
                               </td>
                             );
                           })}
