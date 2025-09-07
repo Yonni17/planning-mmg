@@ -82,16 +82,15 @@ async function requireAdminOrResponse(req: NextRequest) {
 
 /**
  * Construit:
- * - slots de la période (ordonnés)
+ * - slots (ordonnés)
  * - disponibilités par slot + candidates_by_slot
- * - index utilisateurs (name, target_level, avail_count)
+ * - users_index (name, target_level, avail_count)
  *   * inclut aussi les users ayant des préférences de période même sans dispo
  */
 async function buildAvailabilitySummary(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   period_id: string
 ) {
-  // 1) Slots
   const { data: slotsData, error: slotsErr } = await supabase
     .from('slots')
     .select('id, kind, period_id, start_ts, date')
@@ -111,7 +110,7 @@ async function buildAvailabilitySummary(
 
   const slotIds = slots.map(s => s.id);
 
-  // 2) Availability (batch paginé)
+  // Availability (batch)
   async function fetchAvailabilityByBatches(ids: string[], idBatch = 200, pageSize = 1000) {
     const out: { user_id: string; slot_id: string; available: boolean }[] = [];
     for (let i = 0; i < ids.length; i += idBatch) {
@@ -136,7 +135,7 @@ async function buildAvailabilitySummary(
   }
   const avRows = await fetchAvailabilityByBatches(slotIds, 200, 1000);
 
-  // 3) Ids utilisateurs à considérer
+  // availBySlot + users set
   const availBySlot = new Map<string, Set<string>>();
   const usersFromAvailability = new Set<string>();
   for (const a of avRows) {
@@ -146,7 +145,7 @@ async function buildAvailabilitySummary(
     usersFromAvailability.add(a.user_id);
   }
 
-  // Inclure aussi ceux qui ont des préférences de période (même sans dispo)
+  // preferences_period -> targets
   const { data: prefUsers, error: prefUsersErr } = await supabase
     .from('preferences_period')
     .select('user_id, target_level')
@@ -156,7 +155,7 @@ async function buildAvailabilitySummary(
   const usersFromPrefs = new Set<string>((prefUsers ?? []).map((p: any) => p.user_id));
   const allUsers = new Set<string>([...Array.from(usersFromAvailability), ...Array.from(usersFromPrefs)]);
 
-  // 4) Profiles (pour les noms)
+  // profiles -> name
   const profIndex = new Map<string, { first_name: string | null; last_name: string | null }>();
   if (allUsers.size > 0) {
     const { data: profiles, error: profErr } = await supabase
@@ -178,11 +177,11 @@ async function buildAvailabilitySummary(
     return full || uid;
   };
 
-  // 5) Targets
+  // targets map
   const targetCap = new Map<string, number>();
   (prefUsers ?? []).forEach((p: any) => targetCap.set(p.user_id, p.target_level ?? 5));
 
-  // 6) avail count par user (0 par défaut)
+  // avail count per user
   const availCountByUser = new Map<string, number>();
   for (const u of allUsers) availCountByUser.set(u, 0);
   for (const s of slots) {
@@ -191,7 +190,7 @@ async function buildAvailabilitySummary(
     }
   }
 
-  // 7) availability_by_slot + candidates_by_slot (avec noms)
+  // per-slot candidates with names
   const availability_by_slot: Record<string, { date: string; kind: string; candidates: { user_id: string; name: string }[] }> = {};
   const candidates_by_slot: Record<string, { user_id: string; name: string }[]> = {};
   for (const s of slots) {
@@ -201,7 +200,6 @@ async function buildAvailabilitySummary(
     candidates_by_slot[s.id] = cand;
   }
 
-  // 8) users_index (pour *tous* les users considérés)
   const users_index: Record<string, { name: string; target_level: number | null; avail_count: number }> = {};
   for (const u of allUsers) {
     users_index[u] = {
@@ -244,7 +242,6 @@ export async function GET(req: NextRequest) {
 type PrefMonthRow = { user_id: string; month: string; target_total: number };
 
 function largestRemainderDistribution(total: number, weights: number[]) {
-  // Distribue "total" entiers proportionnellement à "weights" (>=0)
   const sum = weights.reduce((a, b) => a + b, 0);
   if (sum <= 0) return Array(weights.length).fill(0);
   const raw = weights.map(w => (total * (w / sum)));
@@ -276,7 +273,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'period_id requis' }, { status: 400 });
     }
 
-    // ---- Base: slots + summary (sert aussi pour l’UI même sans génération)
+    // Base: slots + summary
     const { slots, availability_by_slot, candidates_by_slot, users_index } =
       await buildAvailabilitySummary(supabase, period_id);
     if (!slots.length) return NextResponse.json({ error: 'Aucun slot pour cette période' }, { status: 400 });
@@ -299,11 +296,11 @@ export async function POST(req: NextRequest) {
       else targetCap.set(u, Math.max(1, Math.min(5, tl)));
     }
 
-    // Rareté globale (nb de dispos totales par user)
+    // Rareté globale par user
     const availCountByUser = new Map<string, number>();
     for (const u of allUsers) availCountByUser.set(u, users_index[u]?.avail_count ?? 0);
 
-    // ---------- Préparation "mois par mois" ----------
+    // Préparation “mois par mois”
     const months = Array.from(new Set(slots.map(s => monthOf(s.date)))).sort();
 
     // Dispos par user & mois
@@ -320,7 +317,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // preferences_month (si existant)
+    // preferences_month
     const { data: pmRows } = await supabase
       .from('preferences_month')
       .select('user_id, month, target_total')
@@ -331,39 +328,29 @@ export async function POST(req: NextRequest) {
       pmByUser.get(r.user_id)!.set(r.month, Math.max(0, Number(r.target_total || 0)));
     }
 
-    // Quotas mensuels (durs si target finie; "soft 1/mois" pour max)
-    // -> Map user -> Map month -> quota
+    // Quotas mensuels (durs si target finie; “soft 1/mois” pour Max)
     const quotaByUserMonth = new Map<string, Map<string, number>>();
     for (const u of allUsers) {
       const cap = targetCap.get(u)!; // ∞ ou 1..5
       const prefU = pmByUser.get(u);
       const dispU = disposByUserMonth.get(u) ?? new Map();
       const out = new Map<string, number>();
+
       if (prefU && Array.from(prefU.values()).some(v => (v ?? 0) > 0)) {
-        // Utilise les prefs mensuelles déclarées
-        let sum = 0;
-        for (const m of months) {
-          const v = prefU.get(m) ?? 0;
-          out.set(m, v);
-          sum += v;
-        }
-        // Si cap est fini et sum > cap, on ne coupe pas ici (cap sera respecté via need_total).
-        // Si sum < cap, le surplus restera sur d'autres mois via passes suivantes.
+        for (const m of months) out.set(m, prefU.get(m) ?? 0);
       } else {
-        // Dérive depuis cap & disponibilités
         if (Number.isFinite(cap)) {
           const weights = months.map(m => (dispU.get(m) ?? 0));
           const dist = largestRemainderDistribution(cap, weights);
           months.forEach((m, i) => out.set(m, dist[i] ?? 0));
         } else {
-          // Max → soft quota: 1 par mois avec dispo
-          months.forEach(m => out.set(m, (dispU.get(m) ?? 0) > 0 ? 1 : 0));
+          months.forEach(m => out.set(m, (dispU.get(m) ?? 0) > 0 ? 1 : 0)); // soft
         }
       }
       quotaByUserMonth.set(u, out);
     }
 
-    // ---------- Structures d’assignation & suivi (cross-mois) ----------
+    // Structures d’assignation cross-mois
     const assignments: { slot_id: string; user_id: string; score: number }[] = [];
     const holes_list: { slot_id: string; date: string; kind: string; candidates: number }[] = [];
     const takenSlot = new Set<string>();
@@ -371,7 +358,7 @@ export async function POST(req: NextRequest) {
     const assignedCount = new Map<string, number>();
     for (const u of allUsers) assignedCount.set(u, 0);
 
-    const assignedCountByMonth = new Map<string, Map<string, number>>(); // u -> m -> n
+    const assignedCountByMonth = new Map<string, Map<string, number>>();
     const incAssigned = (u: string, m: string) => {
       assignedCount.set(u, (assignedCount.get(u) ?? 0) + 1);
       if (!assignedCountByMonth.has(u)) assignedCountByMonth.set(u, new Map());
@@ -379,7 +366,7 @@ export async function POST(req: NextRequest) {
       mm.set(m, (mm.get(m) ?? 0) + 1);
     };
 
-    // anti-enchaînements (cross-mois)
+    // Anti-enchaînements (cross-mois)
     const assignedUsersByDate = new Map<string, Set<string>>();
     const lastAssignedDate = new Map<string, string | null>();
     const lastNightDate = new Map<string, string | null>();
@@ -407,14 +394,16 @@ export async function POST(req: NextRequest) {
 
     const userHasSameDay = (u: string, date: string) => assignedUsersByDate.get(date)?.has(u) ?? false;
 
-    // Besoins restants globaux (cap total)
+    // Besoins restants globaux (cap total dur pour finis)
     const remainingTotalNeed = new Map<string, number>();
     for (const u of allUsers) {
       const cap = targetCap.get(u)!;
       remainingTotalNeed.set(u, Number.isFinite(cap) ? cap : Number.POSITIVE_INFINITY);
     }
 
-    // Helper tri stable (rareté globale puis nom)
+    const isFiniteTarget = (u: string) => Number.isFinite(targetCap.get(u)!);
+
+    // Tri stable
     const stableCompareUsers = (u1: string, u2: string) => {
       const c1 = availCountByUser.get(u1) ?? 0;
       const c2 = availCountByUser.get(u2) ?? 0;
@@ -424,9 +413,9 @@ export async function POST(req: NextRequest) {
       return u1.localeCompare(u2);
     };
 
-    // ---------- Fonction d'assignation pour 1 mois ----------
+    // ---------- Assignation pour 1 mois ----------
     const assignForMonth = (month: string) => {
-      // besoins restants mensuels
+      // besoins mensuels restants
       const remainingMonthNeed = new Map<string, number>();
       for (const u of allUsers) {
         const q = quotaByUserMonth.get(u)?.get(month) ?? 0;
@@ -434,7 +423,7 @@ export async function POST(req: NextRequest) {
         remainingMonthNeed.set(u, Math.max(0, q - already));
       }
 
-      // criticité future : nb de slots (mois > month) à 1 seul candidat = u
+      // criticité future (mois suivants)
       const mIndex = months.indexOf(month);
       const futureMonths = months.slice(mIndex + 1);
       const criticalFuture = new Map<string, number>();
@@ -454,30 +443,29 @@ export async function POST(req: NextRequest) {
 
       const monthSlots = slots.filter((s) => !takenSlot.has(s.id) && monthOf(s.date) === month);
 
-      // 1) Slots à 1 seul candidat (du mois)
+      // 1) Slots à 1 seul candidat
       for (const s of monthSlots) {
         if (takenSlot.has(s.id)) continue;
         const set = availBySlot.get(s.id) ?? new Set<string>();
         if (set.size === 1) {
           const only = Array.from(set)[0];
           const totNeed = remainingTotalNeed.get(only) ?? 0;
-          const monNeed = remainingMonthNeed.get(only) ?? 0;
-          const eligibleTotal = totNeed > 0 || !Number.isFinite(targetCap.get(only)!);
-          // On force si unique, même si monNeed == 0, tant qu'on n'explose pas totNeed (sauf Max)
+          const eligibleTotal = totNeed > 0 || !isFiniteTarget(only);
           if (eligibleTotal) {
             assignments.push({ slot_id: s.id, user_id: only, score: 1 });
             takenSlot.add(s.id);
             incAssigned(only, month);
-            if (Number.isFinite(targetCap.get(only)!)) {
-              remainingTotalNeed.set(only, Math.max(0, (remainingTotalNeed.get(only) ?? 0) - 1));
-              if (monNeed > 0) remainingMonthNeed.set(only, monNeed - 1);
+            if (isFiniteTarget(only)) {
+              remainingTotalNeed.set(only, Math.max(0, totNeed - 1));
+              const mon = remainingMonthNeed.get(only) ?? 0;
+              if (mon > 0) remainingMonthNeed.set(only, mon - 1);
             }
             markAssigned(only, s.date, s.kind);
           }
         }
       }
 
-      // 2) Reste des slots (du mois) rare -> commun
+      // 2) Reste des slots rare -> commun
       const remaining = monthSlots
         .filter((s) => !takenSlot.has(s.id))
         .map((s) => ({ s, c: (availBySlot.get(s.id)?.size ?? 0) }))
@@ -491,20 +479,29 @@ export async function POST(req: NextRequest) {
           continue;
         }
 
-        const eligibleStrict = candAll.filter(u => {
-          const tot = remainingTotalNeed.get(u) ?? 0;
-          const mon = remainingMonthNeed.get(u) ?? 0;
-          return (tot > 0 || !Number.isFinite(targetCap.get(u)!)) && mon > 0;
-        });
-        const eligibleTotalOnly = candAll.filter(u => {
-          const tot = remainingTotalNeed.get(u) ?? 0;
-          return (tot > 0 || !Number.isFinite(targetCap.get(u)!));
-        });
+        // --- PRIORITÉS DE POOL ---
+        // P1: finis avec besoin mensuel > 0 et besoin total > 0
+        const P1 = candAll.filter(u => isFiniteTarget(u)
+          && (remainingTotalNeed.get(u) ?? 0) > 0
+          && (remainingMonthNeed.get(u) ?? 0) > 0);
 
-        // pool0 : strict quotas mensuels → sinon quotas totaux → sinon tout le monde
-        const pool0 = (eligibleStrict.length > 0)
-          ? eligibleStrict
-          : (eligibleTotalOnly.length > 0 ? eligibleTotalOnly : candAll.slice());
+        // P2: finis avec besoin total > 0 (on autorise dépassement mensuel si pas de P1)
+        const P2 = candAll.filter(u => isFiniteTarget(u)
+          && (remainingTotalNeed.get(u) ?? 0) > 0
+          && (remainingMonthNeed.get(u) ?? 0) === 0);
+
+        // P3: Max avec “soft” besoin mensuel > 0
+        const P3 = candAll.filter(u => !isFiniteTarget(u)
+          && (remainingMonthNeed.get(u) ?? 0) > 0);
+
+        // P4: le reste (Max sans soft besoin ou tout autre)
+        const P4 = candAll.filter(u => !P1.includes(u) && !P2.includes(u) && !P3.includes(u));
+
+        let pool0: string[] =
+          (P1.length > 0) ? P1 :
+          (P2.length > 0) ? P2 :
+          (P3.length > 0) ? P3 :
+          P4;
 
         // A. interdire 2 créneaux le même jour si alternative
         const poolNoSameDay = pool0.filter((u) => !userHasSameDay(u, s.date));
@@ -525,12 +522,12 @@ export async function POST(req: NextRequest) {
         });
         const poolB = poolAvoidHeavy.length > 0 ? poolAvoidHeavy : poolA;
 
-        // C. réserve criticité future : si totNeed-1 < criticalFuture[u], on évite (s’il existe alternative)
+        // C. réserve criticité future: si fini et totNeed-1 < criticalFuture[u], on évite (si alternative)
         const poolKeepFuture = poolB.filter((u) => {
           const cf = criticalFuture.get(u) ?? 0;
           if (cf <= 0) return true;
+          if (!isFiniteTarget(u)) return true; // Max: ne bloque pas
           const tot = remainingTotalNeed.get(u) ?? 0;
-          if (!Number.isFinite(targetCap.get(u)!)) return true; // Max: on ne bloque pas
           return (tot - 1) >= cf;
         });
         const poolC = poolKeepFuture.length > 0 ? poolKeepFuture : poolB;
@@ -552,11 +549,12 @@ export async function POST(req: NextRequest) {
           continue;
         }
 
+        // Assignation & décréments
         assignments.push({ slot_id: s.id, user_id: chosen, score: 1 });
         takenSlot.add(s.id);
         incAssigned(chosen, month);
 
-        if (Number.isFinite(targetCap.get(chosen)!)) {
+        if (isFiniteTarget(chosen)) {
           const tot = remainingTotalNeed.get(chosen) ?? 0;
           if (tot > 0) remainingTotalNeed.set(chosen, tot - 1);
           const mon = remainingMonthNeed.get(chosen) ?? 0;
@@ -567,7 +565,7 @@ export async function POST(req: NextRequest) {
       }
     };
 
-    // --------- 3 passes : mois 1 -> mois 2 -> mois 3 ---------
+    // 3 passes : M1 -> M2 -> M3
     for (const m of months) {
       assignForMonth(m);
     }
@@ -587,7 +585,7 @@ export async function POST(req: NextRequest) {
         return String(a.kind ?? '').localeCompare(String(b.kind ?? ''));
       });
 
-    // candidats by slot (avec noms) si demandé
+    // candidats by slot si demandé
     let out_candidates_by_slot: Record<string, { user_id: string; name: string }[]> | undefined;
     if (include_candidates) {
       out_candidates_by_slot = {};
