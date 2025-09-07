@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { supabase } from '@/lib/supabase';
 import { useRouter } from 'next/navigation';
 
@@ -59,9 +59,8 @@ export default function CalendrierPage() {
   const [deadline, setDeadline] = useState<Date | null>(null);
   const [nowTick, setNowTick] = useState<number>(Date.now()); // tick chaque minute
 
-  // autosave silencieux (debounce)
-  const debounceRef = useRef<number | null>(null);
-  const pendingIdsRef = useRef<Set<string>>(new Set());
+  // Sauvegarde immédiate : suivi des slots en cours d’écriture
+  const [savingIds, setSavingIds] = useState<Set<string>>(new Set());
 
   // --------- INIT ---------
   useEffect(() => {
@@ -155,7 +154,7 @@ export default function CalendrierPage() {
     for (const row of avData || []) map[(row as any).slot_id as string] = !!(row as any).available;
     setAvailability(map);
 
-    pendingIdsRef.current = new Set();
+    setSavingIds(new Set());
   };
 
   const loadMonthStatus = async (pid: string, uid: string) => {
@@ -209,50 +208,40 @@ export default function CalendrierPage() {
 
   const currentMonthKey = useMemo(() => viewMonth ? yyyymm(viewMonth) : '', [viewMonth]);
 
-  // --------- AUTOSAVE (debounce) ---------
-  const flushSave = async () => {
-    if (!userId) return;
-    const ids = Array.from(pendingIdsRef.current);
-    if (ids.length === 0) return;
+  // --------- ACTIONS (sauvegarde immédiate) ---------
+  const toggleLocal = async (slotId: string, locked: boolean) => {
+    if (locked || !userId) return;
+    if (savingIds.has(slotId)) return; // évite double-clic pendant save
 
-    const payload = ids.map(slot_id => ({
-      user_id: userId,
-      slot_id,
-      available: !!availability[slot_id],
-    }));
+    const next = !availability[slotId];
+
+    // Optimiste: on reflète tout de suite
+    setAvailability(prev => ({ ...prev, [slotId]: next }));
+    setSavingIds(prev => new Set(prev).add(slotId));
 
     try {
-      const { error } = await supabase.from('availability').upsert(payload);
+      const { error } = await supabase.from('availability').upsert([{
+        user_id: userId,
+        slot_id: slotId,
+        available: next,
+      }]);
       if (error) throw error;
-      pendingIdsRef.current = new Set();
-    } catch {
-      setAvailability(prev => {
-        const copy = { ...prev };
-        for (const slot_id of ids) {
-          copy[slot_id] = !copy[slot_id];
-        }
+    } catch (e) {
+      // rollback si échec
+      setAvailability(prev => ({ ...prev, [slotId]: !next }));
+      // console.error('save dispo failed', e);
+    } finally {
+      setSavingIds(prev => {
+        const copy = new Set(prev);
+        copy.delete(slotId);
         return copy;
       });
-      pendingIdsRef.current = new Set();
     }
-  };
-
-  const scheduleSave = () => {
-    if (debounceRef.current) window.clearTimeout(debounceRef.current);
-    debounceRef.current = window.setTimeout(flushSave, 500);
-  };
-
-  // --------- ACTIONS ---------
-  const toggleLocal = (slotId: string, locked: boolean) => {
-    if (locked) return; // si verrouillé : on bloque le toggle
-    setAvailability(prev => ({ ...prev, [slotId]: !prev[slotId] }));
-    pendingIdsRef.current.add(slotId);
-    scheduleSave();
   };
 
   const validateMonth = async (mKey: string) => {
     if (!userId || !periodId) return;
-    await supabase
+    const { error } = await supabase
       .from('doctor_period_months')
       .upsert({
         user_id: userId,
@@ -262,14 +251,14 @@ export default function CalendrierPage() {
         validated_at: new Date().toISOString(),
         opted_out: false,
       }, { onConflict: 'user_id,period_id,month' });
-    await loadMonthStatus(periodId, userId);
+    if (!error) await loadMonthStatus(periodId, userId);
   };
 
   const unlockMonth = async (mKey: string) => {
     if (!userId || !periodId) return;
     const ok = confirm('Déverrouiller ce mois pour modifier vos disponibilités ?');
     if (!ok) return;
-    await supabase
+    const { error } = await supabase
       .from('doctor_period_months')
       .upsert({
         user_id: userId,
@@ -278,7 +267,7 @@ export default function CalendrierPage() {
         locked: false,
         validated_at: null,
       }, { onConflict: 'user_id,period_id,month' });
-    await loadMonthStatus(periodId, userId);
+    if (!error) await loadMonthStatus(periodId, userId);
   };
 
   // --------- COUNTDOWN helpers ---------
@@ -495,6 +484,8 @@ export default function CalendrierPage() {
                   </div>
                 ) : daySlots.map((s) => {
                   const on = !!availability[s.id];
+                  const isSaving = savingIds.has(s.id);
+
                   const onCls =
                     'bg-emerald-600 text-white hover:bg-emerald-500 ' +
                     'dark:bg-emerald-600 dark:hover:bg-emerald-500';
@@ -506,12 +497,13 @@ export default function CalendrierPage() {
                     <button
                       key={s.id}
                       type="button"
-                      disabled={locked}
+                      disabled={locked || isSaving}
                       onClick={() => toggleLocal(s.id, locked)}
                       className={`flex-1 text-[11px] px-2 border-t first:border-t-0
                                   border-zinc-200 dark:border-zinc-700
                                   flex items-center justify-center
-                                  ${on ? onCls : offCls}`}
+                                  ${on ? onCls : offCls}
+                                  ${isSaving ? 'opacity-60 cursor-wait' : ''}`}
                       title={KIND_LABEL[s.kind]}
                     >
                       {KIND_LABEL[s.kind]}
@@ -524,7 +516,7 @@ export default function CalendrierPage() {
         })}
       </div>
 
-      {/* Pas de bouton “Enregistrer” : autosave silencieux */}
+      {/* Pas de bouton “Enregistrer” : chaque clic sauvegarde immédiatement */}
     </div>
   );
 }
