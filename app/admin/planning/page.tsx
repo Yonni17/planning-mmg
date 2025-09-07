@@ -277,6 +277,7 @@ export default function PlanningPage() {
     setResult(payload);
   }
 
+  // Name map (affichage & listes de candidats)
   const nameMap = useMemo(() => {
     const m = new Map<string, string>();
     for (const p of profiles) m.set(p.user_id, p.full_name ?? p.user_id);
@@ -303,7 +304,7 @@ export default function PlanningPage() {
     return slots.filter((s) => s.date.startsWith(monthFilter));
   }, [slots, monthFilter]);
 
-  // Générer (appel l’API – recalcul d'une proposition, ne touche pas la DB)
+  // Générer (recalcule une proposition, ne touche pas la DB)
   async function generate() {
     if (!periodId) return;
     setLoading(true);
@@ -651,10 +652,6 @@ export default function PlanningPage() {
               </tr>
             </thead>
             <tbody>
-              {Array.from(
-                new Map(result?.assignments?.map(a => [a.user_id, true]) ?? []).keys()
-              )}
-              {/* rows */}
               {doctorRows.map((r, idx) => (
                 <tr key={`${r.user_id}-${idx}`} className="border-t">
                   <td className="p-2">{r.name}</td>
