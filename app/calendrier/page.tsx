@@ -13,7 +13,7 @@ type Slot = {
   kind: 'WEEKDAY_20_00'|'SAT_12_18'|'SAT_18_00'|'SUN_08_14'|'SUN_14_20'|'SUN_20_24';
 };
 
-type Period = { id: string; label: string; draw_at?: string | null };
+type Period = { id: string; label: string; draw_at?: string | null; open_at?: string | null };
 
 const pad = (n: number) => String(n).padStart(2, '0');
 const yyyymm = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
@@ -33,6 +33,7 @@ export default function CalendrierPage() {
   const router = useRouter();
 
   const [userId, setUserId] = useState<string | null>(null);
+
   const [periods, setPeriods] = useState<Period[]>([]);
   const [periodId, setPeriodId] = useState<string>('');
   const [drawAt, setDrawAt] = useState<Date | null>(null);
@@ -42,13 +43,15 @@ export default function CalendrierPage() {
   const [availability, setAvailability] = useState<Record<string, boolean>>({});
   const [viewMonth, setViewMonth] = useState<Date | null>(null);
   const [optedOut, setOptedOut] = useState<boolean>(false);
-  const [loading, setLoading] = useState(true);
 
-  // autosave silencieux (debounce)
+  const [loading, setLoading] = useState(true);
+  const [noSlotsAnywhere, setNoSlotsAnywhere] = useState(false);
+
+  // autosave silencieux
   const debounceRef = useRef<number | null>(null);
   const pendingIdsRef = useRef<Set<string>>(new Set());
 
-  // --------- INIT ---------
+  // ---------- INIT ----------
   useEffect(() => {
     (async () => {
       setLoading(true);
@@ -77,31 +80,61 @@ export default function CalendrierPage() {
         return;
       }
 
-      // Périodes (on lit aussi draw_at)
-      const { data: periodsData } = await supabase
+      // Périodes (avec draw_at)
+      const { data: periodsData, error: pErr } = await supabase
         .from('periods')
-        .select('id,label,draw_at')
+        .select('id,label,draw_at,open_at')
         .order('open_at', { ascending: false });
+
+      if (pErr) { setLoading(false); return; }
 
       const list = (periodsData || []) as Period[];
       setPeriods(list);
 
-      const defId = list[0]?.id || '';
-      setPeriodId(defId);
-      setDrawAt(list[0]?.draw_at ? new Date(list[0]!.draw_at!) : null);
-
-      if (defId) {
-        await Promise.all([
-          loadSlotsAndAvail(defId, user.id),
-          loadOptOut(defId, user.id),
-        ]);
+      // Choisir la période la plus récente qui a des slots
+      const chosen = await pickLatestPeriodWithSlots(list);
+      if (!chosen) {
+        setNoSlotsAnywhere(true);
+        setSlots([]);
+        setLoading(false);
+        return;
       }
 
+      await switchPeriod(chosen.id, user.id, list);
       setLoading(false);
     })();
   }, [router]);
 
-  // --------- Compte à rebours ---------
+  // ---------- Choix de la période avec slots ----------
+  const countSlotsForPeriod = async (pid: string) => {
+    const { count } = await supabase
+      .from('slots')
+      .select('id', { count: 'exact', head: true })
+      .eq('period_id', pid);
+    return count ?? 0;
+  };
+
+  const pickLatestPeriodWithSlots = async (orderedPeriods: Period[]) => {
+    for (const p of orderedPeriods) {
+      const c = await countSlotsForPeriod(p.id);
+      if (c > 0) return p;
+    }
+    return null;
+  };
+
+  // Change de période proprement (used au init et au change select)
+  const switchPeriod = async (pid: string, uid: string, knownPeriods?: Period[]) => {
+    setPeriodId(pid);
+    const p = (knownPeriods ?? periods).find(pp => pp.id === pid);
+    setDrawAt(p?.draw_at ? new Date(p.draw_at) : null);
+
+    await Promise.all([
+      loadSlotsAndAvail(pid, uid),
+      loadOptOut(pid, uid),
+    ]);
+  };
+
+  // ---------- Compte à rebours ----------
   useEffect(() => {
     if (!drawAt) { setCountdown(''); return; }
     const tick = () => {
@@ -119,7 +152,7 @@ export default function CalendrierPage() {
     return () => window.clearInterval(id);
   }, [drawAt]);
 
-  // --------- LOADERS ---------
+  // ---------- LOADERS ----------
   const loadSlotsAndAvail = async (pid: string, uid: string) => {
     const { data: slotsData } = await supabase
       .from('slots')
@@ -130,7 +163,11 @@ export default function CalendrierPage() {
     const sList = (slotsData || []) as Slot[];
     setSlots(sList);
 
-    if (!viewMonth && sList.length > 0) {
+    if (!sList.length) {
+      // si cette période n’a pas de slots → message plus bas
+      setViewMonth(null);
+      setNoSlotsAnywhere(false); // on ne sait pas si d’autres en ont, le select permettra de changer
+    } else if (!viewMonth) {
       const d0 = new Date(sList[0].date + 'T00:00:00');
       setViewMonth(new Date(d0.getFullYear(), d0.getMonth(), 1));
     }
@@ -157,7 +194,7 @@ export default function CalendrierPage() {
     setOptedOut(!!data?.opted_out);
   };
 
-  // --------- DERIVED ---------
+  // ---------- DERIVED ----------
   const monthsInPeriod = useMemo(() => {
     const set = new Set<string>();
     for (const s of slots) set.add(yyyymm(new Date(s.date + 'T00:00:00')));
@@ -195,7 +232,7 @@ export default function CalendrierPage() {
     return new Date() >= drawAt;
   }, [drawAt, optedOut]);
 
-  // --------- AUTOSAVE (debounce) ---------
+  // ---------- AUTOSAVE ----------
   const flushSave = async () => {
     if (!userId) return;
     const ids = Array.from(pendingIdsRef.current);
@@ -227,12 +264,18 @@ export default function CalendrierPage() {
     debounceRef.current = window.setTimeout(flushSave, 500);
   };
 
-  // --------- ACTIONS ---------
+  // ---------- ACTIONS ----------
   const toggleLocal = (slotId: string) => {
     if (isReadOnly) return;
     setAvailability(prev => ({ ...prev, [slotId]: !prev[slotId] }));
     pendingIdsRef.current.add(slotId);
     scheduleSave();
+  };
+
+  const onChangePeriod = async (v: string) => {
+    setNoSlotsAnywhere(false);
+    if (!userId) return;
+    await switchPeriod(v, userId);
   };
 
   const toggleOptOut = async () => {
@@ -254,7 +297,7 @@ export default function CalendrierPage() {
     setOptedOut(wantOptOut);
   };
 
-  // --------- RENDER ---------
+  // ---------- RENDER ----------
   if (loading) return <p>Chargement…</p>;
 
   const currentMonthKey = viewMonth ? yyyymm(viewMonth) : '';
@@ -268,25 +311,13 @@ export default function CalendrierPage() {
         <select
           className="border rounded p-2 bg-zinc-900 text-zinc-100 border-zinc-700"
           value={periodId}
-          onChange={async (e) => {
-            const v = e.target.value;
-            setPeriodId(v);
-            const p = periods.find(pp => pp.id === v);
-            setDrawAt(p?.draw_at ? new Date(p.draw_at) : null);
-            if (userId) {
-              await Promise.all([
-                loadSlotsAndAvail(v, userId),
-                loadOptOut(v, userId),
-              ]);
-            }
-          }}
+          onChange={(e) => onChangePeriod(e.target.value)}
         >
           {periods.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
         </select>
 
         {monthsInPeriod.map(m => {
           const isActive = currentMonthKey === m.key;
-
           const activeCls = 'bg-white text-black border border-zinc-300';
           const base = isActive
             ? activeCls
@@ -337,12 +368,20 @@ export default function CalendrierPage() {
             Vous avez indiqué ne pas souhaiter prendre de garde ce trimestre. La grille est désactivée.
           </div>
         )}
-        {isReadOnly && !optedOut && (
+        {(!optedOut && drawAt && new Date() >= drawAt) && (
           <div className="mt-2 text-red-300">
             Le tirage a eu lieu. Le planning est désormais en lecture seule.
           </div>
         )}
       </div>
+
+      {/* Alerte si pas de slots */}
+      {noSlotsAnywhere && (
+        <div className="p-3 rounded border border-amber-600 bg-amber-900/30 text-amber-100">
+          Aucune période ne contient de créneaux (slots) pour l’instant. 
+          Ajoutez des créneaux dans la période courante pour afficher le planning.
+        </div>
+      )}
 
       {/* Grille mensuelle : clic direct = toggle */}
       <div className="grid grid-cols-7 gap-2">
@@ -350,7 +389,7 @@ export default function CalendrierPage() {
           <div key={w} className="text-center text-xs uppercase tracking-wide text-gray-500">{w}</div>
         ))}
 
-        {daysOfMonth.map((d, i) => {
+        {viewMonth && daysOfMonth.map((d, i) => {
           if (!d) return <div key={i} className="h-32 rounded-xl border border-dashed border-gray-200 bg-gray-50" />;
 
           const key = ymdLocal(d);
@@ -396,8 +435,6 @@ export default function CalendrierPage() {
           );
         })}
       </div>
-
-      {/* Pas de bouton “Enregistrer” : tout est auto-sauvé */}
     </div>
   );
 }
