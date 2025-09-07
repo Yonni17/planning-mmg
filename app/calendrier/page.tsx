@@ -13,20 +13,7 @@ type Slot = {
   kind: 'WEEKDAY_20_00'|'SAT_12_18'|'SAT_18_00'|'SUN_08_14'|'SUN_14_20'|'SUN_20_24';
 };
 
-type Period = { id: string; label: string };
-
-type MonthStatus = {
-  validated_at: string | null;
-  locked: boolean;
-  opted_out: boolean | null;
-};
-
-type Profile = {
-  user_id: string;
-  first_name: string | null;
-  last_name: string | null;
-  role: string | null;
-};
+type Period = { id: string; label: string; draw_at: string | null };
 
 const pad = (n: number) => String(n).padStart(2, '0');
 const yyyymm = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
@@ -48,71 +35,83 @@ export default function CalendrierPage() {
   const [userId, setUserId] = useState<string | null>(null);
   const [periods, setPeriods] = useState<Period[]>([]);
   const [periodId, setPeriodId] = useState<string>('');
+  const [drawAt, setDrawAt] = useState<Date | null>(null); // date de tirage
+  const [countdown, setCountdown] = useState<string>('');
   const [slots, setSlots] = useState<Slot[]>([]);
   const [availability, setAvailability] = useState<Record<string, boolean>>({});
-  const [monthStatus, setMonthStatus] = useState<Record<string, MonthStatus>>({});
   const [viewMonth, setViewMonth] = useState<Date | null>(null);
+  const [optedOut, setOptedOut] = useState<boolean>(false);
   const [loading, setLoading] = useState(true);
 
-  // autosave silencieux (debounce)
+  // autosave silencieux
   const debounceRef = useRef<number | null>(null);
-  const pendingIdsRef = useRef<Set<string>>(new Set()); // set des slot_id modifiés depuis la dernière save
+  const pendingIdsRef = useRef<Set<string>>(new Set());
 
   // --------- INIT ---------
   useEffect(() => {
     (async () => {
       setLoading(true);
 
-      // 1) Auth
+      // auth
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) { router.replace('/login'); return; }
       setUserId(user.id);
 
-      // 2) S’assurer qu’un profil existe (FK éventuel)
+      // profil minimal (pour FK éventuels)
       const { data: prof } = await supabase
         .from('profiles')
-        .select('user_id, first_name, last_name, role')
+        .select('user_id, first_name, last_name')
         .eq('user_id', user.id)
         .maybeSingle();
 
       if (!prof) {
-        // crée un profil minimal silencieusement (aucun message UI)
-        await supabase.from('profiles').insert({
-          user_id: user.id,
-          first_name: null,
-          last_name: null,
-          role: 'doctor',
-        } as any);
-      } else {
-        // si prénom/nom manquants → on force la complétion d’identité
-        if (!prof.first_name || !prof.last_name) {
-          router.replace('/preferences?missing=1');
-          return;
-        }
+        await supabase.from('profiles').insert({ user_id: user.id, role: 'doctor' } as any);
+      } else if (!prof.first_name || !prof.last_name) {
+        router.replace('/preferences?missing=1');
+        return;
       }
 
-      // 3) Périodes
-      const { data: periodsData, error: perr } = await supabase
+      // périodes (on lit draw_at)
+      const { data: periodsData } = await supabase
         .from('periods')
-        .select('id,label')
+        .select('id,label,draw_at')
         .order('open_at', { ascending: false });
-      if (perr) { setLoading(false); return; }
 
-      const list = periodsData || [];
+      const list = (periodsData ?? []) as Period[];
       setPeriods(list);
 
       const defId = list[0]?.id || '';
       setPeriodId(defId);
+      setDrawAt(list[0]?.draw_at ? new Date(list[0].draw_at) : null);
 
       if (defId) {
         await Promise.all([
           loadSlotsAndAvail(defId, user.id),
-          loadMonthStatus(defId, user.id),
+          loadFlags(defId, user.id),
         ]);
       }
+
       setLoading(false);
     })();
   }, [router]);
+
+  // --------- Compte à rebours ---------
+  useEffect(() => {
+    if (!drawAt) { setCountdown(''); return; }
+    const tick = () => {
+      const now = new Date();
+      const diff = drawAt.getTime() - now.getTime();
+      if (diff <= 0) { setCountdown('Clôturé — le planning n’est plus modifiable.'); return; }
+      const d = Math.floor(diff / (24*3600*1000));
+      const h = Math.floor((diff % (24*3600*1000)) / (3600*1000));
+      const m = Math.floor((diff % (3600*1000)) / (60*1000));
+      const s = Math.floor((diff % (60*1000)) / 1000);
+      setCountdown(`J-${d} ${pad(h)}:${pad(m)}:${pad(s)}`);
+    };
+    tick();
+    const id = window.setInterval(tick, 1000);
+    return () => window.clearInterval(id);
+  }, [drawAt]);
 
   // --------- LOADERS ---------
   const loadSlotsAndAvail = async (pid: string, uid: string) => {
@@ -142,22 +141,16 @@ export default function CalendrierPage() {
     pendingIdsRef.current = new Set();
   };
 
-  const loadMonthStatus = async (pid: string, uid: string) => {
+  const loadFlags = async (pid: string, uid: string) => {
+    // on lit opted_out depuis doctor_period_flags
     const { data } = await supabase
-      .from('doctor_period_months')
-      .select('month, validated_at, locked, opted_out')
+      .from('doctor_period_flags')
+      .select('opted_out')
       .eq('user_id', uid)
-      .eq('period_id', pid);
+      .eq('period_id', pid)
+      .maybeSingle();
 
-    const m: Record<string, MonthStatus> = {};
-    for (const row of data || []) {
-      m[(row as any).month as string] = {
-        validated_at: (row as any).validated_at as string | null,
-        locked: !!(row as any).locked,
-        opted_out: ((row as any).opted_out as boolean | null) ?? null,
-      };
-    }
-    setMonthStatus(m);
+    setOptedOut(!!data?.opted_out);
   };
 
   // --------- DERIVED ---------
@@ -191,7 +184,12 @@ export default function CalendrierPage() {
     return map;
   }, [slots]);
 
-  const currentMonthKey = useMemo(() => viewMonth ? yyyymm(viewMonth) : '', [viewMonth]);
+  // édition autorisée tant que tirage pas passé et pas opt-out
+  const isReadOnly = useMemo(() => {
+    if (optedOut) return true;
+    if (!drawAt) return false;
+    return new Date() >= drawAt;
+  }, [drawAt, optedOut]);
 
   // --------- AUTOSAVE (debounce) ---------
   const flushSave = async () => {
@@ -199,29 +197,24 @@ export default function CalendrierPage() {
     const ids = Array.from(pendingIdsRef.current);
     if (ids.length === 0) return;
 
-    // snapshot changes
     const payload = ids.map(slot_id => ({
       user_id: userId,
       slot_id,
       available: !!availability[slot_id],
     }));
 
-    // on tente la sauvegarde ; en cas d’échec on rollback localement
     try {
       const { error } = await supabase.from('availability').upsert(payload);
       if (error) throw error;
-
-      pendingIdsRef.current = new Set(); // ok
+      pendingIdsRef.current = new Set();
     } catch {
       // rollback silencieux
       setAvailability(prev => {
         const copy = { ...prev };
-        for (const slot_id of ids) {
-          copy[slot_id] = !copy[slot_id];
-        }
+        for (const slot_id of ids) copy[slot_id] = !copy[slot_id];
         return copy;
       });
-      pendingIdsRef.current = new Set(); // reset quand même
+      pendingIdsRef.current = new Set();
     }
   };
 
@@ -231,45 +224,33 @@ export default function CalendrierPage() {
   };
 
   // --------- ACTIONS ---------
-  const toggleLocal = (slotId: string, locked: boolean) => {
-    if (locked) return; // si mois verrouillé : pas de modif
-    setAvailability(prev => {
-      const next = { ...prev, [slotId]: !prev[slotId] };
-      return next;
-    });
+  const toggleLocal = (slotId: string) => {
+    if (isReadOnly) return;
+    setAvailability(prev => ({ ...prev, [slotId]: !prev[slotId] }));
     pendingIdsRef.current.add(slotId);
     scheduleSave();
   };
 
-  const validateMonth = async (mKey: string) => {
+  const toggleOptOut = async () => {
     if (!userId || !periodId) return;
-    await supabase
-      .from('doctor_period_months')
-      .upsert({
-        user_id: userId,
-        period_id: periodId,
-        month: mKey,
-        locked: true,
-        validated_at: new Date().toISOString(),
-        opted_out: false,
-      }, { onConflict: 'user_id,period_id,month' });
-    await loadMonthStatus(periodId, userId);
-  };
+    const wantOptOut = !optedOut;
 
-  const unlockMonth = async (mKey: string) => {
-    if (!userId || !periodId) return;
-    const ok = confirm('Déverrouiller ce mois pour modifier vos disponibilités ?');
-    if (!ok) return;
+    // petite confirmation si on active l'opt-out
+    if (wantOptOut) {
+      const ok = confirm("Confirmer : vous ne souhaitez pas prendre de garde ce trimestre ?");
+      if (!ok) return;
+    }
+
     await supabase
-      .from('doctor_period_months')
+      .from('doctor_period_flags')
       .upsert({
         user_id: userId,
         period_id: periodId,
-        month: mKey,
-        locked: false,
-        validated_at: null,
-      }, { onConflict: 'user_id,period_id,month' });
-    await loadMonthStatus(periodId, userId);
+        opted_out: wantOptOut,
+        all_validated: false, // on ne l’utilise plus mais garde une valeur
+      }, { onConflict: 'user_id,period_id' });
+
+    setOptedOut(wantOptOut);
   };
 
   // --------- RENDER ---------
@@ -279,7 +260,7 @@ export default function CalendrierPage() {
     <div className="space-y-4">
       <h1 className="text-xl font-semibold">Mes disponibilités</h1>
 
-      {/* Sélecteurs période & mois */}
+      {/* Période + mois */}
       <div className="flex flex-wrap gap-2 items-center">
         <select
           className="border rounded p-2 bg-zinc-900 text-zinc-100 border-zinc-700"
@@ -287,10 +268,12 @@ export default function CalendrierPage() {
           onChange={async (e) => {
             const v = e.target.value;
             setPeriodId(v);
+            const p = periods.find(pp => pp.id === v);
+            setDrawAt(p?.draw_at ? new Date(p.draw_at) : null);
             if (userId) {
               await Promise.all([
                 loadSlotsAndAvail(v, userId),
-                loadMonthStatus(v, userId),
+                loadFlags(v, userId),
               ]);
             }
           }}
@@ -299,59 +282,68 @@ export default function CalendrierPage() {
         </select>
 
         {monthsInPeriod.map(m => {
-          const st = monthStatus[m.key];
-          const isActive = currentMonthKey === m.key;
-
-          const activeCls = 'bg-white text-black border border-zinc-300';
-          const greenCls  = 'bg-green-50 text-green-900 border border-green-200';
-          const redCls    = 'bg-red-50 text-red-900 border border-red-200';
-          const hoverCls  = 'hover:bg-white hover:text-black';
-
+          const isActive = viewMonth ? yyyymm(viewMonth) === m.key : false;
           const base = isActive
-            ? activeCls
-            : (st?.locked ? `${greenCls} ${hoverCls}` : `${redCls} ${hoverCls}`);
-
-          return (
+            ? 'bg-white text-black border border-zinc-300'
+            : 'bg-zinc-100 text-zinc-700 border border-zinc-200 hover:bg-white hover:text-black';
+        return (
             <button
               key={m.key}
               className={`px-3 py-1.5 rounded ${base}`}
               onClick={() => setViewMonth(m.date)}
-              title={st?.locked ? 'Validé' : 'À valider'}
             >
               {m.label}
             </button>
           );
         })}
 
-        {/* Actions mois courant (silencieuses) */}
-        {!!currentMonthKey && (
-          <div className="ml-auto flex items-center gap-2">
-            {monthStatus[currentMonthKey]?.locked ? (
-              <>
-                <span className="text-sm text-green-700">Mois validé</span>
-                <button
-                  className="px-3 py-1.5 rounded border border-zinc-300 hover:bg-zinc-50"
-                  onClick={() => unlockMonth(currentMonthKey)}
-                >
-                  Déverrouiller
-                </button>
-              </>
-            ) : (
-              <>
-                <span className="text-sm text-red-700">Mois à valider</span>
-                <button
-                  className="px-3 py-1.5 rounded border border-emerald-300 text-emerald-900 bg-emerald-50 hover:bg-emerald-100"
-                  onClick={() => validateMonth(currentMonthKey)}
-                >
-                  Valider ce mois
-                </button>
-              </>
+        <div className="ml-auto flex items-center gap-2">
+          <button
+            onClick={toggleOptOut}
+            className={`px-3 py-1.5 rounded border ${
+              optedOut
+                ? 'bg-amber-100 border-amber-300 text-amber-900 hover:bg-amber-200'
+                : 'bg-zinc-100 border-zinc-300 text-zinc-800 hover:bg-zinc-200'
+            }`}
+          >
+            {optedOut ? 'Je souhaite finalement proposer des gardes' : 'Je ne souhaite pas prendre de garde ce trimestre'}
+          </button>
+        </div>
+      </div>
+
+      {/* Bloc explicatif + compte à rebours */}
+      <div className="rounded-xl border border-zinc-700 bg-zinc-900/50 p-4 space-y-2">
+        <p className="text-sm text-zinc-200">
+          Indiquez vos disponibilités en <strong>cliquant simplement</strong> sur les créneaux proposés. 
+          Chaque clic active/désactive le créneau (vert = disponible). L’enregistrement est <strong>automatique</strong>.
+        </p>
+        <p className="text-sm text-zinc-400">
+          Vous pouvez modifier vos choix à tout moment <em>jusqu’à la date de tirage</em>. 
+          Après le tirage, le planning n’est plus modifiable.
+        </p>
+        {drawAt && (
+          <div className="mt-2 font-semibold text-zinc-100">
+            Vous avez jusqu’au {drawAt.toLocaleString('fr-FR', { dateStyle: 'full', timeStyle: 'short' })} pour saisir vos disponibilités.
+            {countdown && (
+              <span className="block mt-1 text-lg">
+                ⏳ {countdown}
+              </span>
             )}
+          </div>
+        )}
+        {optedOut && (
+          <div className="mt-2 text-amber-300">
+            Vous avez indiqué ne pas souhaiter prendre de garde ce trimestre. La grille est désactivée.
+          </div>
+        )}
+        {isReadOnly && !optedOut && (
+          <div className="mt-2 text-red-300">
+            Le tirage a eu lieu. Le planning est désormais en lecture seule.
           </div>
         )}
       </div>
 
-      {/* Grille mensuelle : clic direct = toggle (pas de sheet, pas de bandeau) */}
+      {/* Grille mensuelle */}
       <div className="grid grid-cols-7 gap-2">
         {['Lun','Mar','Mer','Jeu','Ven','Sam','Dim'].map(w => (
           <div key={w} className="text-center text-xs uppercase tracking-wide text-gray-500">{w}</div>
@@ -363,8 +355,6 @@ export default function CalendrierPage() {
           const key = ymdLocal(d);
           const daySlots = slotsByDate[key] || [];
           const dayNum = d.getDate();
-          const mKey = yyyymm(d);
-          const locked = !!monthStatus[mKey]?.locked;
 
           return (
             <div
@@ -384,15 +374,15 @@ export default function CalendrierPage() {
                 ) : daySlots.map((s) => {
                   const on = !!availability[s.id];
                   const cellClass = on
-                    ? (locked ? 'bg-emerald-700 text-white' : 'bg-emerald-600 text-white hover:bg-emerald-500')
-                    : (locked ? 'bg-zinc-200 text-zinc-500' : 'bg-zinc-100 text-zinc-600 hover:bg-zinc-200');
+                    ? (isReadOnly ? 'bg-emerald-700 text-white' : 'bg-emerald-600 text-white hover:bg-emerald-500')
+                    : (isReadOnly ? 'bg-zinc-200 text-zinc-500' : 'bg-zinc-100 text-zinc-600 hover:bg-zinc-200');
 
                   return (
                     <button
                       key={s.id}
                       type="button"
-                      disabled={locked}
-                      onClick={() => toggleLocal(s.id, locked)}
+                      disabled={isReadOnly}
+                      onClick={() => toggleLocal(s.id)}
                       className={`flex-1 text-[11px] px-2 border-t first:border-t-0 ${cellClass} flex items-center justify-center`}
                       title={KIND_LABEL[s.kind]}
                     >
@@ -405,8 +395,6 @@ export default function CalendrierPage() {
           );
         })}
       </div>
-
-      {/* Pas de bouton “Enregistrer” ni de bandeau : tout est auto-sauvé en silence */}
     </div>
   );
 }
