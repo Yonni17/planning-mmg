@@ -13,19 +13,12 @@ type Slot = {
   kind: 'WEEKDAY_20_00'|'SAT_12_18'|'SAT_18_00'|'SUN_08_14'|'SUN_14_20'|'SUN_20_24';
 };
 
-type Period = { id: string; label: string };
+type Period = { id: string; label: string; open_at: string };
 
 type MonthStatus = {
   validated_at: string | null;
   locked: boolean;
   opted_out: boolean | null;
-};
-
-type Profile = {
-  user_id: string;
-  first_name: string | null;
-  last_name: string | null;
-  role: string | null;
 };
 
 const pad = (n: number) => String(n).padStart(2, '0');
@@ -42,6 +35,14 @@ const KIND_LABEL: Record<Slot['kind'], string> = {
   SUN_20_24:     '20:00–00:00',
 };
 
+function fmtDateInParis(d: Date) {
+  return d.toLocaleString('fr-FR', {
+    timeZone: 'Europe/Paris',
+    dateStyle: 'full',
+    timeStyle: 'short',
+  });
+}
+
 export default function CalendrierPage() {
   const router = useRouter();
 
@@ -54,9 +55,13 @@ export default function CalendrierPage() {
   const [viewMonth, setViewMonth] = useState<Date | null>(null);
   const [loading, setLoading] = useState(true);
 
+  // Countdown (deadline = open_at - 21 jours)
+  const [deadline, setDeadline] = useState<Date | null>(null);
+  const [nowTick, setNowTick] = useState<number>(Date.now()); // tick chaque minute
+
   // autosave silencieux (debounce)
   const debounceRef = useRef<number | null>(null);
-  const pendingIdsRef = useRef<Set<string>>(new Set()); // set des slot_id modifiés depuis la dernière save
+  const pendingIdsRef = useRef<Set<string>>(new Set());
 
   // --------- INIT ---------
   useEffect(() => {
@@ -68,7 +73,7 @@ export default function CalendrierPage() {
       if (!user) { router.replace('/login'); return; }
       setUserId(user.id);
 
-      // 2) S’assurer qu’un profil existe (FK éventuel)
+      // 2) Profil existant sinon créer minimal
       const { data: prof } = await supabase
         .from('profiles')
         .select('user_id, first_name, last_name, role')
@@ -76,7 +81,6 @@ export default function CalendrierPage() {
         .maybeSingle();
 
       if (!prof) {
-        // crée un profil minimal silencieusement (aucun message UI)
         await supabase.from('profiles').insert({
           user_id: user.id,
           first_name: null,
@@ -84,21 +88,19 @@ export default function CalendrierPage() {
           role: 'doctor',
         } as any);
       } else {
-        // si prénom/nom manquants → on force la complétion d’identité
         if (!prof.first_name || !prof.last_name) {
           router.replace('/preferences?missing=1');
           return;
         }
       }
 
-      // 3) Périodes
-      const { data: periodsData, error: perr } = await supabase
+      // 3) Périodes (⚠️ on récupère aussi open_at pour le compte à rebours)
+      const { data: periodsData } = await supabase
         .from('periods')
-        .select('id,label')
+        .select('id,label,open_at')
         .order('open_at', { ascending: false });
-      if (perr) { setLoading(false); return; }
 
-      const list = periodsData || [];
+      const list = (periodsData || []) as Period[];
       setPeriods(list);
 
       const defId = list[0]?.id || '';
@@ -109,10 +111,24 @@ export default function CalendrierPage() {
           loadSlotsAndAvail(defId, user.id),
           loadMonthStatus(defId, user.id),
         ]);
+        // calcule deadline: open_at - 21 jours
+        const p = list.find(p => p.id === defId);
+        if (p?.open_at) {
+          const open = new Date(p.open_at);
+          const dl = new Date(open.getTime() - 21 * 24 * 60 * 60 * 1000);
+          setDeadline(dl);
+        }
       }
+
       setLoading(false);
     })();
   }, [router]);
+
+  // --------- TICK du compte à rebours (toutes les minutes) ---------
+  useEffect(() => {
+    const t = setInterval(() => setNowTick(Date.now()), 60 * 1000);
+    return () => clearInterval(t);
+  }, []);
 
   // --------- LOADERS ---------
   const loadSlotsAndAvail = async (pid: string, uid: string) => {
@@ -199,18 +215,16 @@ export default function CalendrierPage() {
     const ids = Array.from(pendingIdsRef.current);
     if (ids.length === 0) return;
 
-    // snapshot changes
     const payload = ids.map(slot_id => ({
       user_id: userId,
       slot_id,
       available: !!availability[slot_id],
     }));
 
-    // tentative de sauvegarde ; rollback silencieux en cas d’échec
     try {
       const { error } = await supabase.from('availability').upsert(payload);
       if (error) throw error;
-      pendingIdsRef.current = new Set(); // ok
+      pendingIdsRef.current = new Set();
     } catch {
       setAvailability(prev => {
         const copy = { ...prev };
@@ -219,7 +233,7 @@ export default function CalendrierPage() {
         }
         return copy;
       });
-      pendingIdsRef.current = new Set(); // reset quand même
+      pendingIdsRef.current = new Set();
     }
   };
 
@@ -229,14 +243,56 @@ export default function CalendrierPage() {
   };
 
   // --------- ACTIONS ---------
-  const toggleLocal = (slotId: string) => {
-    setAvailability(prev => {
-      const next = { ...prev, [slotId]: !prev[slotId] };
-      return next;
-    });
+  const toggleLocal = (slotId: string, locked: boolean) => {
+    if (locked) return; // si verrouillé : on bloque le toggle
+    setAvailability(prev => ({ ...prev, [slotId]: !prev[slotId] }));
     pendingIdsRef.current.add(slotId);
     scheduleSave();
   };
+
+  const validateMonth = async (mKey: string) => {
+    if (!userId || !periodId) return;
+    await supabase
+      .from('doctor_period_months')
+      .upsert({
+        user_id: userId,
+        period_id: periodId,
+        month: mKey,
+        locked: true,
+        validated_at: new Date().toISOString(),
+        opted_out: false,
+      }, { onConflict: 'user_id,period_id,month' });
+    await loadMonthStatus(periodId, userId);
+  };
+
+  const unlockMonth = async (mKey: string) => {
+    if (!userId || !periodId) return;
+    const ok = confirm('Déverrouiller ce mois pour modifier vos disponibilités ?');
+    if (!ok) return;
+    await supabase
+      .from('doctor_period_months')
+      .upsert({
+        user_id: userId,
+        period_id: periodId,
+        month: mKey,
+        locked: false,
+        validated_at: null,
+      }, { onConflict: 'user_id,period_id,month' });
+    await loadMonthStatus(periodId, userId);
+  };
+
+  // --------- COUNTDOWN helpers ---------
+  const countdown = useMemo(() => {
+    if (!deadline) return null;
+    const ms = new Date(nowTick).getTime() - 0; // juste pour “lire” le tick
+    const diff = deadline.getTime() - Date.now();
+    const past = diff <= 0;
+    const abs = Math.abs(diff);
+    const d = Math.floor(abs / (1000 * 60 * 60 * 24));
+    const h = Math.floor((abs / (1000 * 60 * 60)) % 24);
+    const m = Math.floor((abs / (1000 * 60)) % 60);
+    return { past, d, h, m };
+  }, [deadline, nowTick]);
 
   // --------- RENDER ---------
   if (loading) return <p className="text-zinc-300">Chargement…</p>;
@@ -247,7 +303,7 @@ export default function CalendrierPage() {
 
       {/* Sélecteurs période & mois */}
       <div className="flex flex-wrap gap-2 items-center">
-        {/* Sélecteur période : texte noir, fond selon thème */}
+        {/* Sélecteur période : suit le thème, texte noir volontairement pour lisibilité */}
         <select
           className="border rounded p-2 text-black
                      bg-white dark:bg-zinc-800
@@ -262,6 +318,13 @@ export default function CalendrierPage() {
                 loadSlotsAndAvail(v, userId),
                 loadMonthStatus(v, userId),
               ]);
+              const p = periods.find(p => p.id === v);
+              if (p?.open_at) {
+                const open = new Date(p.open_at);
+                setDeadline(new Date(open.getTime() - 21 * 24 * 60 * 60 * 1000));
+              } else {
+                setDeadline(null);
+              }
             }
           }}
         >
@@ -274,18 +337,15 @@ export default function CalendrierPage() {
             const st = monthStatus[m.key];
             const isActive = currentMonthKey === m.key;
 
-            // Couleurs moins pâles (vert = validé, rouge = à valider), avec variantes dark
+            // Couleurs moins pâles (vert validé, rouge à valider)
             const greenTab =
               'bg-green-200 text-green-900 border border-green-400 ' +
               'dark:bg-emerald-700 dark:text-white dark:border-emerald-500';
             const redTab =
               'bg-red-200 text-red-900 border border-red-400 ' +
               'dark:bg-red-700 dark:text-white dark:border-red-500';
-            const neutralTab =
-              'bg-zinc-100 text-zinc-800 border border-zinc-300 ' +
-              'dark:bg-zinc-800 dark:text-zinc-100 dark:border-zinc-600';
 
-            const base = st?.locked ? greenTab : redTab; // ton code historique: locked ≈ validé
+            const base = st?.locked ? greenTab : redTab;
             const notActive = `${base} hover:opacity-90 transition`;
             const active =
               'bg-white text-black border-2 border-emerald-400 shadow-sm ' +
@@ -308,15 +368,89 @@ export default function CalendrierPage() {
             </div>
           )}
         </div>
+
+        {/* Actions mois courant : Verrouiller / Déverrouiller */}
+        {!!currentMonthKey && (
+          <div className="ml-auto flex items-center gap-2">
+            {monthStatus[currentMonthKey]?.locked ? (
+              <>
+                <span className="text-sm text-green-600 dark:text-emerald-400">
+                  Mois verrouillé ✅
+                </span>
+                <button
+                  className="px-3 py-1.5 rounded border
+                             border-zinc-300 hover:bg-zinc-50
+                             dark:border-zinc-600 dark:hover:bg-zinc-800 dark:text-zinc-100"
+                  onClick={() => unlockMonth(currentMonthKey)}
+                >
+                  Déverrouiller
+                </button>
+              </>
+            ) : (
+              <>
+                <span className="text-sm text-red-600 dark:text-red-400">
+                  Mois non verrouillé
+                </span>
+                <button
+                  className="px-3 py-1.5 rounded border
+                             border-emerald-300 text-emerald-900 bg-emerald-50 hover:bg-emerald-100
+                             dark:border-emerald-500 dark:text-white dark:bg-emerald-700 dark:hover:bg-emerald-600"
+                  onClick={() => validateMonth(currentMonthKey)}
+                >
+                  Verrouiller ce mois
+                </button>
+              </>
+            )}
+          </div>
+        )}
       </div>
 
-      {/* Grille mensuelle : clic = toggle, styles adaptés light/dark */}
+      {/* Bloc d’explications + compte à rebours */}
+      <div
+        className="rounded-xl border p-4
+                   border-zinc-300 bg-zinc-50 text-zinc-800
+                   dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+      >
+        <h2 className="text-base font-semibold mb-2">Comment renseigner vos disponibilités ?</h2>
+        <ol className="list-decimal pl-5 space-y-1 text-sm">
+          <li>Choisissez le <strong>trimestre</strong> en haut à gauche.</li>
+          <li>Cliquez sur le <strong>mois</strong> voulu pour l’afficher.</li>
+          <li>Dans chaque jour, <strong>cliquez</strong> les créneaux pour les passer en vert ✅ (disponible) ou en gris (indisponible).</li>
+          <li>Quand tout est ok pour le mois, cliquez sur <strong>“Verrouiller ce mois”</strong> pour signaler que c’est complet.</li>
+          <li>Vous pourrez <strong>déverrouiller</strong> si vous devez corriger avant la date limite.</li>
+        </ol>
+
+        {/* Countdown */}
+        <div className="mt-3 text-sm">
+          {deadline ? (
+            <>
+              <div className="font-medium">
+                Clôture des disponibilités (J-21 avant le début du trimestre) :
+                <span className="ml-1">
+                  {fmtDateInParis(deadline)}
+                </span>
+              </div>
+              <div className="mt-1 font-semibold">
+                {countdown && !countdown.past
+                  ? <>⏳ Il reste <span className="tabular-nums">{countdown.d} j {countdown.h} h {countdown.m} min</span>.</>
+                  : <>⛔ La période de saisie des disponibilités est <span className="font-bold">fermée</span>.</>}
+              </div>
+            </>
+          ) : (
+            <div className="text-zinc-500">
+              La date de clôture sera affichée dès qu’une période est sélectionnée.
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Grille mensuelle */}
       <div className="grid grid-cols-7 gap-2">
         {['Lun','Mar','Mer','Jeu','Ven','Sam','Dim'].map(w => (
           <div key={w} className="text-center text-xs uppercase tracking-wide text-zinc-500">{w}</div>
         ))}
 
-        {daysOfMonth.map((d, i) => {
+        {useMemo(() => daysOfMonth, [daysOfMonth]).map((d, i) => {
           if (!d) {
             return (
               <div
@@ -331,6 +465,8 @@ export default function CalendrierPage() {
           const key = ymdLocal(d);
           const daySlots = slotsByDate[key] || [];
           const dayNum = d.getDate();
+          const mKey = yyyymm(d);
+          const locked = !!monthStatus[mKey]?.locked;
 
           return (
             <div
@@ -368,7 +504,8 @@ export default function CalendrierPage() {
                     <button
                       key={s.id}
                       type="button"
-                      onClick={() => toggleLocal(s.id)}
+                      disabled={locked}
+                      onClick={() => toggleLocal(s.id, locked)}
                       className={`flex-1 text-[11px] px-2 border-t first:border-t-0
                                   border-zinc-200 dark:border-zinc-700
                                   flex items-center justify-center
