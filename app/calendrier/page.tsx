@@ -284,7 +284,9 @@ export default function CalendrierPage() {
   // --------- COUNTDOWN helpers ---------
   const countdown = useMemo(() => {
     if (!deadline) return null;
-    const ms = new Date(nowTick).getTime() - 0; // juste pour “lire” le tick
+    // force recalcul avec nowTick
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const _ = nowTick;
     const diff = deadline.getTime() - Date.now();
     const past = diff <= 0;
     const abs = Math.abs(diff);
@@ -303,7 +305,7 @@ export default function CalendrierPage() {
 
       {/* Sélecteurs période & mois */}
       <div className="flex flex-wrap gap-2 items-center">
-        {/* Sélecteur période : suit le thème, texte noir volontairement pour lisibilité */}
+        {/* Sélecteur période */}
         <select
           className="border rounded p-2 text-black
                      bg-white dark:bg-zinc-800
@@ -450,7 +452,7 @@ export default function CalendrierPage() {
           <div key={w} className="text-center text-xs uppercase tracking-wide text-zinc-500">{w}</div>
         ))}
 
-        {useMemo(() => daysOfMonth, [daysOfMonth]).map((d, i) => {
+        {daysOfMonth.map((d, i) => {
           if (!d) {
             return (
               <div
