@@ -14,7 +14,21 @@ type Slot = {
   kind: 'WEEKDAY_20_00'|'SAT_12_18'|'SAT_18_00'|'SUN_08_14'|'SUN_14_20'|'SUN_20_24';
 };
 
-type Period = { id: string; label: string; open_at: string };
+// ⚠️ On embarque les champs d'automation utiles dans Period
+type Period = {
+  id: string;
+  label: string;
+  open_at: string;
+  timezone: string;
+  // PostgREST renvoie souvent un tableau pour l'embed; on gère les 2 cas
+  period_automation?: {
+    avail_deadline: string | null;
+    avail_deadline_before_days: number | null;
+  } | Array<{
+    avail_deadline: string | null;
+    avail_deadline_before_days: number | null;
+  }> | null;
+};
 
 type MonthStatus = {
   validated_at: string | null;
@@ -36,12 +50,31 @@ const KIND_LABEL: Record<Slot['kind'], string> = {
   SUN_20_24:     '20:00–00:00',
 };
 
-function fmtDateInParis(d: Date) {
+function fmtInTZ(d: Date, tz = 'Europe/Paris') {
   return d.toLocaleString('fr-FR', {
-    timeZone: 'Europe/Paris',
+    timeZone: tz,
     dateStyle: 'full',
     timeStyle: 'short',
   });
+}
+
+function pickAutomationRow(p: Period) {
+  const pa = (Array.isArray(p.period_automation) ? p.period_automation[0] : p.period_automation) as
+    | { avail_deadline: string | null; avail_deadline_before_days: number | null }
+    | null
+    | undefined;
+  return pa ?? null;
+}
+
+function computeDeadline(p: Period): { deadline: Date | null; ruleLabel: string } {
+  const pa = pickAutomationRow(p);
+  if (pa?.avail_deadline) {
+    return { deadline: new Date(pa.avail_deadline), ruleLabel: 'date fixée' };
+  }
+  const days = pa?.avail_deadline_before_days ?? 21; // fallback logique
+  const open = new Date(p.open_at);
+  const d = new Date(open.getTime() - days * 24 * 60 * 60 * 1000);
+  return { deadline: d, ruleLabel: `J-${days} avant l’ouverture` };
 }
 
 export default function CalendrierPage() {
@@ -50,19 +83,27 @@ export default function CalendrierPage() {
   const [userId, setUserId] = useState<string | null>(null);
   const [periods, setPeriods] = useState<Period[]>([]);
   const [periodId, setPeriodId] = useState<string>('');
+  const [periodTz, setPeriodTz] = useState<string>('Europe/Paris');
   const [slots, setSlots] = useState<Slot[]>([]);
   const [availability, setAvailability] = useState<Record<string, boolean>>({});
   const [monthStatus, setMonthStatus] = useState<Record<string, MonthStatus>>({});
   const [viewMonth, setViewMonth] = useState<Date | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // Countdown (deadline = open_at - 21 jours)
+  // Countdown
   const [deadline, setDeadline] = useState<Date | null>(null);
+  const [deadlineRule, setDeadlineRule] = useState<string>(''); // ex: "J-21 avant l’ouverture" ou "date fixée"
   const [nowTick, setNowTick] = useState<number>(Date.now()); // tick chaque minute
 
   // autosave silencieux (debounce)
   const debounceRef = useRef<number | null>(null);
   const pendingIdsRef = useRef<Set<string>>(new Set());
+
+  // Réfs anti-course / anti-double-clic
+  const availabilityRef = useRef<Record<string, boolean>>({});
+  useEffect(() => { availabilityRef.current = availability; }, [availability]);
+
+  const savingRef = useRef<Set<string>>(new Set()); // slots en écriture en cours
 
   // État d’ouverture du bloc d’instructions (ouvert par défaut en ≥ md)
   const [instOpen, setInstOpen] = useState<boolean>(true);
@@ -98,30 +139,35 @@ export default function CalendrierPage() {
         }
       }
 
-      // 3) Périodes (on récupère aussi open_at pour le compte à rebours)
-      const { data: periodsData } = await supabase
+      // 3) Périodes (+ automation embarquée)
+      const { data: periodsData, error } = await supabase
         .from('periods')
-        .select('id,label,open_at')
+        .select('id,label,open_at,timezone,period_automation!left(avail_deadline,avail_deadline_before_days)')
         .order('open_at', { ascending: false });
+
+      if (error) {
+        console.error('load periods error', error);
+        setLoading(false);
+        return;
+      }
 
       const list = (periodsData || []) as Period[];
       setPeriods(list);
 
       const defId = list[0]?.id || '';
       setPeriodId(defId);
+      if (list[0]?.timezone) setPeriodTz(list[0].timezone);
 
       if (defId) {
         await Promise.all([
           loadSlotsAndAvail(defId, user.id),
           loadMonthStatus(defId, user.id),
         ]);
-        // calcule deadline: open_at - 21 jours
-        const p = list.find(p => p.id === defId);
-        if (p?.open_at) {
-          const open = new Date(p.open_at);
-          const dl = new Date(open.getTime() - 21 * 24 * 60 * 60 * 1000);
-          setDeadline(dl);
-        }
+
+        const p = list.find(pp => pp.id === defId)!;
+        const { deadline: dl, ruleLabel } = computeDeadline(p);
+        setDeadline(dl);
+        setDeadlineRule(ruleLabel);
       }
 
       setLoading(false);
@@ -230,7 +276,7 @@ export default function CalendrierPage() {
     const payload = ids.map(slot_id => ({
       user_id: userId,
       slot_id,
-      available: !!availability[slot_id],
+      available: !!availabilityRef.current[slot_id],
     }));
 
     try {
@@ -238,12 +284,11 @@ export default function CalendrierPage() {
       const { error } = await supabase.from('availability').upsert(payload, { onConflict: 'user_id,slot_id' });
       if (error) throw error;
       pendingIdsRef.current = new Set();
-    } catch {
+    } catch (err) {
+      console.error('batch upsert availability failed', err);
       setAvailability(prev => {
         const copy = { ...prev };
-        for (const slot_id of ids) {
-          copy[slot_id] = !copy[slot_id];
-        }
+        for (const slot_id of ids) copy[slot_id] = !copy[slot_id];
         return copy;
       });
       pendingIdsRef.current = new Set();
@@ -267,7 +312,8 @@ export default function CalendrierPage() {
       window.removeEventListener('beforeunload', handleBeforeUnload);
       document.removeEventListener('visibilitychange', handleVisibility);
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // --------- HELPERS ---------
   async function ensureMonthRow(pid: string, uid: string, mKey: string) {
@@ -281,12 +327,32 @@ export default function CalendrierPage() {
     if (error) throw error;
   }
 
+  async function fetchOneAvailability(uid: string, slotId: string): Promise<boolean> {
+    const { data, error } = await supabase
+      .from('availability')
+      .select('available')
+      .eq('user_id', uid)
+      .eq('slot_id', slotId)
+      .maybeSingle();
+    if (error) {
+      console.error('fetchOneAvailability error', error);
+      return !!availabilityRef.current[slotId]; // fallback sur l'état local
+    }
+    return !!data?.available;
+  }
+
   // --------- ACTIONS ---------
   const toggleLocal = async (slotId: string, locked: boolean) => {
     if (locked || !userId || !periodId) return;
+    if (savingRef.current.has(slotId)) return; // anti double-clic / ré-entrance
+    savingRef.current.add(slotId);
 
-    // 1) UI optimiste
-    setAvailability(prev => ({ ...prev, [slotId]: !prev[slotId] }));
+    // Valeur avant clic et prochaine valeur (sans dépendre d'un setState asynchrone)
+    const oldVal = !!availabilityRef.current[slotId];
+    const nextVal = !oldVal;
+
+    // 1) UI optimiste immédiate
+    setAvailability(prev => ({ ...prev, [slotId]: nextVal }));
 
     // 2) Déduire le mois (YYYY-MM) du slot pour assurer la ligne parent
     const s = slots.find(x => x.id === slotId);
@@ -296,7 +362,6 @@ export default function CalendrierPage() {
       if (mKey) await ensureMonthRow(periodId, userId, mKey);
 
       // 3) Écrire immédiatement CE slot (persistance inter-pages)
-      const nextVal = !availability[slotId];
       const { error } = await supabase
         .from('availability')
         .upsert(
@@ -305,13 +370,19 @@ export default function CalendrierPage() {
         );
       if (error) throw error;
 
-      // 4) On conserve le batch pour d’éventuels multi-clics rapides
+      // 4) Réconciliation : relire la valeur fraîche en base pour éviter toute divergence
+      const fresh = await fetchOneAvailability(userId, slotId);
+      setAvailability(prev => ({ ...prev, [slotId]: fresh }));
+
+      // 5) On conserve le batch pour d’éventuels multi-clics rapides
       pendingIdsRef.current.add(slotId);
       scheduleSave();
     } catch (e) {
       // rollback UI si l’écriture échoue
-      setAvailability(prev => ({ ...prev, [slotId]: !!prev[slotId] }));
+      setAvailability(prev => ({ ...prev, [slotId]: oldVal }));
       console.error('availability upsert error', e);
+    } finally {
+      savingRef.current.delete(slotId);
     }
   };
 
@@ -364,6 +435,9 @@ export default function CalendrierPage() {
   // --------- RENDER ---------
   if (loading) return <p className="text-zinc-300">Chargement…</p>;
 
+  const currentPeriod = periods.find(p => p.id === periodId);
+  const currentTz = currentPeriod?.timezone || periodTz || 'Europe/Paris';
+
   return (
     <div className="space-y-4">
       <h1 className="text-xl font-semibold text-zinc-100">Mes disponibilités</h1>
@@ -380,17 +454,20 @@ export default function CalendrierPage() {
           onChange={async (e) => {
             const v = e.target.value;
             setPeriodId(v);
+            const p = periods.find(pp => pp.id === v);
+            if (p?.timezone) setPeriodTz(p.timezone);
             if (userId) {
               await Promise.all([
                 loadSlotsAndAvail(v, userId),
                 loadMonthStatus(v, userId),
               ]);
-              const p = periods.find(p => p.id === v);
-              if (p?.open_at) {
-                const open = new Date(p.open_at);
-                setDeadline(new Date(open.getTime() - 21 * 24 * 60 * 60 * 1000));
+              if (p) {
+                const { deadline: dl, ruleLabel } = computeDeadline(p);
+                setDeadline(dl);
+                setDeadlineRule(ruleLabel);
               } else {
                 setDeadline(null);
+                setDeadlineRule('');
               }
             }
           }}
@@ -471,6 +548,38 @@ export default function CalendrierPage() {
           </div>
         )}
       </div>
+{/* Compte à rebours — toujours visible */}
+{deadline ? (
+  <div className="rounded-lg border border-emerald-400/40 bg-emerald-50/30 dark:bg-emerald-900/20 px-4 py-3">
+    <div className="text-sm">
+      <span className="font-medium">Clôture des disponibilités : </span>
+      <span>{fmtInTZ(deadline, currentTz)}</span>
+      <span className="ml-2 text-xs text-zinc-500">
+        ({deadlineRule}{currentTz ? ` • ${currentTz}` : ''})
+      </span>
+    </div>
+    <div className="mt-1 font-semibold">
+      {(() => {
+        // force recalcul avec nowTick
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        const _ = nowTick;
+        const diff = deadline.getTime() - Date.now();
+        const past = diff <= 0;
+        const abs = Math.abs(diff);
+        const d = Math.floor(abs / (1000 * 60 * 60 * 24));
+        const h = Math.floor((abs / (1000 * 60 * 60)) % 24);
+        const m = Math.floor((abs / (1000 * 60)) % 60);
+        return past
+          ? <>⛔ La période de saisie des disponibilités est <span className="font-bold">fermée</span>.</>
+          : <>⏳ Il reste <span className="tabular-nums">{d} j {h} h {m} min</span>.</>;
+      })()}
+    </div>
+  </div>
+) : (
+  <div className="rounded-lg border border-zinc-300 dark:border-zinc-700 px-4 py-3 text-sm text-zinc-600 dark:text-zinc-300">
+    La date de clôture sera affichée dès qu’une période est sélectionnée.
+  </div>
+)}
 
       {/* Bloc d’instructions REPLIABLE */}
       <details
@@ -495,29 +604,6 @@ export default function CalendrierPage() {
             <li>Quand tout est ok pour le mois, cliquez sur <strong>“Verrouiller ce mois”</strong> pour signaler que c’est complet.</li>
             <li>Vous pouvez <strong>déverrouiller</strong> si vous devez corriger avant la date limite.</li>
           </ol>
-
-          {/* Countdown intégré ici pour rester visible au besoin */}
-          <div className="mt-3 text-sm">
-            {deadline ? (
-              <>
-                <div className="font-medium">
-                  Clôture des disponibilités (J-21 avant le début du trimestre) :
-                  <span className="ml-1">
-                    {fmtDateInParis(deadline)}
-                  </span>
-                </div>
-                <div className="mt-1 font-semibold">
-                  {countdown && !countdown.past
-                    ? <>⏳ Il reste <span className="tabular-nums">{countdown.d} j {countdown.h} h {countdown.m} min</span>.</>
-                    : <>⛔ La période de saisie des disponibilités est <span className="font-bold">fermée</span>.</>}
-                </div>
-              </>
-            ) : (
-              <div className="text-zinc-500">
-                La date de clôture sera affichée dès qu’une période est sélectionnée.
-              </div>
-            )}
-          </div>
         </div>
       </details>
 
