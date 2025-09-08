@@ -16,12 +16,12 @@ const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
 const toParis = (d: Date) => new Date(d.toLocaleString('en-US', { timeZone: PARIS_TZ }));
 
 function isoHourKey(d: Date) {
-  // YYYY-MM-DDTHH (heure close)
+  // Clé d'heure UTC: YYYY-MM-DDTHH
   return d.toISOString().slice(0, 13);
 }
 function weekKeyParis(d: Date) {
   const local = toParis(d);
-  // Semaine ISO approximée suffisante pour clé d'idempotence
+  // Semaine ISO approximative suffisante pour clé d'idempotence
   const year = local.getFullYear();
   const jan4 = new Date(Date.UTC(year, 0, 4));
   const dow = (local.getDay() + 6) % 7; // 0=Lundi
@@ -39,14 +39,18 @@ async function alreadyLogged(periodId: string, eventType: string, windowKey: str
     .eq('window_key', windowKey)
     .eq('target', target)
     .maybeSingle();
-  if (error && error.code !== 'PGRST116') console.error('alreadyLogged error', error);
+  if (error && (error as any).code !== 'PGRST116') console.error('alreadyLogged error', error);
   return !!data;
 }
 async function logSent(periodId: string, eventType: string, windowKey: string, target: string, meta: any = {}) {
   const { error } = await supabase
     .from('automation_email_log')
     .insert({ period_id: periodId, event_type: eventType, window_key: windowKey, target, meta });
-  if (error) console.error('logSent error', error);
+  if (error) {
+    console.error('logSent error', error);
+    // remonter l'erreur pour que l’API signale le problème (ex: RLS)
+    throw error;
+  }
 }
 
 async function sendOne(to: string, subject: string, html: string) {
@@ -99,35 +103,71 @@ async function sendBulkIndividually(
 
 // --- Récup: périodes + automation ---
 async function fetchActivePeriods() {
-  // periods + period_automation
+  // periods + period_automation (INNER: on exige une ligne d'automatisation)
   const { data, error } = await supabase
     .from('periods')
-    .select('id, label, open_at, close_at, timezone, generate_at, period_automation!inner(*)'); // require automation row
+    .select('id, label, open_at, close_at, timezone, generate_at, period_automation!inner(*)');
   if (error) throw error;
-  return data?.map((p: any) => ({
-    id: p.id,
-    label: p.label,
-    tz: p.timezone || PARIS_TZ,
+  return (data ?? []).map((p: any) => ({
+    id: p.id as string,
+    label: p.label as string,
+    tz: (p.timezone as string) || PARIS_TZ,
     open_at: new Date(p.open_at),
     close_at: new Date(p.close_at),
     automation: p.period_automation
-  })) ?? [];
+  }));
 }
 
 // --- Destinataires: rappels planning (non verrouillés) ---
-async function fetchRecipientsPlanning(periodId: string) {
-  // On s’appuie sur la vue recommandée (sinon, remplace par un GROUP BY sur doctor_period_months)
-  const { data, error } = await supabase
-    .from('v_period_doctors_to_remind')
-    .select('user_id, email, all_months_done, any_optout')
-    .eq('period_id', periodId);
-  if (error) {
-    console.error('fetchRecipientsPlanning error', error);
-    return [];
+// Stratégie: essayer la vue; si elle échoue ou renvoie 0 → fallback direct sur les tables.
+async function fetchRecipientsPlanning(periodId: string, wantDebug = false) {
+  // 1) Tentative par la vue
+  {
+    const { data, error } = await supabase
+      .from('v_period_doctors_to_remind')
+      .select('user_id, email, all_months_done, any_optout')
+      .eq('period_id', periodId);
+
+    if (!error && Array.isArray(data)) {
+      const recips = (data ?? [])
+        .filter((r: any) => r?.email && r.all_months_done === false && r.any_optout === false)
+        .map((r: any) => ({ user_id: r.user_id as string, email: r.email as string }));
+      if (wantDebug) console.log('[recips:view]', { periodId, count: recips.length });
+      if (recips.length > 0) return recips;
+      // sinon try fallback
+    } else {
+      if (wantDebug) console.error('[recips:view:error]', error);
+    }
   }
-  return (data ?? [])
-    .filter((r: any) => r.email && r.all_months_done === false && r.any_optout === false)
-    .map((r: any) => ({ user_id: r.user_id as string, email: r.email as string }));
+
+  // 2) Fallback: jointure directe doctor_period_months + profiles
+  //    Logique: docteurs ayant AU MOINS un mois non verrouillé et pas opt-out sur la période.
+  {
+    const { data, error } = await supabase
+      .from('doctor_period_months')
+      .select('user_id, locked, opted_out, profiles!inner(user_id,email,role)')
+      .eq('period_id', periodId)
+      .eq('locked', false)
+      .or('opted_out.is.null,opted_out.eq.false') // opted_out null ou false
+      .eq('profiles.role', 'doctor')
+      .not('profiles.email', 'is', null);
+
+    if (error) {
+      if (wantDebug) console.error('[recips:fallback:error]', error);
+      return [];
+    }
+
+    // dédoublonner par user_id (un user peut avoir plusieurs mois ouverts)
+    const uniq = new Map<string, { user_id: string; email: string }>();
+    for (const r of (data ?? [])) {
+      const email = (r as any)?.profiles?.email as string | null;
+      const uid = (r as any)?.user_id as string;
+      if (email) uniq.set(uid, { user_id: uid, email });
+    }
+    const recips = Array.from(uniq.values());
+    if (wantDebug) console.log('[recips:fallback]', { periodId, count: recips.length });
+    return recips;
+  }
 }
 
 // --- Destinataires: rappel J-1 de garde (assignments publiés) ---
@@ -171,6 +211,7 @@ async function fetchAssignmentsJ1(now: Date) {
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const dryRun = searchParams.get('dry-run') === '1';
+  const wantDebug = searchParams.get('debug') === '1';
 
   try {
     const now = new Date();
@@ -193,8 +234,7 @@ export async function GET(req: NextRequest) {
         const is09 = local.getHours() === 9;
         if (isMonday && is09) {
           const wk = weekKeyParis(now);
-          // Envoi individuel idempotent par destinataire
-          const recips = await fetchRecipientsPlanning(periodId);
+          const recips = await fetchRecipientsPlanning(periodId, wantDebug);
           totalToSend += recips.length;
 
           if (!dryRun) {
@@ -210,8 +250,9 @@ export async function GET(req: NextRequest) {
               dryRun
             );
             totalSent += sent;
-          } else {
-            debug.push({ periodId, weekly: true, recipients: recips.length });
+          }
+          if (wantDebug || dryRun) {
+            debug.push({ type: 'weekly', periodId, key: wk, recipients: recips.map(r => r.email) });
           }
         }
       }
@@ -228,8 +269,7 @@ export async function GET(req: NextRequest) {
         if (now >= windowStart && now < windowEnd) {
           const key = `${deadline.toISOString()}:${h}h`; // window_key unique par (deadline, h)
 
-          // Envoi individuel idempotent par destinataire
-          const recips = await fetchRecipientsPlanning(periodId);
+          const recips = await fetchRecipientsPlanning(periodId, wantDebug);
           totalToSend += recips.length;
 
           if (!dryRun) {
@@ -246,8 +286,9 @@ export async function GET(req: NextRequest) {
               dryRun
             );
             totalSent += sent;
-          } else {
-            debug.push({ periodId, deadline: deadline.toISOString(), h, recipients: recips.length });
+          }
+          if (wantDebug || dryRun) {
+            debug.push({ type: 'deadline', h, periodId, key, recipients: recips.map(r => r.email) });
           }
         }
       }
@@ -256,8 +297,8 @@ export async function GET(req: NextRequest) {
       if (a.avail_open_at) {
         const openAt = new Date(a.avail_open_at);
         if (now >= openAt && (now.getTime() - openAt.getTime()) < 3600 * 1000) {
-          const windowKey = isoHourKey(openAt);
-          const recips = await fetchRecipientsPlanning(periodId);
+          const windowKey = isoHourKey(openAt); // UTC hour key
+          const recips = await fetchRecipientsPlanning(periodId, wantDebug);
           totalToSend += recips.length;
 
           if (!dryRun) {
@@ -270,8 +311,9 @@ export async function GET(req: NextRequest) {
               dryRun
             );
             totalSent += sent;
-          } else {
-            debug.push({ periodId, opening: openAt.toISOString(), recipients: recips.length });
+          }
+          if (wantDebug || dryRun) {
+            debug.push({ type: 'opening', periodId, key: windowKey, recipients: recips.map(r => r.email) });
           }
         }
       }
@@ -304,6 +346,14 @@ export async function GET(req: NextRequest) {
           }
           await sleep(MIN_GAP_MS);
         }
+      }
+
+      if (wantDebug || dryRun) {
+        debug.push({
+          type: 'assignment_j1',
+          count: assignments.length,
+          recipients: assignments.map(a => ({ email: a.email, slot_id: a.slot_id, start_ts: a.start_ts }))
+        });
       }
     }
 
