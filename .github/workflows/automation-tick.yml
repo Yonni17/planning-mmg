@@ -12,6 +12,6 @@ jobs:
     steps:
       - name: Call /automation-tick (dry-run, verbose)
         run: |
-          URL="https://planning-mmg.ovh/api/admin/automation-tick?dry-run=1&key=${{ secrets.CRON_SECRET }}"
+          URL="https://planning-mmg.ovh/api/admin/automation-tick?key=${{ secrets.CRON_SECRET }}"
           echo "→ $URL"
           curl -v --fail-with-body "$URL"
