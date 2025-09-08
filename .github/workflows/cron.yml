@@ -1,16 +1,22 @@
-name: ping vercel cron endpoint
+name: Cron
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # tous les jours 06:00 UTC
-  workflow_dispatch: {}    # bouton "Run workflow" manuel
+    - cron: '0 6 * * *'   # existant pour /api/admin/cron
+    - cron: '0 * * * *'   # NOUVEAU: tick emails toutes les heures
+  workflow_dispatch:
 
 jobs:
-  call:
+  daily-periods:
     runs-on: ubuntu-latest
     steps:
-      - name: Call the endpoint
+      - name: Tick daily periods
         run: |
-          curl -fsS "https://planning-mmg.ovh/api/admin/cron?key=$CRON_SECRET"
-        env:
-          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          curl -fsSL "${{ secrets.PUBLIC_URL }}/api/admin/cron?token=${{ secrets.CRON_TOKEN }}"
+
+  hourly-automation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tick email automation
+        run: |
+          curl -fsSL "${{ secrets.PUBLIC_URL }}/api/admin/automation-tick?token=${{ secrets.CRON_TOKEN }}"
