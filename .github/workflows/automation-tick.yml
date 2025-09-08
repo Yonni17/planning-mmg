@@ -1,0 +1,17 @@
+# .github/workflows/automation-tick.yml
+name: ping automation-tick endpoint
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # toutes les heures, à HH:00 UTC
+  workflow_dispatch: {}    # bouton "Run workflow"
+
+jobs:
+  call:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /automation-tick (dry-run, verbose)
+        run: |
+          URL="https://planning-mmg.ovh/api/admin/automation-tick?dry-run=1&key=${{ secrets.CRON_SECRET }}"
+          echo "→ $URL"
+          curl -v --fail-with-body "$URL"
