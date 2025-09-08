@@ -1,6 +1,6 @@
+'use client';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
-'use client';
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 
