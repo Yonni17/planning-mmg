@@ -1,23 +1,29 @@
 // app/api/admin/automation-tick/route.ts
 import { NextRequest, NextResponse } from 'next/server';
-import { getSupabaseAdmin } from '@/lib/supabaseAdmin'; // << utilise le client admin (service role)
+import { getSupabaseAdmin } from '@/lib/supabaseAdmin'; // client "service role"
+import * as EmailTemplatesModule from '@/lib/emailTemplates'; // <-- import robuste
 import { sendEmail } from '@/lib/email';
-import { emailTemplates } from '@/lib/emailTemplates';
 
 export const dynamic = 'force-dynamic';
 
-// ---------- Client admin ----------
-const supabase = getSupabaseAdmin(); // une seule instance par module
+// --------- Client admin (bypass RLS) ---------
+const supabase = getSupabaseAdmin();
 
-// ---------- Réglages ----------
+// --------- Réglages ---------
 const PARIS_TZ = 'Europe/Paris';
-const MIN_GAP_MS = Number(process.env.EMAIL_MIN_GAP_MS ?? 700); // throttle ~1.4 rps
+const MIN_GAP_MS = Number(process.env.EMAIL_MIN_GAP_MS ?? 700);
 const MAX_RETRIES = 3;
 
-// ---------- Utils ----------
-const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
+// --------- Templates robustes (supporte named export OU default) ---------
+const TPL: any = (EmailTemplatesModule as any).emailTemplates ?? EmailTemplatesModule;
+function assertTpl(name: string) {
+  if (!TPL || typeof TPL[name] !== 'function') {
+    throw new Error(`Email template "${name}" introuvable (vérifie l'export dans lib/emailTemplates.ts)`);
+  }
+}
 
-/** Convertit un Date "now" en équivalent Europe/Paris, mais en Date UTC (pour getUTC*) */
+// --------- Utils ---------
+const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
 function toTZ(d: Date, tz: string) {
   const parts = new Intl.DateTimeFormat('en-GB', {
     timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
@@ -29,11 +35,7 @@ function toTZ(d: Date, tz: string) {
     Number(map.hour), Number(map.minute), Number(map.second)
   ));
 }
-
-function isoHourKey(d: Date) {
-  // Clé d'heure UTC: YYYY-MM-DDTHH (24h)
-  return d.toISOString().slice(0, 13);
-}
+function isoHourKey(d: Date) { return d.toISOString().slice(0, 13); }
 function weekKeyParis(d: Date) {
   const local = toTZ(d, PARIS_TZ);
   const year = local.getUTCFullYear();
@@ -62,7 +64,7 @@ async function logSent(periodId: string, eventType: string, windowKey: string, t
     .insert({ period_id: periodId, event_type: eventType, window_key: windowKey, target, meta });
   if (error) {
     console.error('logSent error', error);
-    throw error; // remonter (utile si RLS bloquait, etc.)
+    throw error;
   }
 }
 
@@ -123,7 +125,6 @@ type AutomationRow = {
 };
 function pickAutomationRow(a: any): AutomationRow | null {
   if (!a) return null;
-  // PostgREST peut renvoyer un objet ou un tableau (1 ligne)
   return Array.isArray(a) ? (a[0] ?? null) : a;
 }
 async function fetchActivePeriods() {
@@ -144,54 +145,35 @@ async function fetchActivePeriods() {
   }).filter(p => !!p.automation);
 }
 
-// --- Destinataires: rappels planning (non verrouillés) ---
-// Tente la vue; sinon fallback direct (doctor_period_months + profiles)
+// --- Destinataires: on passe TOUJOURS par doctor_period_months + profiles ---
+// (on ne dépend plus de la vue qui incluait ton admin)
 async function fetchRecipientsPlanning(periodId: string, wantDebug = false) {
-  // 1) Vue
-  {
-    const { data, error } = await supabase
-      .from('v_period_doctors_to_remind')
-      .select('user_id, email, all_months_done, any_optout')
-      .eq('period_id', periodId);
+  const { data, error } = await supabase
+    .from('doctor_period_months')
+    .select('user_id, locked, opted_out, profiles!inner(user_id,email,role)')
+    .eq('period_id', periodId)
+    .eq('locked', false)
+    .or('opted_out.is.null,opted_out.eq.false')
+    .eq('profiles.role', 'doctor')
+    .not('profiles.email', 'is', null);
 
-    if (!error && Array.isArray(data)) {
-      const recips = (data ?? [])
-        .filter((r: any) => r?.email && r.all_months_done === false && r.any_optout === false)
-        .map((r: any) => ({ user_id: r.user_id as string, email: r.email as string }));
-      if (wantDebug) console.log('[recips:view]', { periodId, count: recips.length });
-      if (recips.length > 0) return recips;
-    } else {
-      if (wantDebug) console.error('[recips:view:error]', error);
-    }
+  if (error) {
+    if (wantDebug) console.error('[recips:error]', error);
+    return [];
   }
-  // 2) Fallback
-  {
-    const { data, error } = await supabase
-      .from('doctor_period_months')
-      .select('user_id, locked, opted_out, profiles!inner(user_id,email,role)')
-      .eq('period_id', periodId)
-      .eq('locked', false)
-      .or('opted_out.is.null,opted_out.eq.false')
-      .eq('profiles.role', 'doctor')
-      .not('profiles.email', 'is', null);
 
-    if (error) {
-      if (wantDebug) console.error('[recips:fallback:error]', error);
-      return [];
-    }
-    const uniq = new Map<string, { user_id: string; email: string }>();
-    for (const r of (data ?? [])) {
-      const email = (r as any)?.profiles?.email as string | null;
-      const uid = (r as any)?.user_id as string;
-      if (email) uniq.set(uid, { user_id: uid, email });
-    }
-    const recips = Array.from(uniq.values());
-    if (wantDebug) console.log('[recips:fallback]', { periodId, count: recips.length });
-    return recips;
+  const uniq = new Map<string, { user_id: string; email: string }>();
+  for (const r of (data ?? [])) {
+    const email = (r as any)?.profiles?.email as string | null;
+    const uid = (r as any)?.user_id as string;
+    if (email) uniq.set(uid, { user_id: uid, email });
   }
+  const recips = Array.from(uniq.values());
+  if (wantDebug) console.log('[recips]', { periodId, count: recips.length, emails: recips.map(x => x.email) });
+  return recips;
 }
 
-// --- Destinataires: rappel J-1 de garde (assignments publiés) ---
+// --- Destinataires: rappel J-1 de garde ---
 async function fetchAssignmentsJ1(now: Date) {
   const from = new Date(now.getTime() + 24 * 3600 * 1000);
   const to   = new Date(now.getTime() + 25 * 3600 * 1000);
@@ -234,14 +216,23 @@ export async function GET(req: NextRequest) {
   const wantDebug = searchParams.get('debug') === '1';
 
   try {
+    // sanity check templates (évite le "reading 'opening'")
+    assertTpl('opening');
+    assertTpl('weekly');
+    assertTpl('deadline_48');
+    assertTpl('deadline_24');
+    assertTpl('deadline_1');
+    assertTpl('assignment_j1');
+
     const now = new Date();
     const nowParis = toTZ(now, PARIS_TZ);
     const periods = await fetchActivePeriods();
+
     let totalToSend = 0;
     let totalSent = 0;
     const debug: any[] = [];
 
-    // ===== A) Rappels “complétion planning” =====
+    // ===== A) Rappels complétion planning =====
     for (const p of periods) {
       const a = p.automation as AutomationRow | null;
       const periodId = p.id;
@@ -255,14 +246,12 @@ export async function GET(req: NextRequest) {
           const wk = weekKeyParis(now);
           const recips = await fetchRecipientsPlanning(periodId, wantDebug);
           totalToSend += recips.length;
+
           if (!dryRun) {
             const sent = await sendBulkIndividually(
               periodId, 'weekly', wk, recips,
               () => {
-                const tpl = emailTemplates.weekly({
-                  periodLabel: p.label,
-                  deadlineAt: a.avail_deadline ? new Date(a.avail_deadline) : p.close_at
-                });
+                const tpl = TPL.weekly({ periodLabel: p.label, deadlineAt: a.avail_deadline ? new Date(a.avail_deadline) : p.close_at });
                 return { subject: tpl.subject, html: tpl.html, meta: { type: 'weekly' } };
               },
               dryRun
@@ -289,15 +278,16 @@ export async function GET(req: NextRequest) {
             const key = `${deadline.toISOString()}:${h}h`;
             const recips = await fetchRecipientsPlanning(periodId, wantDebug);
             totalToSend += recips.length;
+
             if (!dryRun) {
               const type = h === 48 ? 'deadline_48' : h === 24 ? 'deadline_24' : 'deadline_1';
               const sent = await sendBulkIndividually(
                 periodId, type, key, recips,
                 () => {
                   const tpl =
-                    h === 48 ? emailTemplates.deadline_48({ periodLabel: p.label, deadlineAt: deadline }) :
-                    h === 24 ? emailTemplates.deadline_24({ periodLabel: p.label, deadlineAt: deadline }) :
-                               emailTemplates.deadline_1({ periodLabel: p.label, deadlineAt: deadline });
+                    h === 48 ? TPL.deadline_48({ periodLabel: p.label, deadlineAt: deadline }) :
+                    h === 24 ? TPL.deadline_24({ periodLabel: p.label, deadlineAt: deadline }) :
+                               TPL.deadline_1 ({ periodLabel: p.label, deadlineAt: deadline });
                   return { subject: tpl.subject, html: tpl.html, meta: { deadlineAt: deadline.toISOString(), h } };
                 },
                 dryRun
@@ -315,14 +305,15 @@ export async function GET(req: NextRequest) {
         const inWindow = now >= openAt && (now.getTime() - openAt.getTime()) < 3600 * 1000;
         if (wantDebug) debug.push({ type: 'opening-check', periodId, openAt: openAt.toISOString(), now: now.toISOString(), inWindow });
         if (inWindow) {
-          const windowKey = isoHourKey(openAt); // UTC hour key
+          const windowKey = isoHourKey(openAt);
           const recips = await fetchRecipientsPlanning(periodId, wantDebug);
           totalToSend += recips.length;
+
           if (!dryRun) {
             const sent = await sendBulkIndividually(
               periodId, 'opening', windowKey, recips,
               () => {
-                const tpl = emailTemplates.opening({ periodLabel: p.label });
+                const tpl = TPL.opening({ periodLabel: p.label });
                 return { subject: tpl.subject, html: tpl.html, meta: { openAt: openAt.toISOString() } };
               },
               dryRun
@@ -338,6 +329,7 @@ export async function GET(req: NextRequest) {
     {
       const assignments = await fetchAssignmentsJ1(now);
       totalToSend += assignments.length;
+
       for (const a of assignments) {
         const windowKey = `slot:${a.slot_id}`;
         const already = await alreadyLogged(a.period_id, 'assignment_j1', windowKey, a.email);
@@ -346,7 +338,7 @@ export async function GET(req: NextRequest) {
         if (!dryRun) {
           const start = new Date(a.start_ts);
           const end   = new Date(a.end_ts);
-          const tpl = emailTemplates.assignment_j1({ start, end, kind: a.kind });
+          const tpl = TPL.assignment_j1({ start, end, kind: a.kind });
           const ok = await sendOne(a.email, tpl.subject, tpl.html);
           if (ok) {
             totalSent += 1;
@@ -357,6 +349,7 @@ export async function GET(req: NextRequest) {
           await sleep(MIN_GAP_MS);
         }
       }
+
       if (wantDebug || dryRun) {
         debug.push({
           type: 'assignment_j1',
