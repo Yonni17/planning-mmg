@@ -1,10 +1,13 @@
 // app/api/admin/automation-tick/route.ts
 import { NextRequest, NextResponse } from 'next/server';
-import { supabase } from '@/lib/supabase';
+import { getSupabaseAdmin } from '@/lib/supabaseAdmin'; // << utilise le client admin (service role)
 import { sendEmail } from '@/lib/email';
 import { emailTemplates } from '@/lib/emailTemplates';
 
 export const dynamic = 'force-dynamic';
+
+// ---------- Client admin ----------
+const supabase = getSupabaseAdmin(); // une seule instance par module
 
 // ---------- Réglages ----------
 const PARIS_TZ = 'Europe/Paris';
@@ -14,40 +17,25 @@ const MAX_RETRIES = 3;
 // ---------- Utils ----------
 const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
 
-/**
- * Convertit un Date "now" en date équivalente dans un fuseau donné,
- * puis retourne un Date UTC construit à partir des composantes locales.
- * Cela permet d'utiliser .getUTCHours() / .getUTCDay() comme si c'était local.
- */
+/** Convertit un Date "now" en équivalent Europe/Paris, mais en Date UTC (pour getUTC*) */
 function toTZ(d: Date, tz: string) {
   const parts = new Intl.DateTimeFormat('en-GB', {
-    timeZone: tz,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
   }).formatToParts(d);
   const map: Record<string, string> = Object.fromEntries(parts.map(p => [p.type, p.value]));
   return new Date(Date.UTC(
-    Number(map.year),
-    Number(map.month) - 1,
-    Number(map.day),
-    Number(map.hour),
-    Number(map.minute),
-    Number(map.second)
+    Number(map.year), Number(map.month) - 1, Number(map.day),
+    Number(map.hour), Number(map.minute), Number(map.second)
   ));
 }
 
 function isoHourKey(d: Date) {
-  // Clé d'heure UTC: YYYY-MM-DDTHH
+  // Clé d'heure UTC: YYYY-MM-DDTHH (24h)
   return d.toISOString().slice(0, 13);
 }
 function weekKeyParis(d: Date) {
   const local = toTZ(d, PARIS_TZ);
-  // Semaine ISO approchée suffisante pour clé d'idempotence
   const year = local.getUTCFullYear();
   const jan4 = new Date(Date.UTC(year, 0, 4));
   const dow = local.getUTCDay(); // 0=Dim, 1=Lun...
@@ -74,8 +62,7 @@ async function logSent(periodId: string, eventType: string, windowKey: string, t
     .insert({ period_id: periodId, event_type: eventType, window_key: windowKey, target, meta });
   if (error) {
     console.error('logSent error', error);
-    // remonter l'erreur pour que l’API signale le problème (ex: RLS)
-    throw error;
+    throw error; // remonter (utile si RLS bloquait, etc.)
   }
 }
 
@@ -136,7 +123,7 @@ type AutomationRow = {
 };
 function pickAutomationRow(a: any): AutomationRow | null {
   if (!a) return null;
-  // Supabase peut renvoyer un objet ou un tableau d'une seule ligne
+  // PostgREST peut renvoyer un objet ou un tableau (1 ligne)
   return Array.isArray(a) ? (a[0] ?? null) : a;
 }
 async function fetchActivePeriods() {
@@ -152,15 +139,15 @@ async function fetchActivePeriods() {
       tz: (p.timezone as string) || PARIS_TZ,
       open_at: new Date(p.open_at),
       close_at: new Date(p.close_at),
-      automation, // <- normalisé
+      automation,
     };
   }).filter(p => !!p.automation);
 }
 
 // --- Destinataires: rappels planning (non verrouillés) ---
-// Stratégie: essayer la vue; si elle échoue ou renvoie 0 → fallback direct sur les tables.
+// Tente la vue; sinon fallback direct (doctor_period_months + profiles)
 async function fetchRecipientsPlanning(periodId: string, wantDebug = false) {
-  // 1) Tentative par la vue
+  // 1) Vue
   {
     const { data, error } = await supabase
       .from('v_period_doctors_to_remind')
@@ -173,20 +160,18 @@ async function fetchRecipientsPlanning(periodId: string, wantDebug = false) {
         .map((r: any) => ({ user_id: r.user_id as string, email: r.email as string }));
       if (wantDebug) console.log('[recips:view]', { periodId, count: recips.length });
       if (recips.length > 0) return recips;
-      // sinon try fallback
     } else {
       if (wantDebug) console.error('[recips:view:error]', error);
     }
   }
-
-  // 2) Fallback: jointure directe doctor_period_months + profiles
+  // 2) Fallback
   {
     const { data, error } = await supabase
       .from('doctor_period_months')
       .select('user_id, locked, opted_out, profiles!inner(user_id,email,role)')
       .eq('period_id', periodId)
       .eq('locked', false)
-      .or('opted_out.is.null,opted_out.eq.false') // opted_out null ou false
+      .or('opted_out.is.null,opted_out.eq.false')
       .eq('profiles.role', 'doctor')
       .not('profiles.email', 'is', null);
 
@@ -194,8 +179,6 @@ async function fetchRecipientsPlanning(periodId: string, wantDebug = false) {
       if (wantDebug) console.error('[recips:fallback:error]', error);
       return [];
     }
-
-    // dédoublonner par user_id (un user peut avoir plusieurs mois ouverts)
     const uniq = new Map<string, { user_id: string; email: string }>();
     for (const r of (data ?? [])) {
       const email = (r as any)?.profiles?.email as string | null;
@@ -210,9 +193,8 @@ async function fetchRecipientsPlanning(periodId: string, wantDebug = false) {
 
 // --- Destinataires: rappel J-1 de garde (assignments publiés) ---
 async function fetchAssignmentsJ1(now: Date) {
-  // Cherche les slots dans ~[24h, 25h) pour fenêtre 1h, state='published'
   const from = new Date(now.getTime() + 24 * 3600 * 1000);
-  const to = new Date(now.getTime() + 25 * 3600 * 1000);
+  const to   = new Date(now.getTime() + 25 * 3600 * 1000);
 
   const { data, error } = await supabase
     .from('assignments')
@@ -245,10 +227,10 @@ async function fetchAssignmentsJ1(now: Date) {
   })).filter(x => !!x.email);
 }
 
-// --- Point d’entrée GET ---
+// --- Route GET ---
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
-  const dryRun = searchParams.get('dry-run') === '1';
+  const dryRun   = searchParams.get('dry-run') === '1';
   const wantDebug = searchParams.get('debug') === '1';
 
   try {
@@ -259,23 +241,20 @@ export async function GET(req: NextRequest) {
     let totalSent = 0;
     const debug: any[] = [];
 
-    // =========================
-    // A) Rappels “complétion planning”
-    // =========================
+    // ===== A) Rappels “complétion planning” =====
     for (const p of periods) {
       const a = p.automation as AutomationRow | null;
       const periodId = p.id;
 
-      // --- Weekly (lundi 09:00 Europe/Paris)
+      // 1) Weekly (lundi 09:00 Paris)
       if (a?.weekly_reminder) {
-        const isMonday = nowParis.getUTCDay() === 1;      // 1 = Lundi
-        const is09 = nowParis.getUTCHours() === 9;        // 09:00 heure de Paris
+        const isMonday = nowParis.getUTCDay() === 1;
+        const is09     = nowParis.getUTCHours() === 9;
         if (wantDebug) debug.push({ type: 'weekly-check', periodId, parisDay: nowParis.getUTCDay(), parisHour: nowParis.getUTCHours(), isMonday, is09 });
         if (isMonday && is09) {
           const wk = weekKeyParis(now);
           const recips = await fetchRecipientsPlanning(periodId, wantDebug);
           totalToSend += recips.length;
-
           if (!dryRun) {
             const sent = await sendBulkIndividually(
               periodId, 'weekly', wk, recips,
@@ -290,13 +269,11 @@ export async function GET(req: NextRequest) {
             );
             totalSent += sent;
           }
-          if (wantDebug || dryRun) {
-            debug.push({ type: 'weekly', periodId, key: wk, recipients: recips.map(r => r.email) });
-          }
+          if (wantDebug || dryRun) debug.push({ type: 'weekly', periodId, key: wk, recipients: recips.map(r => r.email) });
         }
       }
 
-      // --- Deadlines planning (H-48, H-24, H-1)
+      // 2) Deadlines (H-48 / H-24 / H-1)
       {
         const deadline = a?.avail_deadline ? new Date(a.avail_deadline) : new Date(p.close_at);
         const hoursBefore = Array.isArray(a?.extra_reminder_hours) && a!.extra_reminder_hours!.length
@@ -305,14 +282,13 @@ export async function GET(req: NextRequest) {
 
         for (const h of hoursBefore) {
           const windowStart = new Date(deadline.getTime() - h * 3600 * 1000);
-          const windowEnd = new Date(windowStart.getTime() + 3600 * 1000); // fenêtre 1h
-          const inWindow = now >= windowStart && now < windowEnd;
+          const windowEnd   = new Date(windowStart.getTime() + 3600 * 1000);
+          const inWindow    = now >= windowStart && now < windowEnd;
           if (wantDebug) debug.push({ type: 'deadline-check', periodId, h, deadline: deadline.toISOString(), windowStart: windowStart.toISOString(), windowEnd: windowEnd.toISOString(), now: now.toISOString(), inWindow });
           if (inWindow) {
-            const key = `${deadline.toISOString()}:${h}h`; // window_key unique par (deadline, h)
+            const key = `${deadline.toISOString()}:${h}h`;
             const recips = await fetchRecipientsPlanning(periodId, wantDebug);
             totalToSend += recips.length;
-
             if (!dryRun) {
               const type = h === 48 ? 'deadline_48' : h === 24 ? 'deadline_24' : 'deadline_1';
               const sent = await sendBulkIndividually(
@@ -328,23 +304,20 @@ export async function GET(req: NextRequest) {
               );
               totalSent += sent;
             }
-            if (wantDebug || dryRun) {
-              debug.push({ type: 'deadline', h, periodId, key, recipients: recips.map(r => r.email) });
-            }
+            if (wantDebug || dryRun) debug.push({ type: 'deadline', h, periodId, key, recipients: recips.map(r => r.email) });
           }
         }
       }
 
-      // --- Opening (optionnel) — si tu veux auto-envoyer à l’ouverture (fenêtre 1h)
+      // 3) Opening (fenêtre 1h après avail_open_at)
       if (a?.avail_open_at) {
-        const openAt = new Date(a.avail_open_at);
+        const openAt   = new Date(a.avail_open_at);
         const inWindow = now >= openAt && (now.getTime() - openAt.getTime()) < 3600 * 1000;
         if (wantDebug) debug.push({ type: 'opening-check', periodId, openAt: openAt.toISOString(), now: now.toISOString(), inWindow });
         if (inWindow) {
           const windowKey = isoHourKey(openAt); // UTC hour key
           const recips = await fetchRecipientsPlanning(periodId, wantDebug);
           totalToSend += recips.length;
-
           if (!dryRun) {
             const sent = await sendBulkIndividually(
               periodId, 'opening', windowKey, recips,
@@ -356,42 +329,34 @@ export async function GET(req: NextRequest) {
             );
             totalSent += sent;
           }
-          if (wantDebug || dryRun) {
-            debug.push({ type: 'opening', periodId, key: windowKey, recipients: recips.map(r => r.email) });
-          }
+          if (wantDebug || dryRun) debug.push({ type: 'opening', periodId, key: windowKey, recipients: recips.map(r => r.email) });
         }
       }
     }
 
-    // =========================
-    // B) Rappels “garde demain” (J-1 par assignment publié)
-    // =========================
+    // ===== B) Rappels “garde demain” (J-1) =====
     {
       const assignments = await fetchAssignmentsJ1(now);
       totalToSend += assignments.length;
-
       for (const a of assignments) {
-        const windowKey = `slot:${a.slot_id}`; // 1 seul envoi par slot/assignment
+        const windowKey = `slot:${a.slot_id}`;
         const already = await alreadyLogged(a.period_id, 'assignment_j1', windowKey, a.email);
         if (already) continue;
 
         if (!dryRun) {
           const start = new Date(a.start_ts);
-          const end = new Date(a.end_ts);
+          const end   = new Date(a.end_ts);
           const tpl = emailTemplates.assignment_j1({ start, end, kind: a.kind });
           const ok = await sendOne(a.email, tpl.subject, tpl.html);
           if (ok) {
             totalSent += 1;
             await logSent(a.period_id, 'assignment_j1', windowKey, a.email, {
-              slot_id: a.slot_id,
-              start_ts: a.start_ts,
-              end_ts: a.end_ts
+              slot_id: a.slot_id, start_ts: a.start_ts, end_ts: a.end_ts
             });
           }
           await sleep(MIN_GAP_MS);
         }
       }
-
       if (wantDebug || dryRun) {
         debug.push({
           type: 'assignment_j1',
