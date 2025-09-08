@@ -54,6 +54,7 @@ export default function AutomationSettingsClient() {
   }
 
   async function loadSettings() {
+    if (!periodId) { setMsg('Saisir un period_id pour charger'); return; }
     setLoading(true);
     setMsg('');
     try {
