@@ -28,44 +28,115 @@ type PeriodRow = {
   label: string;
   open_at: string;
   close_at: string;
+  // champs effectifs (via v_effective_automation)
+  effective?: {
+    avail_open_at?: string | null;
+    avail_deadline?: string | null;
+    weekly_reminder?: boolean | null;
+    extra_reminder_hours?: number[] | null;
+    planning_generate_before_days?: number | null;
+    tz?: string | null;
+  } | null;
+};
+
+type EffectiveInfo = {
+  avail_open_at?: string | null;
+  avail_deadline?: string | null;
+  weekly_reminder?: boolean;
+  extra_reminder_hours?: number[];
+  planning_generate_before_days?: number;
+  lock_assignments?: boolean;
+  tz?: string;
+} | null;
+
+const DEFAULT_SETTINGS: Settings = {
+  period_id: null,
+  avail_open_at: null,
+  avail_deadline: null,
+  weekly_reminder: true,
+  extra_reminder_hours: [48, 24, 1],
+  planning_generate_before_days: 21,
+  lock_assignments: false,
 };
 
 export default function AutomationSettingsPage() {
   const [periodId, setPeriodId] = useState<string>('');
-  const [settings, setSettings] = useState<Settings>({
-    period_id: null,
-    avail_open_at: null,
-    avail_deadline: null,
-    weekly_reminder: true,
-    extra_reminder_hours: [48, 24, 1],
-    planning_generate_before_days: 21,
-    lock_assignments: false,
-  });
+  const [settings, setSettings] = useState<Settings>({ ...DEFAULT_SETTINGS });
 
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<string>('');
 
-  // --- nouveautés : liste des périodes pour ne plus taper l'UUID ---
+  // --- nouveautés : liste des périodes + effectifs pour ne plus taper l'UUID et voir les bonnes dates ---
   const [periods, setPeriods] = useState<PeriodRow[]>([]);
   const [periodsLoading, setPeriodsLoading] = useState(false);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        setPeriodsLoading(true);
-        const { data, error } = await supabase
-          .from('periods')
-          .select('id,label,open_at,close_at')
-          .order('open_at', { ascending: false })
-          .limit(30);
+  // Aperçu "effectif" de la période actuellement chargée (utile pour comprendre ce qui s’applique vraiment)
+  const [effective, setEffective] = useState<EffectiveInfo>(null);
 
-        if (!error && Array.isArray(data)) setPeriods(data as PeriodRow[]);
-      } finally {
-        setPeriodsLoading(false);
-      }
-    })();
+  useEffect(() => {
+    refreshPeriods();
   }, []);
+
+  async function refreshPeriods() {
+    try {
+      setPeriodsLoading(true);
+      // 1) periods
+      const { data: p, error } = await supabase
+        .from('periods')
+        .select('id,label,open_at,close_at')
+        .order('open_at', { ascending: false })
+        .limit(30);
+
+      if (error || !Array.isArray(p)) {
+        setPeriods([]);
+        return;
+      }
+
+      const base: PeriodRow[] = p as PeriodRow[];
+      const ids = base.map((x) => x.id);
+      if (ids.length === 0) {
+        setPeriods(base);
+        return;
+      }
+
+      // 2) effectifs (vue)
+      const { data: eff, error: e2 } = await supabase
+        .from('v_effective_automation')
+        .select(
+          'period_id, avail_open_at_effective, avail_deadline_effective, weekly_reminder_effective, extra_reminder_hours_effective, planning_generate_before_days_effective, tz_effective'
+        )
+        .in('period_id', ids);
+
+      if (e2 || !Array.isArray(eff)) {
+        setPeriods(base);
+        return;
+      }
+
+      const byId = new Map(
+        eff.map((e: any) => [
+          e.period_id,
+          {
+            avail_open_at: e.avail_open_at_effective ?? null,
+            avail_deadline: e.avail_deadline_effective ?? null,
+            weekly_reminder: e.weekly_reminder_effective ?? null,
+            extra_reminder_hours: e.extra_reminder_hours_effective ?? null,
+            planning_generate_before_days: e.planning_generate_before_days_effective ?? null,
+            tz: e.tz_effective ?? null,
+          },
+        ])
+      );
+
+      const merged = base.map((row) => ({
+        ...row,
+        effective: byId.get(row.id) || null,
+      }));
+
+      setPeriods(merged);
+    } finally {
+      setPeriodsLoading(false);
+    }
+  }
 
   // fetch avec token admin
   async function withAuthFetch(input: RequestInfo, init: RequestInit = {}) {
@@ -80,6 +151,14 @@ export default function AutomationSettingsPage() {
       },
       credentials: 'include',
     });
+  }
+
+  // Quand on change de période : reset visuel, on attend "Charger"
+  function onSelectPeriod(id: string) {
+    setPeriodId(id);
+    setMsg('');
+    setEffective(null);
+    setSettings({ ...DEFAULT_SETTINGS, period_id: id || null });
   }
 
   async function loadSettings() {
@@ -101,8 +180,13 @@ export default function AutomationSettingsPage() {
         throw new Error(text);
       }
       const data = await res.json();
-      const raw: any = data?.raw ?? null;
 
+      // 1) stocke l'“effective” pour l’aperçu
+      const eff = data?.effective || null;
+      setEffective(eff);
+
+      // 2) si "raw" (override) existe on le met, sinon on remet à “vide”
+      const raw: any = data?.raw ?? null;
       if (raw) {
         setSettings({
           period_id: raw.period_id ?? periodId,
@@ -116,8 +200,8 @@ export default function AutomationSettingsPage() {
           avail_deadline_before_days: raw.avail_deadline_before_days ?? undefined,
         });
       } else {
-        // pas d'override : on garde period_id + defaults
-        setSettings((s) => ({ ...s, period_id: periodId }));
+        // IMPORTANT : si pas d’override → on efface bien les inputs (évite l’impression que “ça ne change pas”)
+        setSettings({ ...DEFAULT_SETTINGS, period_id: periodId });
       }
     } catch (e: any) {
       setMsg(`Erreur chargement : ${e.message}`);
@@ -127,6 +211,10 @@ export default function AutomationSettingsPage() {
   }
 
   async function saveSettings() {
+    if (!periodId) {
+      setMsg('Sélectionne une période avant d’enregistrer.');
+      return;
+    }
     setSaving(true);
     setMsg('');
     try {
@@ -148,6 +236,11 @@ export default function AutomationSettingsPage() {
       }
       await res.json();
       setMsg('Réglages enregistrés ✅');
+
+      // 1) recharge l’aperçu effectif de la période (pour voir le résultat)
+      await loadSettings();
+      // 2) rafraîchit le tableau du bas (pour refléter les “effectifs”)
+      await refreshPeriods();
     } catch (e: any) {
       setMsg(`Erreur enregistrement : ${e.message}`);
     } finally {
@@ -187,7 +280,7 @@ export default function AutomationSettingsPage() {
         <input
           list="period-list"
           value={periodId}
-          onChange={(e) => setPeriodId(e.target.value)}
+          onChange={(e) => onSelectPeriod(e.target.value)}
           placeholder="UUID de période (ou choisir dans la liste)"
           className="w-full rounded-md border px-3 py-2"
         />
@@ -196,7 +289,7 @@ export default function AutomationSettingsPage() {
             <option
               key={p.id}
               value={p.id}
-              label={`${p.label} — ouvr. ${fmtShort(p.open_at)} · deadline ${fmtShort(p.close_at)}`}
+              label={`${p.label} — ouvr. ${fmtShort(p.effective?.avail_open_at || p.open_at)} · deadline ${fmtShort(p.effective?.avail_deadline || p.close_at)}`}
             />
           ))}
         </datalist>
@@ -212,6 +305,20 @@ export default function AutomationSettingsPage() {
         </div>
       </div>
 
+      {/* Aperçu des réglages effectifs */}
+      {effective && (
+        <div className="rounded-xl border border-emerald-800/60 bg-emerald-900/20 p-4">
+          <h2 className="text-lg font-semibold text-emerald-200 mb-2">Réglages effectifs (lecture seule)</h2>
+          <ul className="text-sm text-emerald-100 space-y-1">
+            <li><b>Ouverture :</b> {fmt(effective.avail_open_at)}</li>
+            <li><b>Deadline :</b> {fmt(effective.avail_deadline)}</li>
+            <li><b>Rappel hebdo :</b> {effective.weekly_reminder ? 'actif' : 'inactif'}</li>
+            <li><b>Rappels -h :</b> {effective.extra_reminder_hours?.join(', ') || '—'}</li>
+            <li><b>Fuseau :</b> {effective.tz || 'Europe/Paris'}</li>
+          </ul>
+        </div>
+      )}
+
       {/* Formulaire d’override pour la période sélectionnée */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div>
@@ -224,7 +331,7 @@ export default function AutomationSettingsPage() {
             }
             className="w-full rounded-md border px-3 py-2"
           />
-          <p className="text-xs text-zinc-400 mt-1">Laisse vide pour hériter de la période.</p>
+          <p className="text-xs text-zinc-400 mt-1">Laisse vide pour hériter du global/période.</p>
         </div>
 
         <div>
@@ -237,7 +344,7 @@ export default function AutomationSettingsPage() {
             }
             className="w-full rounded-md border px-3 py-2"
           />
-          <p className="text-xs text-zinc-400 mt-1">Laisse vide pour hériter de la période.</p>
+          <p className="text-xs text-zinc-400 mt-1">Laisse vide pour hériter du global/période.</p>
         </div>
 
         <div className="flex items-center gap-2">
@@ -308,7 +415,7 @@ export default function AutomationSettingsPage() {
 
       {!!msg && <p className="text-sm">{msg}</p>}
 
-      {/* Tableau des périodes récentes (aperçu utile) */}
+      {/* Tableau des périodes récentes (avec dates effectives) */}
       <div className="rounded-xl border border-zinc-700 bg-zinc-800/60 p-4">
         <h2 className="text-lg font-semibold text-white mb-2">Périodes récentes</h2>
         {periods.length === 0 ? (
@@ -319,8 +426,8 @@ export default function AutomationSettingsPage() {
               <thead>
                 <tr className="text-left text-zinc-400">
                   <th className="py-2 pr-4">Label</th>
-                  <th className="py-2 pr-4">Ouverture</th>
-                  <th className="py-2 pr-4">Deadline</th>
+                  <th className="py-2 pr-4">Ouverture (effective)</th>
+                  <th className="py-2 pr-4">Deadline (effective)</th>
                   <th className="py-2 pr-4">Action</th>
                 </tr>
               </thead>
@@ -328,11 +435,11 @@ export default function AutomationSettingsPage() {
                 {periods.map((p) => (
                   <tr key={p.id} className="border-t border-zinc-700">
                     <td className="py-2 pr-4 text-zinc-200">{p.label}</td>
-                    <td className="py-2 pr-4">{fmt(p.open_at)}</td>
-                    <td className="py-2 pr-4">{fmt(p.close_at)}</td>
+                    <td className="py-2 pr-4">{fmt(p.effective?.avail_open_at || p.open_at)}</td>
+                    <td className="py-2 pr-4">{fmt(p.effective?.avail_deadline || p.close_at)}</td>
                     <td className="py-2 pr-4">
                       <button
-                        onClick={() => setPeriodId(p.id)}
+                        onClick={() => onSelectPeriod(p.id)}
                         className="px-2 py-1 rounded-md bg-zinc-700 hover:bg-zinc-600 text-white"
                       >
                         Sélectionner
