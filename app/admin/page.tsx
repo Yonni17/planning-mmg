@@ -37,7 +37,7 @@ export default function AdminHome() {
           </p>
         </Link>
         <Link
-          href="/admin/automation"
+          href="/admin/automation-settings"
           className="block rounded-xl border border-zinc-700 bg-zinc-800/60 p-6 text-center hover:bg-zinc-800 hover:border-blue-500 transition-colors"
           >
             <h2 className="text-lg font-semibold text-white mb-2">Paramètres & Rappels</h2>
