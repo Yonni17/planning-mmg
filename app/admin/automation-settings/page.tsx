@@ -1,27 +1,30 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
 
+// ---- Supabase client (client-side, anon key) ----
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 );
 
+// ---- Types ----
 type Settings = {
   period_id: string | null;
-  avail_open_at: string | null;
-  avail_deadline: string | null;
-  weekly_reminder: boolean;
-  extra_reminder_hours: number[];   // ex: [48,24,1]
-  planning_generate_before_days: number; // ex: 21
-  lock_assignments: boolean;
+  avail_open_at: string | null;           // ISO string (YYYY-MM-DDTHH:mm)
+  avail_deadline: string | null;          // ISO string
+  weekly_reminder: boolean;               // send weekly nudges
+  extra_reminder_hours: number[];         // e.g. [48,24,1]
+  planning_generate_before_days: number;  // e.g. 21
+  lock_assignments: boolean;              // lock after generation
 };
 
+type ApiError = { error?: string };
+
+// ---- Page ----
 export default function AutomationSettingsPage() {
-  const [periodId, setPeriodId] = useState<string>('');
-  const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const [periodId, setPeriodId] = useState<string>(''); // empty = global
   const [settings, setSettings] = useState<Settings>({
     period_id: null,
     avail_open_at: null,
@@ -31,8 +34,12 @@ export default function AutomationSettingsPage() {
     planning_generate_before_days: 21,
     lock_assignments: false,
   });
-  const [message, setMessage] = useState<string>('');
 
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState<string>('');
+
+  // Util to always send Bearer token to admin API routes
   async function withAuthFetch(input: RequestInfo, init: RequestInit = {}) {
     const { data } = await supabase.auth.getSession();
     const token = data.session?.access_token;
@@ -40,50 +47,90 @@ export default function AutomationSettingsPage() {
       ...init,
       headers: {
         ...(init.headers || {}),
-        Authorization: `Bearer ${token}`,
+        Authorization: token ? `Bearer ${token}` : '',
         'Content-Type': 'application/json',
       },
       credentials: 'include',
     });
   }
 
+  // Load settings (global or per-period)
   async function loadSettings() {
     setLoading(true);
-    setMessage('');
+    setMsg('');
     try {
       const url = `/api/admin/automation-settings${periodId ? `?period_id=${encodeURIComponent(periodId)}` : ''}`;
       const res = await withAuthFetch(url);
-      if (!res.ok) throw new Error(`GET ${res.status}`);
-      const data = await res.json();
-      setSettings(data);
+      if (!res.ok) {
+        let text = `GET ${res.status}`;
+        try {
+          const j = (await res.json()) as ApiError;
+          if (j?.error) text += ` — ${j.error}`;
+        } catch {}
+        throw new Error(text);
+      }
+      const data = (await res.json()) as Settings;
+      // Normalize arrays (in case API returns null)
+      setSettings({
+        ...data,
+        extra_reminder_hours: Array.isArray(data.extra_reminder_hours)
+          ? data.extra_reminder_hours
+          : [],
+      });
     } catch (e: any) {
-      setMessage(`Erreur chargement : ${e.message}`);
+      setMsg(`Erreur chargement : ${e.message}`);
     } finally {
       setLoading(false);
     }
   }
 
+  // Save settings
   async function saveSettings() {
     setSaving(true);
-    setMessage('');
+    setMsg('');
     try {
+      const body: Settings = {
+        ...settings,
+        period_id: periodId || null,
+      };
       const res = await withAuthFetch('/api/admin/automation-settings', {
         method: 'POST',
-        body: JSON.stringify({ ...settings, period_id: periodId || null }),
+        body: JSON.stringify(body),
       });
-      if (!res.ok) throw new Error(`POST ${res.status}`);
-      const data = await res.json();
-      setSettings(data);
-      setMessage('Réglages enregistrés ✅');
+      if (!res.ok) {
+        let text = `POST ${res.status}`;
+        try {
+          const j = (await res.json()) as ApiError;
+          if (j?.error) text += ` — ${j.error}`;
+        } catch {}
+        throw new Error(text);
+      }
+      const saved = (await res.json()) as Settings;
+      setSettings({
+        ...saved,
+        extra_reminder_hours: Array.isArray(saved.extra_reminder_hours)
+          ? saved.extra_reminder_hours
+          : [],
+      });
+      setMsg('Réglages enregistrés ✅');
     } catch (e: any) {
-      setMessage(`Erreur enregistrement : ${e.message}`);
+      setMsg(`Erreur enregistrement : ${e.message}`);
     } finally {
       setSaving(false);
     }
   }
 
-  async function testEmail(template: 'opening' | 'weekly' | 'deadline_48' | 'deadline_24' | 'deadline_1' | 'planning_ready') {
-    setMessage('');
+  // Trigger a test email for a given template
+  async function testEmail(
+    template:
+      | 'opening'
+      | 'weekly'
+      | 'deadline_48'
+      | 'deadline_24'
+      | 'deadline_1'
+      | 'planning_ready'
+  ) {
+    setMsg('');
     try {
       const email = prompt('Adresse destinataire test ?');
       if (!email) return;
@@ -92,12 +139,19 @@ export default function AutomationSettingsPage() {
         body: JSON.stringify({ to: email, template, period_id: periodId || null }),
       });
       const j = await res.json();
-      if (!res.ok) throw new Error(j?.error || `HTTP ${res.status}`);
-      setMessage('Email test envoyé ✅');
+      if (!res.ok) {
+        const err = j?.error ? `HTTP ${res.status} — ${j.error}` : `HTTP ${res.status}`;
+        throw new Error(err);
+      }
+      setMsg('Email test envoyé ✅');
     } catch (e: any) {
-      setMessage(`Erreur envoi test : ${e.message}`);
+      setMsg(`Erreur envoi test : ${e.message}`);
     }
   }
+
+  // Helpers for datetime-local inputs (they expect "YYYY-MM-DDTHH:mm")
+  const openAtValue = useMemo(() => toLocalInputValue(settings.avail_open_at), [settings.avail_open_at]);
+  const deadlineValue = useMemo(() => toLocalInputValue(settings.avail_deadline), [settings.avail_deadline]);
 
   useEffect(() => {
     loadSettings();
@@ -106,108 +160,184 @@ export default function AutomationSettingsPage() {
 
   return (
     <div className="max-w-3xl mx-auto p-6 space-y-6">
-      <h1 className="text-2xl font-semibold text-white">Automation & Rappels (emails)</h1>
+      <h1 className="text-2xl font-semibold">Automation & Rappels (emails)</h1>
 
+      {/* Scope selector */}
       <div className="space-y-2">
-        <label className="text-sm text-zinc-300">Période (UUID, vide = global)</label>
+        <label className="text-sm opacity-80">Période (UUID, vide = réglages globaux)</label>
         <input
           value={periodId}
           onChange={(e) => setPeriodId(e.target.value)}
           placeholder="UUID de période (optionnel)"
-          className="w-full rounded-md bg-zinc-900 border border-zinc-700 px-3 py-2 text-white"
+          className="w-full rounded-md border px-3 py-2"
         />
-        <button
-          onClick={loadSettings}
-          disabled={loading}
-          className="px-3 py-2 rounded-md bg-blue-600 hover:bg-blue-500 text-white"
-        >
-          {loading ? 'Chargement…' : 'Recharger'}
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={loadSettings}
+            disabled={loading}
+            className="px-3 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-500 disabled:opacity-50"
+          >
+            {loading ? 'Chargement…' : 'Recharger'}
+          </button>
+          <button
+            onClick={() => setPeriodId('')}
+            className="px-3 py-2 rounded-md bg-zinc-200 hover:bg-zinc-300"
+          >
+            Basculer sur global
+          </button>
+        </div>
       </div>
 
+      {/* Settings form */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div>
-          <label className="block text-sm text-zinc-300">Ouverture des dispos (ISO)</label>
+          <label className="block text-sm opacity-80">Ouverture des dispos</label>
           <input
             type="datetime-local"
-            value={settings.avail_open_at ?? ''}
-            onChange={(e) => setSettings(s => ({ ...s, avail_open_at: e.target.value || null }))}
-            className="w-full rounded-md bg-zinc-900 border border-zinc-700 px-3 py-2 text-white"
+            value={openAtValue}
+            onChange={(e) =>
+              setSettings((s) => ({ ...s, avail_open_at: fromLocalInputValue(e.target.value) }))
+            }
+            className="w-full rounded-md border px-3 py-2"
           />
+          <p className="text-xs opacity-60 mt-1">
+            Quand les médecins peuvent commencer à remplir leurs disponibilités.
+          </p>
         </div>
+
         <div>
-          <label className="block text-sm text-zinc-300">Deadline des dispos (ISO)</label>
+          <label className="block text-sm opacity-80">Deadline des dispos</label>
           <input
             type="datetime-local"
-            value={settings.avail_deadline ?? ''}
-            onChange={(e) => setSettings(s => ({ ...s, avail_deadline: e.target.value || null }))}
-            className="w-full rounded-md bg-zinc-900 border border-zinc-700 px-3 py-2 text-white"
+            value={deadlineValue}
+            onChange={(e) =>
+              setSettings((s) => ({ ...s, avail_deadline: fromLocalInputValue(e.target.value) }))
+            }
+            className="w-full rounded-md border px-3 py-2"
           />
+          <p className="text-xs opacity-60 mt-1">
+            Date/heure limite pour compléter ses disponibilités.
+          </p>
         </div>
+
         <div className="flex items-center gap-2">
           <input
             id="weekly"
             type="checkbox"
             checked={settings.weekly_reminder}
-            onChange={(e) => setSettings(s => ({ ...s, weekly_reminder: e.target.checked }))}
+            onChange={(e) => setSettings((s) => ({ ...s, weekly_reminder: e.target.checked }))}
           />
-          <label htmlFor="weekly" className="text-sm text-zinc-300">Rappel hebdo actif</label>
+          <label htmlFor="weekly" className="text-sm">
+            Rappel hebdomadaire actif
+          </label>
         </div>
+
         <div>
-          <label className="block text-sm text-zinc-300">Heures avant (rappels extra)</label>
+          <label className="block text-sm opacity-80">Heures avant (rappels extra)</label>
           <input
             value={settings.extra_reminder_hours.join(',')}
             onChange={(e) => {
-              const arr = e.target.value.split(',').map(v => Number(v.trim())).filter(v => Number.isFinite(v));
-              setSettings(s => ({ ...s, extra_reminder_hours: arr }));
+              const arr = e.target.value
+                .split(',')
+                .map((v) => Number(v.trim()))
+                .filter((v) => Number.isFinite(v));
+              setSettings((s) => ({ ...s, extra_reminder_hours: arr }));
             }}
             placeholder="ex: 48,24,1"
-            className="w-full rounded-md bg-zinc-900 border border-zinc-700 px-3 py-2 text-white"
+            className="w-full rounded-md border px-3 py-2"
           />
+          <p className="text-xs opacity-60 mt-1">
+            Enverra des rappels à J-2, J-1, H-1 avant la&nbsp;deadline.
+          </p>
         </div>
+
         <div>
-          <label className="block text-sm text-zinc-300">Jours avant génération planning</label>
+          <label className="block text-sm opacity-80">Jours avant génération planning</label>
           <input
             type="number"
             value={settings.planning_generate_before_days}
-            onChange={(e) => setSettings(s => ({ ...s, planning_generate_before_days: Number(e.target.value || 0) }))}
-            className="w-full rounded-md bg-zinc-900 border border-zinc-700 px-3 py-2 text-white"
+            onChange={(e) =>
+              setSettings((s) => ({
+                ...s,
+                planning_generate_before_days: Number(e.target.value || 0),
+              }))
+            }
+            className="w-full rounded-md border px-3 py-2"
           />
+          <p className="text-xs opacity-60 mt-1">
+            Le moteur peut générer le planning X jours avant le début de la période.
+          </p>
         </div>
+
         <div className="flex items-center gap-2">
           <input
             id="lock"
             type="checkbox"
             checked={settings.lock_assignments}
-            onChange={(e) => setSettings(s => ({ ...s, lock_assignments: e.target.checked }))}
+            onChange={(e) => setSettings((s) => ({ ...s, lock_assignments: e.target.checked }))}
           />
-          <label htmlFor="lock" className="text-sm text-zinc-300">Verrouiller assignations (post-génération)</label>
+          <label htmlFor="lock" className="text-sm">
+            Verrouiller les assignations après génération
+          </label>
         </div>
       </div>
 
-      <div className="flex gap-3">
+      {/* Actions */}
+      <div className="flex flex-wrap gap-3">
         <button
           onClick={saveSettings}
           disabled={saving}
-          className="px-4 py-2 rounded-md bg-green-600 hover:bg-green-500 text-white"
+          className="px-4 py-2 rounded-md bg-green-600 text-white hover:bg-green-500 disabled:opacity-50"
         >
           {saving ? 'Enregistrement…' : 'Enregistrer'}
         </button>
 
-        <button
-          onClick={() => testEmail('opening')}
-          className="px-3 py-2 rounded-md bg-zinc-800 hover:bg-zinc-700 text-white"
-        >
+        {/* Test buttons */}
+        <button onClick={() => testEmail('opening')} className="px-3 py-2 rounded-md bg-zinc-800 text-white">
           Test “Ouverture”
         </button>
-        <button onClick={() => testEmail('weekly')} className="px-3 py-2 rounded-md bg-zinc-800 hover:bg-zinc-700 text-white">Test “Hebdo”</button>
-        <button onClick={() => testEmail('deadline_48')} className="px-3 py-2 rounded-md bg-zinc-800 hover:bg-zinc-700 text-white">Test “-48h”</button>
-        <button onClick={() => testEmail('deadline_24')} className="px-3 py-2 rounded-md bg-zinc-800 hover:bg-zinc-700 text-white">Test “-24h”</button>
-        <button onClick={() => testEmail('deadline_1')} className="px-3 py-2 rounded-md bg-zinc-800 hover:bg-zinc-700 text-white">Test “-1h”</button>
-        <button onClick={() => testEmail('planning_ready')} className="px-3 py-2 rounded-md bg-zinc-800 hover:bg-zinc-700 text-white">Test “Planning prêt”</button>
+        <button onClick={() => testEmail('weekly')} className="px-3 py-2 rounded-md bg-zinc-800 text-white">
+          Test “Hebdo”
+        </button>
+        <button onClick={() => testEmail('deadline_48')} className="px-3 py-2 rounded-md bg-zinc-800 text-white">
+          Test “-48h”
+        </button>
+        <button onClick={() => testEmail('deadline_24')} className="px-3 py-2 rounded-md bg-zinc-800 text-white">
+          Test “-24h”
+        </button>
+        <button onClick={() => testEmail('deadline_1')} className="px-3 py-2 rounded-md bg-zinc-800 text-white">
+          Test “-1h”
+        </button>
+        <button onClick={() => testEmail('planning_ready')} className="px-3 py-2 rounded-md bg-zinc-800 text-white">
+          Test “Planning prêt”
+        </button>
       </div>
 
-      {!!message && <p className="text-sm text-amber-300">{message}</p>}
+      {!!msg && <p className="text-sm">{msg}</p>}
     </div>
   );
+}
+
+// ---- Helpers for <input type="datetime-local"> ----
+// Store ISO in DB (UTC or TZ'd), but show "YYYY-MM-DDTHH:mm" to the user.
+
+function toLocalInputValue(iso: string | null): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  // Convert to local "YYYY-MM-DDTHH:mm"
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
+}
+
+function fromLocalInputValue(local: string): string | null {
+  if (!local) return null;
+  // Assume local string -> ISO (keep local time; backend may treat as local TZ or convert to UTC)
+  const d = new Date(local);
+  if (isNaN(d.getTime())) return null;
+  return d.toISOString();
 }
