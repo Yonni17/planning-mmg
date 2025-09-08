@@ -8,7 +8,7 @@ import {
   emailDeadline24h,
   emailDeadline1h,
   emailPlanningReady,
-} from '@/lib/emailTemplates'; // <-- corrige l'import
+} from '@/lib/emailTemplates'; // utilise ton fichier existant
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
@@ -44,7 +44,7 @@ export async function POST(req: NextRequest) {
 
   const service = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
-  // Récupère label + deadline effective pour afficher dans les mails
+  // Récupère label + deadline effective pour affichage
   let periodLabel: string | undefined;
   let deadlineDate: Date | null = null;
 
@@ -94,10 +94,7 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    // Branche sur ton transport (Resend ou SMTP). Exemples:
-    // await resend.emails.send({ from: FROM, to, subject, html });
-    // ou
-    // await smtpTransport.sendMail({ from: FROM, to, subject, html, text });
+    // Branche sur ton transport réel (Resend/SMTP).
     // @ts-ignore
     await sendMail({ from: FROM, to, subject, html, text });
     return NextResponse.json({ ok: true });
