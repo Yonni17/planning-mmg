@@ -60,7 +60,9 @@ export async function POST(req: NextRequest) {
   }
 
   // Construit le mail selon le template demandé
-  let subject: string, html: string, text?: string;
+  let subject: string;
+  let html: string;
+  let text: string | undefined;
 
   switch (template as string) {
     case 'opening': {
