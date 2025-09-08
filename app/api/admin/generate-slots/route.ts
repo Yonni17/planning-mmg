@@ -146,6 +146,15 @@ export async function POST(req: NextRequest) {
       `${y}-12-25`, // Noël
     ];
     const holidaysSet = new Set<string>();
+    // ✅ par défaut on active les fériés fixes si non précisé
+    const useAutoHolidays = (body.autoHolidays !== false);
+    if (useAutoHolidays) {
+      for (const y of years) for (const d of autoFixedFr(y)) holidaysSet.add(d);
+}
+
+// fériés saisis manuellement (toujours pris en compte)
+for (const d of body.holidays ?? []) holidaysSet.add(d);
+
     if (body.autoHolidays) for (const y of years) for (const d of autoFixedFr(y)) holidaysSet.add(d);
     for (const d of body.holidays ?? []) holidaysSet.add(d);
 
