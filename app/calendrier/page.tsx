@@ -234,7 +234,8 @@ export default function CalendrierPage() {
     }));
 
     try {
-      const { error } = await supabase.from('availability').upsert(payload);
+      // IMPORTANT: expliciter onConflict (PK composite)
+      const { error } = await supabase.from('availability').upsert(payload, { onConflict: 'user_id,slot_id' });
       if (error) throw error;
       pendingIdsRef.current = new Set();
     } catch {
@@ -254,12 +255,64 @@ export default function CalendrierPage() {
     debounceRef.current = window.setTimeout(flushSave, 500);
   };
 
+  // Flush en sortie de page / onglet caché pour ne pas perdre de clics
+  useEffect(() => {
+    const handleBeforeUnload = () => { flushSave(); };
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') flushSave();
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // --------- HELPERS ---------
+  async function ensureMonthRow(pid: string, uid: string, mKey: string) {
+    // Crée la ligne doctor_period_months si absente (non verrouillée)
+    const { error } = await supabase
+      .from('doctor_period_months')
+      .upsert(
+        { user_id: uid, period_id: pid, month: mKey, locked: false, opted_out: false },
+        { onConflict: 'user_id,period_id,month' }
+      );
+    if (error) throw error;
+  }
+
   // --------- ACTIONS ---------
-  const toggleLocal = (slotId: string, locked: boolean) => {
-    if (locked) return; // si verrouillé : on bloque le toggle
+  const toggleLocal = async (slotId: string, locked: boolean) => {
+    if (locked || !userId || !periodId) return;
+
+    // 1) UI optimiste
     setAvailability(prev => ({ ...prev, [slotId]: !prev[slotId] }));
-    pendingIdsRef.current.add(slotId);
-    scheduleSave();
+
+    // 2) Déduire le mois (YYYY-MM) du slot pour assurer la ligne parent
+    const s = slots.find(x => x.id === slotId);
+    const mKey = s ? yyyymm(new Date(s.date + 'T00:00:00')) : currentMonthKey;
+
+    try {
+      if (mKey) await ensureMonthRow(periodId, userId, mKey);
+
+      // 3) Écrire immédiatement CE slot (persistance inter-pages)
+      const nextVal = !availability[slotId];
+      const { error } = await supabase
+        .from('availability')
+        .upsert(
+          { user_id: userId, slot_id: slotId, available: nextVal },
+          { onConflict: 'user_id,slot_id' }
+        );
+      if (error) throw error;
+
+      // 4) On conserve le batch pour d’éventuels multi-clics rapides
+      pendingIdsRef.current.add(slotId);
+      scheduleSave();
+    } catch (e) {
+      // rollback UI si l’écriture échoue
+      setAvailability(prev => ({ ...prev, [slotId]: !!prev[slotId] }));
+      console.error('availability upsert error', e);
+    }
   };
 
   const validateMonth = async (mKey: string) => {
