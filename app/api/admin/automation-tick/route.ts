@@ -13,19 +13,45 @@ const MAX_RETRIES = 3;
 
 // ---------- Utils ----------
 const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
-const toParis = (d: Date) => new Date(d.toLocaleString('en-US', { timeZone: PARIS_TZ }));
+
+/**
+ * Convertit un Date "now" en date équivalente dans un fuseau donné,
+ * puis retourne un Date UTC construit à partir des composantes locales.
+ * Cela permet d'utiliser .getUTCHours() / .getUTCDay() comme si c'était local.
+ */
+function toTZ(d: Date, tz: string) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(d);
+  const map: Record<string, string> = Object.fromEntries(parts.map(p => [p.type, p.value]));
+  return new Date(Date.UTC(
+    Number(map.year),
+    Number(map.month) - 1,
+    Number(map.day),
+    Number(map.hour),
+    Number(map.minute),
+    Number(map.second)
+  ));
+}
 
 function isoHourKey(d: Date) {
   // Clé d'heure UTC: YYYY-MM-DDTHH
   return d.toISOString().slice(0, 13);
 }
 function weekKeyParis(d: Date) {
-  const local = toParis(d);
-  // Semaine ISO approximative suffisante pour clé d'idempotence
-  const year = local.getFullYear();
+  const local = toTZ(d, PARIS_TZ);
+  // Semaine ISO approchée suffisante pour clé d'idempotence
+  const year = local.getUTCFullYear();
   const jan4 = new Date(Date.UTC(year, 0, 4));
-  const dow = (local.getDay() + 6) % 7; // 0=Lundi
-  const thursday = new Date(Date.UTC(local.getFullYear(), local.getMonth(), local.getDate() - dow + 3));
+  const dow = local.getUTCDay(); // 0=Dim, 1=Lun...
+  const thursday = new Date(Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() - ((dow + 6) % 7) + 3));
   const week = Math.floor(1 + (thursday.getTime() - jan4.getTime()) / 604800000);
   return `${year}-W${String(week).padStart(2, '0')}`;
 }
@@ -55,7 +81,6 @@ async function logSent(periodId: string, eventType: string, windowKey: string, t
 
 async function sendOne(to: string, subject: string, html: string) {
   let attempt = 0;
-  // retries + backoff
   while (attempt < MAX_RETRIES) {
     attempt++;
     try {
@@ -102,20 +127,34 @@ async function sendBulkIndividually(
 }
 
 // --- Récup: périodes + automation ---
+type AutomationRow = {
+  avail_open_at?: string | null;
+  avail_deadline?: string | null;
+  avail_deadline_before_days?: number | null;
+  weekly_reminder?: boolean | null;
+  extra_reminder_hours?: number[] | null;
+};
+function pickAutomationRow(a: any): AutomationRow | null {
+  if (!a) return null;
+  // Supabase peut renvoyer un objet ou un tableau d'une seule ligne
+  return Array.isArray(a) ? (a[0] ?? null) : a;
+}
 async function fetchActivePeriods() {
-  // periods + period_automation (INNER: on exige une ligne d'automatisation)
   const { data, error } = await supabase
     .from('periods')
     .select('id, label, open_at, close_at, timezone, generate_at, period_automation!inner(*)');
   if (error) throw error;
-  return (data ?? []).map((p: any) => ({
-    id: p.id as string,
-    label: p.label as string,
-    tz: (p.timezone as string) || PARIS_TZ,
-    open_at: new Date(p.open_at),
-    close_at: new Date(p.close_at),
-    automation: p.period_automation
-  }));
+  return (data ?? []).map((p: any) => {
+    const automation = pickAutomationRow(p.period_automation);
+    return {
+      id: p.id as string,
+      label: p.label as string,
+      tz: (p.timezone as string) || PARIS_TZ,
+      open_at: new Date(p.open_at),
+      close_at: new Date(p.close_at),
+      automation, // <- normalisé
+    };
+  }).filter(p => !!p.automation);
 }
 
 // --- Destinataires: rappels planning (non verrouillés) ---
@@ -141,7 +180,6 @@ async function fetchRecipientsPlanning(periodId: string, wantDebug = false) {
   }
 
   // 2) Fallback: jointure directe doctor_period_months + profiles
-  //    Logique: docteurs ayant AU MOINS un mois non verrouillé et pas opt-out sur la période.
   {
     const { data, error } = await supabase
       .from('doctor_period_months')
@@ -215,6 +253,7 @@ export async function GET(req: NextRequest) {
 
   try {
     const now = new Date();
+    const nowParis = toTZ(now, PARIS_TZ);
     const periods = await fetchActivePeriods();
     let totalToSend = 0;
     let totalSent = 0;
@@ -224,14 +263,14 @@ export async function GET(req: NextRequest) {
     // A) Rappels “complétion planning”
     // =========================
     for (const p of periods) {
-      const a = p.automation;
+      const a = p.automation as AutomationRow | null;
       const periodId = p.id;
 
-      // 1) Weekly (lundi 09:00 Europe/Paris)
-      if (a.weekly_reminder) {
-        const local = toParis(now);
-        const isMonday = local.getDay() === 1;
-        const is09 = local.getHours() === 9;
+      // --- Weekly (lundi 09:00 Europe/Paris)
+      if (a?.weekly_reminder) {
+        const isMonday = nowParis.getUTCDay() === 1;      // 1 = Lundi
+        const is09 = nowParis.getUTCHours() === 9;        // 09:00 heure de Paris
+        if (wantDebug) debug.push({ type: 'weekly-check', periodId, parisDay: nowParis.getUTCDay(), parisHour: nowParis.getUTCHours(), isMonday, is09 });
         if (isMonday && is09) {
           const wk = weekKeyParis(now);
           const recips = await fetchRecipientsPlanning(periodId, wantDebug);
@@ -243,7 +282,7 @@ export async function GET(req: NextRequest) {
               () => {
                 const tpl = emailTemplates.weekly({
                   periodLabel: p.label,
-                  deadlineAt: a.avail_deadline ?? p.close_at
+                  deadlineAt: a.avail_deadline ? new Date(a.avail_deadline) : p.close_at
                 });
                 return { subject: tpl.subject, html: tpl.html, meta: { type: 'weekly' } };
               },
@@ -257,46 +296,51 @@ export async function GET(req: NextRequest) {
         }
       }
 
-      // 2) Deadlines planning (H-48, H-24, H-1)
-      const deadline = a.avail_deadline ? new Date(a.avail_deadline) : new Date(p.close_at);
-      const hoursBefore = Array.isArray(a.extra_reminder_hours) && a.extra_reminder_hours.length
-        ? a.extra_reminder_hours
-        : [48, 24, 1];
+      // --- Deadlines planning (H-48, H-24, H-1)
+      {
+        const deadline = a?.avail_deadline ? new Date(a.avail_deadline) : new Date(p.close_at);
+        const hoursBefore = Array.isArray(a?.extra_reminder_hours) && a!.extra_reminder_hours!.length
+          ? a!.extra_reminder_hours!
+          : [48, 24, 1];
 
-      for (const h of hoursBefore) {
-        const windowStart = new Date(deadline.getTime() - h * 3600 * 1000);
-        const windowEnd = new Date(windowStart.getTime() + 3600 * 1000); // fenêtre 1h
-        if (now >= windowStart && now < windowEnd) {
-          const key = `${deadline.toISOString()}:${h}h`; // window_key unique par (deadline, h)
+        for (const h of hoursBefore) {
+          const windowStart = new Date(deadline.getTime() - h * 3600 * 1000);
+          const windowEnd = new Date(windowStart.getTime() + 3600 * 1000); // fenêtre 1h
+          const inWindow = now >= windowStart && now < windowEnd;
+          if (wantDebug) debug.push({ type: 'deadline-check', periodId, h, deadline: deadline.toISOString(), windowStart: windowStart.toISOString(), windowEnd: windowEnd.toISOString(), now: now.toISOString(), inWindow });
+          if (inWindow) {
+            const key = `${deadline.toISOString()}:${h}h`; // window_key unique par (deadline, h)
+            const recips = await fetchRecipientsPlanning(periodId, wantDebug);
+            totalToSend += recips.length;
 
-          const recips = await fetchRecipientsPlanning(periodId, wantDebug);
-          totalToSend += recips.length;
-
-          if (!dryRun) {
-            const type = h === 48 ? 'deadline_48' : h === 24 ? 'deadline_24' : 'deadline_1';
-            const sent = await sendBulkIndividually(
-              periodId, type, key, recips,
-              () => {
-                const tpl =
-                  h === 48 ? emailTemplates.deadline_48({ periodLabel: p.label, deadlineAt: deadline }) :
-                  h === 24 ? emailTemplates.deadline_24({ periodLabel: p.label, deadlineAt: deadline }) :
-                             emailTemplates.deadline_1({ periodLabel: p.label, deadlineAt: deadline });
-                return { subject: tpl.subject, html: tpl.html, meta: { deadlineAt: deadline.toISOString(), h } };
-              },
-              dryRun
-            );
-            totalSent += sent;
-          }
-          if (wantDebug || dryRun) {
-            debug.push({ type: 'deadline', h, periodId, key, recipients: recips.map(r => r.email) });
+            if (!dryRun) {
+              const type = h === 48 ? 'deadline_48' : h === 24 ? 'deadline_24' : 'deadline_1';
+              const sent = await sendBulkIndividually(
+                periodId, type, key, recips,
+                () => {
+                  const tpl =
+                    h === 48 ? emailTemplates.deadline_48({ periodLabel: p.label, deadlineAt: deadline }) :
+                    h === 24 ? emailTemplates.deadline_24({ periodLabel: p.label, deadlineAt: deadline }) :
+                               emailTemplates.deadline_1({ periodLabel: p.label, deadlineAt: deadline });
+                  return { subject: tpl.subject, html: tpl.html, meta: { deadlineAt: deadline.toISOString(), h } };
+                },
+                dryRun
+              );
+              totalSent += sent;
+            }
+            if (wantDebug || dryRun) {
+              debug.push({ type: 'deadline', h, periodId, key, recipients: recips.map(r => r.email) });
+            }
           }
         }
       }
 
-      // 3) Opening (optionnel) — si tu veux auto-envoyer à l’ouverture (fenêtre 1h)
-      if (a.avail_open_at) {
+      // --- Opening (optionnel) — si tu veux auto-envoyer à l’ouverture (fenêtre 1h)
+      if (a?.avail_open_at) {
         const openAt = new Date(a.avail_open_at);
-        if (now >= openAt && (now.getTime() - openAt.getTime()) < 3600 * 1000) {
+        const inWindow = now >= openAt && (now.getTime() - openAt.getTime()) < 3600 * 1000;
+        if (wantDebug) debug.push({ type: 'opening-check', periodId, openAt: openAt.toISOString(), now: now.toISOString(), inWindow });
+        if (inWindow) {
           const windowKey = isoHourKey(openAt); // UTC hour key
           const recips = await fetchRecipientsPlanning(periodId, wantDebug);
           totalToSend += recips.length;
