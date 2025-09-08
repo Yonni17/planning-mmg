@@ -2,25 +2,15 @@ name: ping vercel cron endpoint
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # tous les jours 06:00 UTC (08:00 Paris en été, 07:00 en hiver)
-  workflow_dispatch: {}
+    - cron: '0 6 * * *'   # tous les jours 06:00 UTC
+  workflow_dispatch: {}    # bouton "Run workflow" manuel
 
 jobs:
   call:
     runs-on: ubuntu-latest
-    env:
-      BASE_URL: https://planning-mmg.ovh
-      CRON_KEY: ${{ secrets.CRON_SECRET }}
     steps:
-      - name: Vérifier la présence du secret
+      - name: Call the endpoint
         run: |
-          if [ -z "$CRON_KEY" ]; then
-            echo "::error::CRON_SECRET manquant dans les secrets du dépôt"; exit 1; fi
-      - name: Appeler /api/admin/cron
-        run: |
-          set -euo pipefail
-          URL="$BASE_URL/api/admin/cron?key=$CRON_KEY"
-          echo "→ $URL"
-          curl -fsS -L --max-time 25 --retry 3 --retry-connrefused \
-               -w "\nHTTP %{http_code}\n" \
-               "$URL"
+          curl -fsS "https://planning-mmg.ovh/api/admin/cron?key=$CRON_SECRET"
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
