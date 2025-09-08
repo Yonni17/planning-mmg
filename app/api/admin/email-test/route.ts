@@ -9,8 +9,9 @@ import {
   emailDeadline1h,
   emailPlanningReady,
 } from '@/lib/emailTemplates';
-// si tu utilises un transport centralisé :
-import { sendEmail } from '@/lib/email'; // sinon remplace par ton sendMail
+
+// Si tu as un transport centralisé, remplace cette ligne par:
+// import { sendEmail } from '@/lib/email';
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
@@ -37,7 +38,7 @@ async function requireAdmin(req: NextRequest) {
   return { ok: true as const };
 }
 
-// --- NEW: normalisation des alias ---
+// ---- Normalisation des alias de template ----
 type Canonical =
   | 'opening'
   | 'weekly'
@@ -52,16 +53,10 @@ function normalizeTemplate(input: string | undefined | null): Canonical | null {
 
   if (['opening', 'ouverture'].includes(t)) return 'opening';
   if (['weekly', 'hebdo', 'rappel', 'rappel_hebdo', 'rappel-hebdo'].includes(t)) return 'weekly';
-  if (
-    ['deadline_48','deadline-48','48','48h','-48h','j-2','j2','h-48','d-48','fin-48'].includes(t)
-  ) return 'deadline_48';
-  if (
-    ['deadline_24','deadline-24','24','24h','-24h','j-1','j1','h-24','d-24','fin-24'].includes(t)
-  ) return 'deadline_24';
-  if (
-    ['deadline_1','deadline-1','1','1h','-1h','h-1','fin-1','h1'].includes(t)
-  ) return 'deadline_1';
-  if (['planning_ready','planning','planning-prep','planning_ready'].includes(t)) return 'planning_ready';
+  if (['deadline_48', 'deadline-48', '48', '48h', '-48h', 'j-2', 'h-48', 'd-48', 'fin-48'].includes(t)) return 'deadline_48';
+  if (['deadline_24', 'deadline-24', '24', '24h', '-24h', 'j-1', 'h-24', 'd-24', 'fin-24'].includes(t)) return 'deadline_24';
+  if (['deadline_1', 'deadline-1', '1', '1h', '-1h', 'h-1', 'fin-1'].includes(t)) return 'deadline_1';
+  if (['planning_ready', 'planning', 'planning-prep'].includes(t)) return 'planning_ready';
 
   return null;
 }
@@ -78,9 +73,10 @@ export async function POST(req: NextRequest) {
 
   const service = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
-  // label + deadline effective pour le rendu
+  // Récupère label + deadline effective pour les mails "deadline_xx"
   let periodLabel: string | undefined;
   let deadlineDate: Date | null = null;
+
   if (period_id) {
     const { data: eff, error } = await service
       .from('v_effective_automation')
@@ -121,9 +117,13 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // envoi
   try {
-    await sendEmail({ to, subject, html, text, fromOverride: FROM });
+    // Si tu as un transport unifié:
+    // await sendEmail({ to, subject, html, text, fromOverride: FROM });
+
+    // Sinon garde ton "placeholder" historique:
+    // @ts-ignore
+    await sendMail({ from: FROM, to, subject, html, text });
     return NextResponse.json({ ok: true, template: canonical });
   } catch (e: any) {
     return bad(500, e.message || 'send error');
