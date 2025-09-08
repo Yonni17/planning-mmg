@@ -323,3 +323,51 @@ export function emailPlanningReady(opts: {
   const subject = brandSubject(subjectCore);
   return { subject, html, text };
 }
+export function emailAssignmentJ1(opts: {
+  name?: string;
+  start: Date;
+  end: Date;
+  kind?: string;
+  siteUrl: string;
+}) {
+  const title = 'Rappel – Vous avez une garde demain';
+  const pre   = 'Petit rappel automatique : garde programmée demain.';
+  const name  = opts.name || 'Docteur';
+
+  const w = (d: Date) => d.toLocaleString('fr-FR', {
+    timeZone: 'Europe/Paris',
+    weekday: 'long', year: 'numeric', month: 'long', day: '2-digit',
+    hour: '2-digit', minute: '2-digit',
+  });
+
+  const contentHtml = `
+    <p>Bonjour ${escapeHtml(name)},</p>
+    <p>Pour rappel, vous avez une <b>garde demain</b>.</p>
+    <ul style="margin:8px 0 12px 18px;padding:0;">
+      <li>Début : <b>${escapeHtml(w(opts.start))}</b></li>
+      <li>Fin : <b>${escapeHtml(w(opts.end))}</b></li>
+      ${opts.kind ? `<li>Type : ${escapeHtml(opts.kind)}</li>` : ''}
+    </ul>
+    <p>Merci de vous assurer de votre disponibilité et de votre arrivée à l’heure.</p>
+  `;
+
+  const html = layout({
+    title,
+    preheader: pre,
+    contentHtml,
+    primaryCta: { href: `${opts.siteUrl}/agenda`, label: 'Mon planning' },
+  });
+
+  const text = baseText([
+    `Bonjour ${name},`,
+    '',
+    `Rappel : garde demain.`,
+    `Début : ${opts.start.toLocaleString('fr-FR', { timeZone: tz })}`,
+    `Fin   : ${opts.end.toLocaleString('fr-FR', { timeZone: tz })}`,
+    `Consulter : ${opts.siteUrl}/agenda`,
+  ]);
+
+  const subject = brandSubject('Rappel – garde demain');
+  return { subject, html, text };
+}
+

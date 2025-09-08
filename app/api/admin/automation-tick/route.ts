@@ -1,7 +1,7 @@
 // app/api/admin/automation-tick/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { getSupabaseAdmin } from '@/lib/supabaseAdmin'; // client "service role"
-import * as EmailTemplatesModule from '@/lib/emailTemplates'; // <-- import robuste
+import * as TPL from '@/lib/emailTemplates';            // <-- noms exacts des templates
 import { sendEmail } from '@/lib/email';
 
 export const dynamic = 'force-dynamic';
@@ -13,17 +13,16 @@ const supabase = getSupabaseAdmin();
 const PARIS_TZ = 'Europe/Paris';
 const MIN_GAP_MS = Number(process.env.EMAIL_MIN_GAP_MS ?? 700);
 const MAX_RETRIES = 3;
-
-// --------- Templates robustes (supporte named export OU default) ---------
-const TPL: any = (EmailTemplatesModule as any).emailTemplates ?? EmailTemplatesModule;
-function assertTpl(name: string) {
-  if (!TPL || typeof TPL[name] !== 'function') {
-    throw new Error(`Email template "${name}" introuvable (vérifie l'export dans lib/emailTemplates.ts)`);
-  }
-}
+// URL du site pour les liens dans les emails
+const SITE_URL =
+  process.env.NEXT_PUBLIC_SITE_URL ||
+  (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '') ||
+  'https://planning-mmg.ovh';
 
 // --------- Utils ---------
 const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
+
+/** Convertit un Date "now" en équivalent Europe/Paris, mais en Date UTC (pour getUTC*) */
 function toTZ(d: Date, tz: string) {
   const parts = new Intl.DateTimeFormat('en-GB', {
     timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
@@ -145,8 +144,7 @@ async function fetchActivePeriods() {
   }).filter(p => !!p.automation);
 }
 
-// --- Destinataires: on passe TOUJOURS par doctor_period_months + profiles ---
-// (on ne dépend plus de la vue qui incluait ton admin)
+// --- Destinataires: uniquement doctors avec au moins 1 mois non verrouillé ---
 async function fetchRecipientsPlanning(periodId: string, wantDebug = false) {
   const { data, error } = await supabase
     .from('doctor_period_months')
@@ -212,17 +210,21 @@ async function fetchAssignmentsJ1(now: Date) {
 // --- Route GET ---
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
-  const dryRun   = searchParams.get('dry-run') === '1';
+  const dryRun    = searchParams.get('dry-run') === '1';
   const wantDebug = searchParams.get('debug') === '1';
 
   try {
-    // sanity check templates (évite le "reading 'opening'")
-    assertTpl('opening');
-    assertTpl('weekly');
-    assertTpl('deadline_48');
-    assertTpl('deadline_24');
-    assertTpl('deadline_1');
-    assertTpl('assignment_j1');
+    // Sanity check des templates nécessaires (noms réels)
+    const must = [
+      'emailOpening', 'emailWeeklyReminder',
+      'emailDeadline48h', 'emailDeadline24h', 'emailDeadline1h',
+      'emailAssignmentJ1',
+    ] as const;
+    for (const k of must) {
+      if (!(k in TPL) || typeof (TPL as any)[k] !== 'function') {
+        throw new Error(`Email template manquant: ${k} (dans lib/emailTemplates.ts)`);
+      }
+    }
 
     const now = new Date();
     const nowParis = toTZ(now, PARIS_TZ);
@@ -251,7 +253,11 @@ export async function GET(req: NextRequest) {
             const sent = await sendBulkIndividually(
               periodId, 'weekly', wk, recips,
               () => {
-                const tpl = TPL.weekly({ periodLabel: p.label, deadlineAt: a.avail_deadline ? new Date(a.avail_deadline) : p.close_at });
+                const tpl = TPL.emailWeeklyReminder({
+                  periodLabel: p.label,
+                  deadline: a.avail_deadline ? new Date(a.avail_deadline) : p.close_at,
+                  siteUrl: SITE_URL,
+                });
                 return { subject: tpl.subject, html: tpl.html, meta: { type: 'weekly' } };
               },
               dryRun
@@ -280,14 +286,17 @@ export async function GET(req: NextRequest) {
             totalToSend += recips.length;
 
             if (!dryRun) {
-              const type = h === 48 ? 'deadline_48' : h === 24 ? 'deadline_24' : 'deadline_1';
               const sent = await sendBulkIndividually(
-                periodId, type, key, recips,
+                periodId,
+                h === 48 ? 'deadline_48' : h === 24 ? 'deadline_24' : 'deadline_1',
+                key,
+                recips,
                 () => {
+                  const base = { periodLabel: p.label, deadline, siteUrl: SITE_URL };
                   const tpl =
-                    h === 48 ? TPL.deadline_48({ periodLabel: p.label, deadlineAt: deadline }) :
-                    h === 24 ? TPL.deadline_24({ periodLabel: p.label, deadlineAt: deadline }) :
-                               TPL.deadline_1 ({ periodLabel: p.label, deadlineAt: deadline });
+                    h === 48 ? TPL.emailDeadline48h(base) :
+                    h === 24 ? TPL.emailDeadline24h(base) :
+                               TPL.emailDeadline1h (base);
                   return { subject: tpl.subject, html: tpl.html, meta: { deadlineAt: deadline.toISOString(), h } };
                 },
                 dryRun
@@ -313,7 +322,12 @@ export async function GET(req: NextRequest) {
             const sent = await sendBulkIndividually(
               periodId, 'opening', windowKey, recips,
               () => {
-                const tpl = TPL.opening({ periodLabel: p.label });
+                const tpl = TPL.emailOpening({
+                  periodLabel: p.label,
+                  openAt,
+                  deadline: a.avail_deadline ? new Date(a.avail_deadline) : p.close_at,
+                  siteUrl: SITE_URL,
+                });
                 return { subject: tpl.subject, html: tpl.html, meta: { openAt: openAt.toISOString() } };
               },
               dryRun
@@ -338,7 +352,7 @@ export async function GET(req: NextRequest) {
         if (!dryRun) {
           const start = new Date(a.start_ts);
           const end   = new Date(a.end_ts);
-          const tpl = TPL.assignment_j1({ start, end, kind: a.kind });
+          const tpl = TPL.emailAssignmentJ1({ start, end, kind: a.kind, siteUrl: SITE_URL });
           const ok = await sendOne(a.email, tpl.subject, tpl.html);
           if (ok) {
             totalSent += 1;
