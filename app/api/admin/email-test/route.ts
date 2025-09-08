@@ -1,64 +1,110 @@
 // app/api/admin/email-test/route.ts
 import { NextRequest, NextResponse } from 'next/server';
-import { createClient } from '@supabase/supabase-js';
+import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
 import {
-  emailOpening, emailWeeklyReminder, emailDeadline48h, emailDeadline24h, emailDeadline1h, emailPlanningReady,
+  emailOpening,
+  emailWeeklyReminder,
+  emailDeadline,
+  emailPlanningReady,
 } from '@/lib/emailTemplates';
-import { sendEmail } from '@/lib/email';
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-const FROM = process.env.PLANNING_FROM_EMAIL || process.env.SMTP_FROM || 'MMG <no-reply@example.com>';
-const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || process.env.SITE_URL || 'https://planning-mmg.ovh';
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-function bad(status: number, error: string) { return NextResponse.json({ error }, { status }); }
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const FROM_EMAIL = process.env.PLANNING_FROM_EMAIL || 'planning@send.planning-mmg.ovh';
+const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000';
+
+function getBearer(req: NextRequest) {
+  const h = req.headers.get('authorization') || '';
+  if (h.toLowerCase().startsWith('bearer ')) return h.slice(7).trim();
+  return null;
+}
 
 async function requireAdmin(req: NextRequest) {
-  const authHeader = req.headers.get('authorization') || '';
-  const anon = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { global: { headers: { Authorization: authHeader } }, auth: { persistSession: false } });
-  const { data: u } = await anon.auth.getUser();
-  if (!u?.user) return { ok: false as const, error: 'Unauthenticated' };
-  const service = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
-  const { data: prof } = await service.from('profiles').select('role').eq('user_id', u.user.id).maybeSingle();
-  if (!prof || prof.role !== 'admin') return { ok: false as const, error: 'Forbidden' };
-  return { ok: true as const };
+  const token = getBearer(req);
+  if (!token) return { error: 'Unauthorized' as const };
+  const supa = getSupabaseAdmin();
+  const { data: u, error } = await supa.auth.getUser(token);
+  if (error || !u?.user) return { error: 'Unauthorized' as const };
+  const { data: isAdmin, error: aErr } = await supa.rpc('is_admin', { uid: u.user.id });
+  if (aErr || !isAdmin) return { error: 'Forbidden' as const };
+  return { supa };
 }
 
 export async function POST(req: NextRequest) {
-  const admin = await requireAdmin(req);
-  if (!admin.ok) return bad(401, admin.error);
+  const auth = await requireAdmin(req);
+  if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: 401 });
 
-  const { to, template, period_id } = await req.json();
-  if (!to || !template) return bad(400, 'Missing to/template');
-
-  const service = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
-
-  let periodLabel: string | undefined;
-  let deadlineDate: Date | null = null;
-  if (period_id) {
-    const { data: eff, error } = await service
-      .from('v_effective_automation').select('label, avail_deadline_effective').eq('period_id', period_id).maybeSingle();
-    if (error) return bad(500, error.message);
-    periodLabel = eff?.label || undefined;
-    deadlineDate = eff?.avail_deadline_effective ? new Date(eff.avail_deadline_effective) : null;
-  }
-
-  let subject = '', html = '', text: string | undefined;
-  switch (template as string) {
-    case 'opening': { const t = emailOpening({ periodLabel, openAt: null, deadline: deadlineDate, siteUrl: SITE_URL }); subject = t.subject; html = t.html; text = t.text; break; }
-    case 'weekly': { const t = emailWeeklyReminder({ periodLabel, deadline: deadlineDate, siteUrl: SITE_URL }); subject = t.subject; html = t.html; text = t.text; break; }
-    case 'deadline_48': { const t = emailDeadline48h({ periodLabel, deadline: deadlineDate, siteUrl: SITE_URL }); subject = t.subject; html = t.html; text = t.text; break; }
-    case 'deadline_24': { const t = emailDeadline24h({ periodLabel, deadline: deadlineDate, siteUrl: SITE_URL }); subject = t.subject; html = t.html; text = t.text; break; }
-    case 'deadline_1': { const t = emailDeadline1h({ periodLabel, deadline: deadlineDate, siteUrl: SITE_URL }); subject = t.subject; html = t.html; text = t.text; break; }
-    case 'planning_ready': { const t = emailPlanningReady({ periodLabel, siteUrl: SITE_URL }); subject = t.subject; html = t.html; text = t.text; break; }
-    default: return bad(400, 'Unknown template');
+  if (!RESEND_API_KEY) {
+    return NextResponse.json({ error: 'RESEND_API_KEY manquant' }, { status: 500 });
   }
 
   try {
-    await sendEmail({ to, subject, html, text, fromOverride: FROM });
-    return NextResponse.json({ ok: true });
+    const { to, template, period_id, name, hoursBefore } = await req.json();
+    const email = String(to || '').trim().toLowerCase();
+    if (!email || !email.includes('@')) return NextResponse.json({ error: 'Email invalide' }, { status: 400 });
+
+    // Récupère infos période/automation si besoin
+    let periodLabel: string | undefined;
+    let openAt: Date | null = null;
+    let deadline: Date | null = null;
+
+    if (period_id) {
+      const { supa } = auth;
+      const { data: p } = await supa.from('periods').select('label').eq('id', period_id).maybeSingle();
+      periodLabel = p?.label || undefined;
+
+      const { data: auto } = await supa
+        .from('period_automation')
+        .select('avail_open_at, avail_deadline')
+        .eq('period_id', period_id)
+        .maybeSingle();
+      openAt = auto?.avail_open_at ? new Date(auto.avail_open_at) : null;
+      deadline = auto?.avail_deadline ? new Date(auto.avail_deadline) : null;
+    }
+
+    // Construit le contenu selon le template
+    let subject = '';
+    let html = '';
+    let text = '';
+
+    if (template === 'opening') {
+      ({ subject, html, text } = emailOpening({ name, periodLabel, openAt, deadline, siteUrl: SITE_URL }));
+    } else if (template === 'weekly') {
+      ({ subject, html, text } = emailWeeklyReminder({ name, periodLabel, deadline, siteUrl: SITE_URL }));
+    } else if (template === 'deadline') {
+      const hb = Number.isFinite(hoursBefore) ? Number(hoursBefore) : null;
+      ({ subject, html, text } = emailDeadline({ name, periodLabel, deadline, hoursBefore: hb, siteUrl: SITE_URL }));
+    } else if (template === 'planning') {
+      ({ subject, html, text } = emailPlanningReady({ name, periodLabel, siteUrl: SITE_URL }));
+    } else {
+      return NextResponse.json({ error: 'template inconnu' }, { status: 400 });
+    }
+
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: FROM_EMAIL,
+        to: email,
+        subject,
+        html,
+        text,
+        // reply_to: 'support@...' // si tu veux centraliser les réponses
+      }),
+    });
+
+    if (!res.ok) {
+      const txt = await res.text();
+      return NextResponse.json({ error: `Resend: ${txt}` }, { status: 500 });
+    }
+
+    return NextResponse.json({ ok: true, subject });
   } catch (e: any) {
-    return bad(500, e.message || 'send error');
+    return NextResponse.json({ error: e?.message ?? 'Server error' }, { status: 500 });
   }
 }
