@@ -114,6 +114,20 @@ async function pickPeriod(supabase: ReturnType<typeof getSupabaseAdmin>, periodI
   return data ?? null;
 }
 
+// Throttle util: traite N items par seconde (default 2/s)
+async function processWithRate<T>(
+  items: T[],
+  perSecond = 2,
+  worker: (item: T, idx: number) => Promise<void>
+) {
+  const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
+  for (let i = 0; i < items.length; i += perSecond) {
+    const slice = items.slice(i, i + perSecond);
+    await Promise.allSettled(slice.map((it, k) => worker(it, i + k)));
+    if (i + perSecond < items.length) await delay(1000);
+  }
+}
+
 /* ---------------------------------- GET ----------------------------------- */
 export async function GET(req: NextRequest) {
   const auth = await requireAdminOrResponse(req);
@@ -312,7 +326,7 @@ export async function POST(req: NextRequest) {
 
     const results: Array<{ email: string; status: Result; error?: string }> = [];
 
-    for (const { email, full_name } of contacts) {
+    await processWithRate(contacts, 2, async ({ email, full_name }) => {
       // Noms dérivés
       const finalFullName = (full_name && full_name.trim()) || guessFullNameFromEmail(email);
       const parts = finalFullName.split(' ').filter(Boolean);
@@ -323,12 +337,12 @@ export async function POST(req: NextRequest) {
       const { data: exUser, error: exErr } = await supabase.rpc('user_exists_by_email', { in_email: email });
       if (exErr) {
         results.push({ email, status: 'insert_failed', error: exErr.message });
-        continue;
+        return;
       }
       if (exUser === true) {
         // On considère "déjà inscrit"
         results.push({ email, status: 'already_registered' });
-        continue;
+        return;
       }
 
       // B) déjà invité ?
@@ -339,14 +353,14 @@ export async function POST(req: NextRequest) {
         .maybeSingle();
       if (existErr) {
         results.push({ email, status: 'insert_failed', error: existErr.message });
-        continue;
+        return;
       }
       if (existing) {
         results.push({
           email,
           status: (existing as any).accepted_at ? 'already_accepted' : 'already_invited',
         });
-        continue;
+        return;
       }
 
       // C) insérer en base (table invites)
@@ -362,27 +376,19 @@ export async function POST(req: NextRequest) {
         } as any);
       if (insErr && (insErr as any).code !== '23505') {
         results.push({ email, status: 'insert_failed', error: insErr.message });
-        continue;
+        return;
       }
 
-      // D) envoyer l'invitation (pousse aussi les metadata pour le trigger/profil)
+      // D) envoyer l'invitation (mail automatique Supabase)
       try {
-        const meta = {
-          role,
-          first_name: firstFromFull,
-          last_name: lastFromFull,
-          full_name: finalFullName,
-        };
-
         const { error: inviteErr } = await supabase.auth.admin.inviteUserByEmail(email, {
-          data: meta,
+          data: { role, first_name: firstFromFull, last_name: lastFromFull, full_name: finalFullName },
           redirectTo: `${siteUrl}/auth/callback`,
         });
 
         if (inviteErr) {
-          console.error('INVITE_ERR', { email, message: inviteErr.message });
           results.push({ email, status: 'invite_failed', error: inviteErr.message });
-          continue;
+          return;
         }
 
         // OK
@@ -392,11 +398,10 @@ export async function POST(req: NextRequest) {
           .update({ status: 'sent', last_sent_at: new Date().toISOString() })
           .eq('email', email);
       } catch (e: any) {
-        console.error('INVITE_THROWN', { email, message: e?.message });
         results.push({ email, status: 'invite_failed', error: e?.message ?? 'unknown error' });
-        continue;
+        return;
       }
-    }
+    });
 
     return NextResponse.json({
       invited: results.filter(r => r.status === 'invited').length,

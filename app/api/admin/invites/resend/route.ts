@@ -1,4 +1,4 @@
-// app/api/admin/invites/route.ts
+// app/api/admin/invites/resend/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
 import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
@@ -136,7 +136,21 @@ async function pickPeriod(supabase: ReturnType<typeof getSupabaseAdmin>, periodI
   return data;
 }
 
-/** ================== GET: overview pour le tableau ================== */
+// Throttle util
+async function processWithRate<T>(
+  items: T[],
+  perSecond = 2,
+  worker: (item: T, idx: number) => Promise<void>
+) {
+  const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
+  for (let i = 0; i < items.length; i += perSecond) {
+    const slice = items.slice(i, i + perSecond);
+    await Promise.allSettled(slice.map((it, k) => worker(it, i + k)));
+    if (i + perSecond < items.length) await delay(1000);
+  }
+}
+
+/** ================== GET: overview pour le tableau (mêmes champs que /invites) ================== */
 export async function GET(req: NextRequest) {
   const auth = await requireAdminOrResponse(req);
   if (auth.errorResponse) return auth.errorResponse;
@@ -150,11 +164,10 @@ export async function GET(req: NextRequest) {
     }
 
     // months_total à partir des slots (dates uniques YYYY-MM)
-    const { data: slotDates, error: slotsErr } = await supabase
+    const { data: slotDates } = await supabase
       .from('slots')
       .select('date')
       .eq('period_id', periodRow.id);
-    if (slotsErr) throw slotsErr;
     const monthSet = new Set<string>();
     for (const s of slotDates ?? []) {
       if ((s as any).date) {
@@ -165,10 +178,9 @@ export async function GET(req: NextRequest) {
     const months_total = monthSet.size;
 
     // Invites
-    const { data: invites, error: invErr } = await supabase
+    const { data: invites } = await supabase
       .from('invites')
       .select('email,status,invited_at,accepted_at,last_sent_at,revoked_at,role,full_name');
-    if (invErr) throw invErr;
 
     // Users (Auth)
     const usersRes = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 });
@@ -191,11 +203,10 @@ export async function GET(req: NextRequest) {
     const userIds = users.map(u => u.id);
     let profMap = new Map<string, { first_name: string|null; last_name: string|null; role: string|null }>();
     if (userIds.length) {
-      const { data: profs, error: profErr } = await supabase
+      const { data: profs } = await supabase
         .from('profiles')
         .select('user_id, first_name, last_name, role')
         .in('user_id', userIds);
-      if (profErr) throw profErr;
       for (const p of profs ?? []) {
         profMap.set((p as any).user_id, {
           first_name: (p as any).first_name ?? null,
@@ -206,11 +217,10 @@ export async function GET(req: NextRequest) {
     }
 
     // Flags période
-    const { data: flags, error: fErr } = await supabase
+    const { data: flags } = await supabase
       .from('doctor_period_flags')
       .select('user_id, all_validated, opted_out')
       .eq('period_id', periodRow.id);
-    if (fErr) throw fErr;
     const flagMap = new Map<string, { all_validated: boolean; opted_out: boolean }>();
     for (const r of flags ?? []) {
       flagMap.set((r as any).user_id, {
@@ -220,11 +230,10 @@ export async function GET(req: NextRequest) {
     }
 
     // Compte des mois validés
-    const { data: months, error: mErr } = await supabase
+    const { data: months } = await supabase
       .from('doctor_period_months')
       .select('user_id, validated_at')
       .eq('period_id', periodRow.id);
-    if (mErr) throw mErr;
     const validatedCount = new Map<string, number>();
     for (const r of months ?? []) {
       const uid = (r as any).user_id as string;
@@ -286,52 +295,48 @@ export async function GET(req: NextRequest) {
       rows,
     });
   } catch (e: any) {
-    console.error('[admin/invites GET]', e);
+    console.error('[admin/invites RESEND GET]', e);
     return NextResponse.json({ error: e?.message ?? 'Server error' }, { status: 500 });
   }
 }
 
-/** ================== POST: envoyer des invitations ================== */
+/** ================== POST: Ré-inviter ==================
+ * Comportement demandé :
+ *  - Si l'utilisateur N'EXISTE PAS (pas de compte), on relance EXACTEMENT la même commande Supabase:
+ *    supabase.auth.admin.inviteUserByEmail(...) => renvoie l'email "invite" automatique.
+ *  - Si l'utilisateur EXISTE, Supabase ne renvoie pas le template "invite" à nouveau.
+ *    On envoie alors un email "magic link" via supabase.auth.signInWithOtp(...) (template Supabase).
+ * Le tout est throttlé à 2 req/s pour éviter les 429.
+ */
 export async function POST(req: NextRequest) {
+  const auth = await requireAdminOrResponse(req);
+  if (auth.errorResponse) return auth.errorResponse;
+  const supabase = auth.supabase;
+  const adminUserId = auth.userId!;
+
   try {
-    const auth = await requireAdminOrResponse(req);
-    if (auth.errorResponse) return auth.errorResponse;
-    const supabase = auth.supabase;
-    const adminUserId = auth.userId!;
-
     const body = await req.json().catch(() => ({}));
+    const contactsIn: any[] = Array.isArray(body?.contacts) ? body.contacts : [];
+    const emailsIn: any[] = Array.isArray(body?.emails) ? body.emails : [];
+    const role: 'doctor' | 'admin' = body?.role === 'admin' ? 'admin' : 'doctor';
 
-    // Nouveau : acceptons contacts[] {first_name,last_name,email}
-    const contactsIn: any[] = Array.isArray((body as any)?.contacts) ? (body as any).contacts : [];
-    const emailsIn: any[] = Array.isArray((body as any)?.emails) ? (body as any).emails : [];
-
-    const role: 'doctor' | 'admin' =
-      (body as any)?.role === 'admin' ? 'admin' : 'doctor';
-
-    // Normalisation : on construit une liste unique {email, full_name}
+    // Normalisation
     const map = new Map<string, { email: string; full_name?: string }>();
-
-    // a) depuis contacts[]
     for (const raw of contactsIn) {
       const em = String(raw?.email || '').trim().toLowerCase();
       const fn = String(raw?.first_name || '').trim();
       const ln = String(raw?.last_name || '').trim();
-      if (!em || !/\S+@\S+\.\S+/.test(em)) continue;
-
-      const full_name = (fn || ln) ? `${fn} ${ln}`.trim() : undefined;
-      if (!map.has(em)) map.set(em, { email: em, full_name });
-    }
-
-    // b) fallback: depuis emails[] (ancien format : strings "Nom <email>" ou "email")
-    for (const raw of emailsIn) {
-      const parsed = parseLineToContact(String(raw || ''));
-      if (parsed && parsed.email && !map.has(parsed.email)) {
-        map.set(parsed.email, parsed);
+      if (/\S+@\S+\.\S+$/.test(em)) {
+        const full_name = (fn || ln) ? `${fn} ${ln}`.trim() : undefined;
+        if (!map.has(em)) map.set(em, { email: em, full_name });
       }
     }
-
+    for (const raw of emailsIn) {
+      const p = parseLineToContact(String(raw || ''));
+      if (p?.email && !map.has(p.email)) map.set(p.email, p);
+    }
     const contacts = Array.from(map.values());
-    if (contacts.length === 0) {
+    if (!contacts.length) {
       return NextResponse.json({ error: 'Aucune entrée valide' }, { status: 400 });
     }
 
@@ -339,135 +344,76 @@ export async function POST(req: NextRequest) {
       process.env.NEXT_PUBLIC_SITE_URL ||
       (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:3000');
 
-    type Result =
-      | 'invited'
-      | 'already_registered'
-      | 'already_invited'
-      | 'already_accepted'
-      | 'insert_failed'
-      | 'invite_failed';
-
+    type Result = 'resent_invite' | 'resent_magiclink' | 'already_accepted' | 'failed';
     const results: Array<{ email: string; status: Result; error?: string }> = [];
 
-    for (const { email, full_name } of contacts) {
-      // A) déjà un compte ?
-      const { data: exUser, error: exErr } = await supabase.rpc(
-        'user_exists_by_email',
-        { in_email: email }
-      );
-      if (exErr) {
-        results.push({ email, status: 'insert_failed', error: exErr.message });
-        continue;
-      }
-      if (exUser === true) {
-        // Déjà user → envoyer un magic link (fallback auto)
-        const { data: linkData, error: linkErr } = await supabase.auth.admin.generateLink({
-          type: 'magiclink',
-          email,
-          options: { redirectTo: `${siteUrl}/auth/callback` },
-        });
-        if (linkErr) {
-          results.push({ email, status: 'invite_failed', error: linkErr.message });
-        } else {
-          results.push({ email, status: 'invited' });
-          await supabase
-            .from('invites')
-            .upsert({
-              email,
-              full_name: (full_name && full_name.trim()) || guessFullNameFromEmail(email),
-              role,
-              invited_by: adminUserId,
-              status: 'sent',
-              last_sent_at: new Date().toISOString(),
-              invited_at: new Date().toISOString(),
-            } as any, { onConflict: 'email' });
+    await processWithRate(contacts, 2, async ({ email, full_name }) => {
+      try {
+        // L'utilisateur existe-t-il ?
+        const { data: exists, error: exErr } = await supabase.rpc('user_exists_by_email', { in_email: email });
+        if (exErr) throw exErr;
+
+        if (exists === true) {
+          // Utilisateur EXISTANT -> mail automatique Supabase "magic link"
+          const { error: otpErr } = await supabase.auth.signInWithOtp({
+            email,
+            options: { emailRedirectTo: `${siteUrl}/auth/callback` },
+          });
+          if (otpErr) throw otpErr;
+
+          const finalFullName = (full_name && full_name.trim()) || guessFullNameFromEmail(email);
+          await supabase.from('invites').upsert({
+            email,
+            full_name: finalFullName,
+            role,
+            invited_by: adminUserId,
+            status: 'sent',
+            invited_at: new Date().toISOString(),
+            last_sent_at: new Date().toISOString(),
+          } as any, { onConflict: 'email' });
+
+          results.push({ email, status: 'resent_magiclink' });
+          return;
         }
-        continue;
-      }
 
-      // B) déjà invité ?
-      const { data: existing, error: existErr } = await supabase
-        .from('invites')
-        .select('id, accepted_at, status')
-        .eq('email', email)
-        .maybeSingle();
-      if (existErr) {
-        results.push({ email, status: 'insert_failed', error: existErr.message });
-        continue;
-      }
-      if (existing) {
-        if ((existing as any).accepted_at) {
-          results.push({ email, status: 'already_accepted' });
-        } else {
-          results.push({ email, status: 'already_invited' });
-        }
-        continue;
-      }
+        // Pas d'utilisateur -> Relance EXACTE de l'invitation Supabase
+        const finalFullName = (full_name && full_name.trim()) || guessFullNameFromEmail(email);
 
-      // C) insérer invite (assure-toi que les colonnes existent)
-      const finalFullName = (full_name && full_name.trim()) || guessFullNameFromEmail(email);
-
-      const { error: insErr } = await supabase
-        .from('invites')
-        .insert({
+        // Assure une ligne d’invite
+        await supabase.from('invites').upsert({
           email,
           full_name: finalFullName,
           role,
           invited_by: adminUserId,
           status: 'pending',
           invited_at: new Date().toISOString(),
-        } as any);
+        } as any, { onConflict: 'email' });
 
-      if (insErr && (insErr as any).code !== '23505') {
-        results.push({ email, status: 'insert_failed', error: insErr.message });
-        continue;
-      }
+        const { error: inviteErr } = await supabase.auth.admin.inviteUserByEmail(email, {
+          data: { role, full_name: finalFullName },
+          redirectTo: `${siteUrl}/auth/callback`,
+        });
+        if (inviteErr) throw inviteErr;
 
-      // D) envoi via Admin API: invite d'abord, fallback magiclink si déjà existant
-      try {
-        const { error: inviteErr } = await supabase.auth.admin.inviteUserByEmail(
-          email,
-          { data: { role }, redirectTo: `${siteUrl}/auth/callback` }
-        );
+        await supabase.from('invites')
+          .update({ status: 'sent', last_sent_at: new Date().toISOString() })
+          .eq('email', email);
 
-        if (inviteErr) {
-          const { data: linkData, error: linkErr } = await supabase.auth.admin.generateLink({
-            type: 'magiclink',
-            email,
-            options: { redirectTo: `${siteUrl}/auth/callback` },
-          });
-
-          if (linkErr) {
-            results.push({ email, status: 'invite_failed', error: linkErr.message });
-          } else {
-            results.push({ email, status: 'invited' });
-            await supabase
-              .from('invites')
-              .update({ status: 'sent', last_sent_at: new Date().toISOString() })
-              .eq('email', email);
-          }
-        } else {
-          results.push({ email, status: 'invited' });
-          await supabase
-            .from('invites')
-            .update({ status: 'sent', last_sent_at: new Date().toISOString() })
-            .eq('email', email);
-        }
+        results.push({ email, status: 'resent_invite' });
       } catch (e: any) {
-        results.push({ email, status: 'invite_failed', error: e?.message ?? 'unknown error' });
+        results.push({ email, status: 'failed', error: e?.message || 'unknown error' });
       }
-    }
+    });
 
     return NextResponse.json({
-      invited: results.filter((r) => r.status === 'invited').length,
-      already_registered: results.filter((r) => r.status === 'already_registered').length,
-      already_invited: results.filter((r) => r.status === 'already_invited').length,
-      already_accepted: results.filter((r) => r.status === 'already_accepted').length,
-      failed: results.filter((r) => r.status === 'invite_failed' || r.status === 'insert_failed').length,
+      resent_invite: results.filter(r => r.status === 'resent_invite').length,
+      resent_magiclink: results.filter(r => r.status === 'resent_magiclink').length,
+      already_accepted: results.filter(r => r.status === 'already_accepted').length,
+      failed: results.filter(r => r.status === 'failed').length,
       results,
     });
   } catch (e: any) {
-    console.error('[admin/invites POST]', e);
+    console.error('[admin/invites RESEND POST]', e);
     return NextResponse.json({ error: e?.message ?? 'Server error' }, { status: 500 });
   }
 }
