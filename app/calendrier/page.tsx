@@ -23,7 +23,7 @@ type Period = {
   // PostgREST renvoie souvent un tableau pour l'embed; on gère les 2 cas
   period_automation?: {
     avail_deadline: string | null;
-    avail_deadline_before_days: number | null;
+    avail_deadline_before_days: number | null; // non utilisé mais on le laisse typé
   } | Array<{
     avail_deadline: string | null;
     avail_deadline_before_days: number | null;
@@ -50,6 +50,17 @@ const KIND_LABEL: Record<Slot['kind'], string> = {
   SUN_20_24:     '20:00–00:00',
 };
 
+// Parser robuste pour timestamps DB ("YYYY-MM-DD HH:mm:ss+00" etc.)
+function parseDbTs(ts: string): Date {
+  if (!ts) return new Date(NaN);
+  let s = ts.trim();
+  s = s.replace(' ', 'T');                         // espace → T
+  s = s.replace(/([+-]\d{2})(\d{2})$/, '$1:$2');   // +0000 → +00:00
+  s = s.replace(/([+-]\d{2})$/, '$1:00');          // +00 → +00:00
+  if (!/[zZ]|[+-]\d{2}:\d{2}$/.test(s)) s += 'Z';  // force UTC si pas d’offset
+  return new Date(s);
+}
+
 function fmtInTZ(d: Date, tz = 'Europe/Paris') {
   return d.toLocaleString('fr-FR', {
     timeZone: tz,
@@ -66,15 +77,11 @@ function pickAutomationRow(p: Period) {
   return pa ?? null;
 }
 
-function computeDeadline(p: Period): { deadline: Date | null; ruleLabel: string } {
+// ⬇️ NE GARDE PLUS QUE avail_deadline ; si absent → null (rien n’est affiché)
+function computeDeadline(p: Period): Date | null {
   const pa = pickAutomationRow(p);
-  if (pa?.avail_deadline) {
-    return { deadline: new Date(pa.avail_deadline), ruleLabel: 'date fixée' };
-  }
-  const days = pa?.avail_deadline_before_days ?? 21; // fallback logique
-  const open = new Date(p.open_at);
-  const d = new Date(open.getTime() - days * 24 * 60 * 60 * 1000);
-  return { deadline: d, ruleLabel: `J-${days} avant l’ouverture` };
+  if (pa?.avail_deadline) return parseDbTs(pa.avail_deadline);
+  return null;
 }
 
 export default function CalendrierPage() {
@@ -92,7 +99,6 @@ export default function CalendrierPage() {
 
   // Countdown
   const [deadline, setDeadline] = useState<Date | null>(null);
-  const [deadlineRule, setDeadlineRule] = useState<string>(''); // ex: "J-21 avant l’ouverture" ou "date fixée"
   const [nowTick, setNowTick] = useState<number>(Date.now()); // tick chaque minute
 
   // autosave silencieux (debounce)
@@ -165,9 +171,7 @@ export default function CalendrierPage() {
         ]);
 
         const p = list.find(pp => pp.id === defId)!;
-        const { deadline: dl, ruleLabel } = computeDeadline(p);
-        setDeadline(dl);
-        setDeadlineRule(ruleLabel);
+        setDeadline(computeDeadline(p)); // ⬅️ uniquement avail_deadline
       }
 
       setLoading(false);
@@ -462,12 +466,9 @@ export default function CalendrierPage() {
                 loadMonthStatus(v, userId),
               ]);
               if (p) {
-                const { deadline: dl, ruleLabel } = computeDeadline(p);
-                setDeadline(dl);
-                setDeadlineRule(ruleLabel);
+                setDeadline(computeDeadline(p)); // ⬅️ uniquement avail_deadline
               } else {
                 setDeadline(null);
-                setDeadlineRule('');
               }
             }
           }}
@@ -548,38 +549,32 @@ export default function CalendrierPage() {
           </div>
         )}
       </div>
-{/* Compte à rebours — toujours visible */}
-{deadline ? (
-  <div className="rounded-lg border border-emerald-400/40 bg-emerald-50/30 dark:bg-emerald-900/20 px-4 py-3">
-    <div className="text-sm">
-      <span className="font-medium">Clôture des disponibilités : </span>
-      <span>{fmtInTZ(deadline, currentTz)}</span>
-      <span className="ml-2 text-xs text-zinc-500">
-        ({deadlineRule}{currentTz ? ` • ${currentTz}` : ''})
-      </span>
-    </div>
-    <div className="mt-1 font-semibold">
-      {(() => {
-        // force recalcul avec nowTick
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        const _ = nowTick;
-        const diff = deadline.getTime() - Date.now();
-        const past = diff <= 0;
-        const abs = Math.abs(diff);
-        const d = Math.floor(abs / (1000 * 60 * 60 * 24));
-        const h = Math.floor((abs / (1000 * 60 * 60)) % 24);
-        const m = Math.floor((abs / (1000 * 60)) % 60);
-        return past
-          ? <>⛔ La période de saisie des disponibilités est <span className="font-bold">fermée</span>.</>
-          : <>⏳ Il reste <span className="tabular-nums">{d} j {h} h {m} min</span>.</>;
-      })()}
-    </div>
-  </div>
-) : (
-  <div className="rounded-lg border border-zinc-300 dark:border-zinc-700 px-4 py-3 text-sm text-zinc-600 dark:text-zinc-300">
-    La date de clôture sera affichée dès qu’une période est sélectionnée.
-  </div>
-)}
+
+      {/* Compte à rebours — toujours visible si avail_deadline existe */}
+      {deadline && (
+        <div className="rounded-lg border border-emerald-400/40 bg-emerald-50/30 dark:bg-emerald-900/20 px-4 py-3">
+          <div className="text-sm">
+            <span className="font-medium">Clôture des disponibilités : </span>
+            <span>{fmtInTZ(deadline, currentTz)}</span>
+          </div>
+          <div className="mt-1 font-semibold">
+            {(() => {
+              // force recalcul avec nowTick
+              // eslint-disable-next-line @typescript-eslint/no-unused-vars
+              const _ = nowTick;
+              const diff = deadline.getTime() - Date.now();
+              const past = diff <= 0;
+              const abs = Math.abs(diff);
+              const d = Math.floor(abs / (1000 * 60 * 60 * 24));
+              const h = Math.floor((abs / (1000 * 60 * 60)) % 24);
+              const m = Math.floor((abs / (1000 * 60)) % 60);
+              return past
+                ? <>⛔ La période de saisie des disponibilités est <span className="font-bold">fermée</span>.</>
+                : <>⏳ Il reste <span className="tabular-nums">{d} j {h} h {m} min</span>.</>;
+            })()}
+          </div>
+        </div>
+      )}
 
       {/* Bloc d’instructions REPLIABLE */}
       <details
