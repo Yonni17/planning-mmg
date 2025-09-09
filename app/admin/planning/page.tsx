@@ -1,7 +1,7 @@
 // app/admin/planning/page.tsx
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, useRef, useLayoutEffect, useCallback } from 'react';
 import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(
@@ -85,6 +85,48 @@ export default function PlanningPage() {
   const [slots, setSlots] = useState<SlotRow[]>([]);
   const [avail, setAvail] = useState<Map<string, Set<string>>>(new Map());
   const [monthFilter, setMonthFilter] = useState<string>('');
+
+  // === Top scrollbar (ultra-safe) ===
+  const topScrollRef = useRef<HTMLDivElement | null>(null);
+  const bodyScrollRef = useRef<HTMLDivElement | null>(null);
+  const syncing = useRef(false);
+  const [scrollW, setScrollW] = useState(0);
+  const [clientW, setClientW] = useState(0);
+
+  const measure = useCallback(() => {
+    const el = bodyScrollRef.current;
+    if (!el) return;
+    setScrollW(el.scrollWidth);
+    setClientW(el.clientWidth);
+  }, []);
+  useLayoutEffect(() => { measure(); }, [measure]);
+  useEffect(() => {
+    const ro = new ResizeObserver(measure);
+    if (bodyScrollRef.current) ro.observe(bodyScrollRef.current);
+    window.addEventListener('resize', measure);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', measure);
+    };
+  }, [measure]);
+  const onTopScroll = () => {
+    if (syncing.current) return;
+    syncing.current = true;
+    if (bodyScrollRef.current && topScrollRef.current) {
+      bodyScrollRef.current.scrollLeft = topScrollRef.current.scrollLeft;
+    }
+    syncing.current = false;
+  };
+  const onBodyScroll = () => {
+    if (syncing.current) return;
+    syncing.current = true;
+    if (bodyScrollRef.current && topScrollRef.current) {
+      topScrollRef.current.scrollLeft = bodyScrollRef.current.scrollLeft;
+    }
+    syncing.current = false;
+  };
+  const showTopScrollbar = scrollW > clientW;
+  // === fin top scrollbar ===
 
   // Flag : existe-t-il déjà un planning enregistré en base ?
   const hasDbAssignments = !!(result && result.assignments && result.assignments.length > 0);
@@ -709,63 +751,77 @@ export default function PlanningPage() {
             </div>
           </div>
 
-          {/* Top scrollbar */}
-          <div className="overflow-x-auto">
-            <div className="overflow-x-auto rounded-lg border" style={{ direction: 'rtl' }}>
-              <div style={{ direction: 'ltr' }}>
-                <table className="min-w-max text-xs" style={{ backgroundColor: '#000', color: '#fff' }}>
-                  <thead>
-                    <tr>
-                      <th className="sticky left-0 z-10 px-2 py-2 text-left border-r" style={{ backgroundColor: '#000' }}>
-                        Créneau
-                      </th>
-                      {doctorOrderForGrid.map((uid) => (
-                        <th
-                          key={uid}
-                          className="px-1 py-2 text-center border-b border-l"
-                          style={{
-                            width: 28,
-                            minWidth: 28,
-                            maxWidth: 28,
-                            writingMode: 'vertical-rl',
-                            transform: 'rotate(180deg)',
-                            whiteSpace: 'nowrap',
-                          }}
-                          title={nameMap.get(uid) ?? uid}
-                        >
-                          {nameMap.get(uid) ?? uid}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredSlots.map((s) => {
-                      const label = `${formatDateLongFR(s.date)} — ${formatKindRange(s.kind)}`;
-                      return (
-                        <tr key={s.id}>
-                          <td className="sticky left-0 z-10 px-2 py-1 border-t border-r" style={{ backgroundColor: '#000' }}>
-                            {label}
-                          </td>
-                          {doctorOrderForGrid.map((uid) => {
-                            const ok = avail.get(s.id)?.has(uid) ?? false;
-                            return (
-                              <td
-                                key={uid}
-                                onClick={() => toggleAvailability(s.id, uid)}
-                                className="text-center align-middle border-t border-l cursor-pointer select-none hover:bg-white/10"
-                                style={{ width: 28, minWidth: 28, maxWidth: 28 }}
-                                title={ok ? 'Cliquer pour retirer la dispo' : 'Cliquer pour ajouter la dispo'}
-                              >
-                                {ok ? <span className="font-bold" style={{ color: '#22c55e' }}>✕</span> : <span> </span>}
-                              </td>
-                            );
-                          })}
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+          {/* Barre de scroll horizontale EN HAUT (synchro) */}
+          <div className="rounded-lg border bg-black text-white">
+            {showTopScrollbar && (
+              <div
+                ref={topScrollRef}
+                onScroll={onTopScroll}
+                className="w-full overflow-x-auto overflow-y-hidden"
+                style={{ height: 14 }}
+              >
+                <div style={{ width: scrollW, height: 1 }} />
               </div>
+            )}
+
+            {/* Conteneur principal scrollable (bas) */}
+            <div
+              ref={bodyScrollRef}
+              onScroll={onBodyScroll}
+              className="overflow-x-auto"
+            >
+              <table className="min-w-max text-xs" style={{ backgroundColor: '#000', color: '#fff' }}>
+                <thead>
+                  <tr>
+                    <th className="sticky left-0 z-10 px-2 py-2 text-left border-r" style={{ backgroundColor: '#000' }}>
+                      Créneau
+                    </th>
+                    {doctorOrderForGrid.map((uid) => (
+                      <th
+                        key={uid}
+                        className="px-1 py-2 text-center border-b border-l"
+                        style={{
+                          width: 28,
+                          minWidth: 28,
+                          maxWidth: 28,
+                          writingMode: 'vertical-rl',
+                          transform: 'rotate(180deg)',
+                          whiteSpace: 'nowrap',
+                        }}
+                        title={nameMap.get(uid) ?? uid}
+                      >
+                        {nameMap.get(uid) ?? uid}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredSlots.map((s) => {
+                    const label = `${formatDateLongFR(s.date)} — ${formatKindRange(s.kind)}`;
+                    return (
+                      <tr key={s.id}>
+                        <td className="sticky left-0 z-10 px-2 py-1 border-t border-r" style={{ backgroundColor: '#000' }}>
+                          {label}
+                        </td>
+                        {doctorOrderForGrid.map((uid) => {
+                          const ok = avail.get(s.id)?.has(uid) ?? false;
+                          return (
+                            <td
+                              key={uid}
+                              onClick={() => toggleAvailability(s.id, uid)}
+                              className="text-center align-middle border-t border-l cursor-pointer select-none hover:bg-white/10"
+                              style={{ width: 28, minWidth: 28, maxWidth: 28 }}
+                              title={ok ? 'Cliquer pour retirer la dispo' : 'Cliquer pour ajouter la dispo'}
+                            >
+                              {ok ? <span className="font-bold" style={{ color: '#22c55e' }}>✕</span> : <span> </span>}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             </div>
           </div>
 
