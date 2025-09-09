@@ -50,6 +50,31 @@ const KIND_LABEL: Record<Slot['kind'], string> = {
   SUN_20_24:     '20:00–00:00',
 };
 
+
+// --- DEBUG helpers ---
+function rawAvailDeadline(p?: Period | null): string | null {
+  if (!p) return null;
+  const pa = Array.isArray(p.period_automation) ? p.period_automation[0] : p.period_automation;
+  return pa?.avail_deadline ?? null;
+}
+{/* DEBUG PANEL */}
+{debugMode && debugState && (
+  <div
+    className="fixed bottom-3 right-3 z-50 max-w-[90vw] md:max-w-[520px]
+               rounded-lg border border-amber-400/50 bg-amber-50 text-amber-900
+               shadow-lg p-3 text-xs dark:bg-amber-900/20 dark:text-amber-200"
+  >
+    <div className="font-semibold mb-1">DEBUG période</div>
+    <pre className="whitespace-pre-wrap break-words m-0">
+      {JSON.stringify(debugState, null, 2)}
+    </pre>
+    <div className="mt-1 opacity-70">
+      Astuce : <code>localStorage.setItem('mmg-debug','1')</code> pour le garder actif.
+    </div>
+  </div>
+)}
+
+
 // Parser robuste pour timestamps DB ("YYYY-MM-DD HH:mm:ss+00" etc.)
 function parseDbTs(ts: string): Date {
   if (!ts) return new Date(NaN);
@@ -91,6 +116,32 @@ export default function CalendrierPage() {
   const [periods, setPeriods] = useState<Period[]>([]);
   const [periodId, setPeriodId] = useState<string>('');
   const [periodTz, setPeriodTz] = useState<string>('Europe/Paris');
+  // Mode debug activable par ?debug=1 ou localStorage('mmg-debug'='1')
+const debugMode =
+  typeof window !== 'undefined' &&
+  (new URLSearchParams(window.location.search).has('debug') ||
+   localStorage.getItem('mmg-debug') === '1');
+
+const debugState = debugMode ? {
+  periodId,
+  periodLabel: currentPeriod?.label ?? null,
+  tz: currentTz,
+  rawAvailDeadline: rawAvailDeadline(currentPeriod),           // valeur brute venant de period_automation
+  computedDeadlineISO: deadline ? deadline.toISOString() : null, // date après parse
+  nowISO: new Date().toISOString(),
+  months: monthsInPeriod.map(m => m.key),
+  slotsCount: slots.length,
+} : null;
+
+// Log console utile quand debug on
+if (debugMode && typeof window !== 'undefined') {
+  // évite de spammer : on log à chaque rendu mais c'est voulu pour comparer
+  // l’ID de période + la deadline brute vs computed
+  // (retire si tu trouves ça trop verbeux)
+  // eslint-disable-next-line no-console
+  console.table([debugState]);
+}
+
   const [slots, setSlots] = useState<Slot[]>([]);
   const [availability, setAvailability] = useState<Record<string, boolean>>({});
   const [monthStatus, setMonthStatus] = useState<Record<string, MonthStatus>>({});
