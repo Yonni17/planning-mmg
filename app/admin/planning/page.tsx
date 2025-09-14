@@ -288,7 +288,7 @@ export default function PlanningPage() {
         candidates: avail.get(s.id)?.size ?? 0,
       }));
 
-    // Payload minimal (candidates_by_slot sera (re)calculé après via useEffect quand avail sera prêt)
+    // Payload minimal
     assignments.sort((a, b) => {
       const d = String(a.date ?? '').localeCompare(String(b.date ?? ''));
       if (d !== 0) return d;
@@ -302,7 +302,7 @@ export default function PlanningPage() {
       assignments,
       runs: [{ seed: 0, total_score: assignments.length, holes: holes_list.length }],
       holes_list,
-      candidates_by_slot: undefined, // on laisse vide ici
+      candidates_by_slot: undefined,
     };
 
     setEdited({});
@@ -336,11 +336,10 @@ export default function PlanningPage() {
     return slots.filter((s) => s.date.startsWith(monthFilter));
   }, [slots, monthFilter]);
 
-  // === recalculer candidates_by_slot dès que avail/slots/profiles changent ===
+  // Recalculer candidates_by_slot dès que avail/slots/profiles changent
   useEffect(() => {
     if (!result) return;
 
-    // Construit une map candidats { slotId -> [{user_id, name}] }
     const buildCandidates = (): CandidatesBySlot => {
       const out: CandidatesBySlot = {};
       for (const s of slots) {
@@ -353,7 +352,6 @@ export default function PlanningPage() {
       return out;
     };
 
-    // Compare sommairement pour éviter les boucles d’updates inutiles
     const shallowEqual = (a?: CandidatesBySlot, b?: CandidatesBySlot) => {
       if (!a && !b) return true;
       if (!a || !b) return false;
@@ -405,7 +403,6 @@ export default function PlanningPage() {
         return String(a.kind ?? '').localeCompare(String(b.kind ?? ''));
       });
 
-      // On garde candidates_by_slot du backend si présent, sinon le useEffect ci-dessus le comblera
       setResult({ ...json, assignments: sorted });
     } catch (e: any) {
       alert(e?.message ?? 'Erreur');
@@ -441,7 +438,6 @@ export default function PlanningPage() {
       const json = await res.json();
       if (!res.ok) throw new Error(json?.error ?? "Erreur d'enregistrement");
 
-      // Recharge depuis la base pour afficher d’office
       await hydrateAssignmentsFromDB(periodId);
       alert(`Assignations enregistrées (${json.inserted}) ✅`);
     } catch (e: any) {
@@ -475,19 +471,18 @@ export default function PlanningPage() {
   // Répartition (avec colonnes Semaine / Weekend-Férié)
   const doctorRows = useMemo(() => {
     const count = new Map<string, number>();
-    const weekCnt = new Map<string, number>();       // NEW
-    const weekendCnt = new Map<string, number>();    // NEW
+    const weekCnt = new Map<string, number>();
+    const weekendCnt = new Map<string, number>();
 
     const allUserIds = new Set<string>();
     for (const p of profiles) allUserIds.add(p.user_id);
     for (const [u] of targets) allUserIds.add(u);
     for (const set of avail.values()) for (const u of set) allUserIds.add(u);
 
-    // init
     for (const u of allUserIds) {
       count.set(u, 0);
-      weekCnt.set(u, 0);       // NEW
-      weekendCnt.set(u, 0);    // NEW
+      weekCnt.set(u, 0);
+      weekendCnt.set(u, 0);
     }
 
     if (result) {
@@ -495,7 +490,6 @@ export default function PlanningPage() {
         const uid = edited[a.slot_id] ?? a.user_id;
         count.set(uid, (count.get(uid) ?? 0) + 1);
 
-        // Semaine vs Weekend/Férié
         if (isWeekendKind(a.kind)) {
           weekendCnt.set(uid, (weekendCnt.get(uid) ?? 0) + 1);
         } else if (a.kind) {
@@ -513,8 +507,8 @@ export default function PlanningPage() {
 
     const rows = Array.from(allUserIds).map((u) => {
       const assigned = count.get(u) ?? 0;
-      const assignedWeek = weekCnt.get(u) ?? 0;        // NEW
-      const assignedWeekend = weekendCnt.get(u) ?? 0;  // NEW
+      const assignedWeek = weekCnt.get(u) ?? 0;
+      const assignedWeekend = weekendCnt.get(u) ?? 0;
       const target = targets.get(u) ?? 5;
       const targetLabel = target === 5 ? 'Max' : String(target);
       const dispos = availCount.get(u) ?? 0;
@@ -523,8 +517,8 @@ export default function PlanningPage() {
         user_id: u,
         name: nameMap.get(u) ?? u,
         assigned,
-        assignedWeek,        // NEW
-        assignedWeekend,     // NEW
+        assignedWeek,
+        assignedWeekend,
         target,
         targetLabel,
         dispos,
@@ -535,6 +529,45 @@ export default function PlanningPage() {
     rows.sort((a, b) => (b.assigned - a.assigned) || a.name.localeCompare(b.name, 'fr'));
     return rows;
   }, [result, edited, profiles, targets, avail, slots, nameMap]);
+
+  // === NOUVEAU : Tableau “Disponibilités par médecin” (total / semaine / weekend) ===
+  const userAvailRows = useMemo(() => {
+    const allUserIds = new Set<string>();
+    for (const p of profiles) allUserIds.add(p.user_id);
+    for (const [u] of targets) allUserIds.add(u);
+    for (const set of avail.values()) for (const u of set) allUserIds.add(u);
+
+    const total = new Map<string, number>();
+    const week = new Map<string, number>();
+    const weekend = new Map<string, number>();
+
+    for (const u of allUserIds) {
+      total.set(u, 0);
+      week.set(u, 0);
+      weekend.set(u, 0);
+    }
+
+    for (const s of slots) {
+      const set = avail.get(s.id) ?? new Set<string>();
+      const isWE = isWeekendKind(s.kind);
+      for (const u of set) {
+        total.set(u, (total.get(u) ?? 0) + 1);
+        if (isWE) weekend.set(u, (weekend.get(u) ?? 0) + 1);
+        else week.set(u, (week.get(u) ?? 0) + 1);
+      }
+    }
+
+    const rows = Array.from(allUserIds).map((u) => ({
+      user_id: u,
+      name: nameMap.get(u) ?? u,
+      total: total.get(u) ?? 0,
+      week: week.get(u) ?? 0,
+      weekend: weekend.get(u) ?? 0,
+      monthsLocked: '—', // laissé volontairement à “—” (pas de lecture DB risquée)
+    }));
+    rows.sort((a, b) => (b.total - a.total) || a.name.localeCompare(b.name, 'fr'));
+    return rows;
+  }, [profiles, targets, avail, slots, nameMap]);
 
   // Colonnes médecins pour la grille des dispos
   const doctorOrderForGrid = useMemo(() => {
@@ -655,7 +688,7 @@ export default function PlanningPage() {
               </span>
             ) : null}
           </div>
-        {!result ? (
+          {!result ? (
             <p className="text-sm text-gray-600">Sélectionnez une période.</p>
           ) : result.holes === 0 ? (
             <p className="text-sm text-gray-600">Aucun trou 🎉</p>
@@ -730,7 +763,7 @@ export default function PlanningPage() {
           )}
         </div>
 
-        {/* Répartition */}
+        {/* Répartition (après modifs) */}
         <div>
           <h2 className="text-xl font-bold mb-2">Répartition des gardes (après vos modifications)</h2>
           <table className="w-full text-sm border">
@@ -759,6 +792,36 @@ export default function PlanningPage() {
               ))}
             </tbody>
           </table>
+        </div>
+
+        {/* NOUVEAU : Disponibilités par médecin */}
+        <div>
+          <h2 className="text-xl font-bold mb-2">Disponibilités par médecin (période sélectionnée)</h2>
+          <table className="w-full text-sm border">
+            <thead>
+              <tr className="bg-gray-50">
+                <th className="p-2 text-left text-gray-800 font-semibold">Médecin</th>
+                <th className="p-2 text-left text-gray-800 font-semibold"># Dispos</th>
+                <th className="p-2 text-left text-gray-800 font-semibold">Semaine</th>
+                <th className="p-2 text-left text-gray-800 font-semibold">Weekend/Férié</th>
+                <th className="p-2 text-left text-gray-800 font-semibold">Mois verrouillés (sur 3)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {userAvailRows.map((r) => (
+                <tr key={r.user_id} className="border-t">
+                  <td className="p-2">{r.name}</td>
+                  <td className="p-2">{r.total}</td>
+                  <td className="p-2">{r.week}</td>
+                  <td className="p-2">{r.weekend}</td>
+                  <td className="p-2">{r.monthsLocked}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="text-xs text-zinc-500 mt-1">
+            Astuce : plus un médecin met de disponibilités (y compris quelques week-ends), plus l’algorithme a de chances de l’assigner.
+          </p>
         </div>
 
         {/* Grille de disponibilités */}
