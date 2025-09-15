@@ -130,7 +130,6 @@ export default function PlanningPage() {
     syncing.current = false;
   };
   const showTopScrollbar = scrollW > clientW;
-  // === fin top scrollbar ===
 
   // Flag : existe-t-il déjà un planning enregistré en base ?
   const hasDbAssignments = !!(result && result.assignments && result.assignments.length > 0);
@@ -150,7 +149,6 @@ export default function PlanningPage() {
     (async () => {
       setLoading(true);
 
-      // Retenir label pour email/sommaire
       const cur = periods.find((p) => p.id === periodId);
       setPeriodLabel(cur?.label ?? '');
 
@@ -169,7 +167,7 @@ export default function PlanningPage() {
       }));
       setSlots(s);
 
-      // Profiles (inclut prénom/nom pour fallback)
+      // Profiles
       const { data: profData } = await supabase
         .from('profiles')
         .select('user_id, full_name, first_name, last_name');
@@ -204,7 +202,6 @@ export default function PlanningPage() {
       for (let i = 0; i < slotIds.length; i += 200) {
         const chunk = slotIds.slice(i, i + 200);
         let from = 0;
-        // eslint-disable-next-line no-constant-condition
         while (true) {
           const to = from + 1000 - 1;
           const { data } = await supabase
@@ -229,7 +226,7 @@ export default function PlanningPage() {
       const first = s[0]?.date;
       if (first) setMonthFilter(first.slice(0, 7));
 
-      // Hydratation depuis la base (afficher tout immédiatement s'il y a un planning)
+      // Hydrate assignments déjà en base
       await hydrateAssignmentsFromDB(periodId);
 
       setLoading(false);
@@ -288,7 +285,6 @@ export default function PlanningPage() {
         candidates: avail.get(s.id)?.size ?? 0,
       }));
 
-    // Payload minimal
     assignments.sort((a, b) => {
       const d = String(a.date ?? '').localeCompare(String(b.date ?? ''));
       if (d !== 0) return d;
@@ -530,7 +526,7 @@ export default function PlanningPage() {
     return rows;
   }, [result, edited, profiles, targets, avail, slots, nameMap]);
 
-  // === NOUVEAU : Tableau “Disponibilités par médecin” (total / semaine / weekend) ===
+  // === Tableau “Disponibilités par médecin” (total / semaine / weekend / % weekend) ===
   const userAvailRows = useMemo(() => {
     const allUserIds = new Set<string>();
     for (const p of profiles) allUserIds.add(p.user_id);
@@ -557,14 +553,20 @@ export default function PlanningPage() {
       }
     }
 
-    const rows = Array.from(allUserIds).map((u) => ({
-      user_id: u,
-      name: nameMap.get(u) ?? u,
-      total: total.get(u) ?? 0,
-      week: week.get(u) ?? 0,
-      weekend: weekend.get(u) ?? 0,
-      monthsLocked: '—', // laissé volontairement à “—” (pas de lecture DB risquée)
-    }));
+    const rows = Array.from(allUserIds).map((u) => {
+      const tot = total.get(u) ?? 0;
+      const we = weekend.get(u) ?? 0;
+      const pct = tot > 0 ? Math.round((we / tot) * 100) : null; // null => affichage “—”
+      return {
+        user_id: u,
+        name: nameMap.get(u) ?? u,
+        total: tot,
+        week: week.get(u) ?? 0,
+        weekend: we,
+        weekendPctLabel: pct === null ? '—' : `${pct}%`,
+        monthsLocked: '—', // pas de lecture DB risquée
+      };
+    });
     rows.sort((a, b) => (b.total - a.total) || a.name.localeCompare(b.name, 'fr'));
     return rows;
   }, [profiles, targets, avail, slots, nameMap]);
@@ -804,6 +806,7 @@ export default function PlanningPage() {
                 <th className="p-2 text-left text-gray-800 font-semibold"># Dispos</th>
                 <th className="p-2 text-left text-gray-800 font-semibold">Semaine</th>
                 <th className="p-2 text-left text-gray-800 font-semibold">Weekend/Férié</th>
+                <th className="p-2 text-left text-gray-800 font-semibold">% Weekend/Férié</th>
                 <th className="p-2 text-left text-gray-800 font-semibold">Mois verrouillés (sur 3)</th>
               </tr>
             </thead>
@@ -814,6 +817,7 @@ export default function PlanningPage() {
                   <td className="p-2">{r.total}</td>
                   <td className="p-2">{r.week}</td>
                   <td className="p-2">{r.weekend}</td>
+                  <td className="p-2">{r.weekendPctLabel}</td>
                   <td className="p-2">{r.monthsLocked}</td>
                 </tr>
               ))}
