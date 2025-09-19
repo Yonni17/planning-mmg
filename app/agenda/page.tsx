@@ -1,3 +1,4 @@
+// app/admin/agenda/page.tsx
 'use client';
 
 import { useEffect, useMemo, useState, ReactNode } from 'react';
@@ -7,7 +8,7 @@ import { useRouter } from 'next/navigation';
 type Slot = {
   id: string;
   period_id: string;
-  date: string; // YYYY-MM-DD (locale)
+  date: string; // YYYY-MM-DD
   start_ts: string;
   end_ts: string;
   kind:
@@ -20,6 +21,14 @@ type Slot = {
 };
 
 type Period = { id: string; label: string };
+
+type Profile = {
+  user_id: string;
+  first_name: string | null;
+  last_name: string | null;
+  full_name: string | null;
+  email: string | null;
+};
 
 const pad = (n: number) => String(n).padStart(2, '0');
 const yyyymm = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
@@ -37,6 +46,10 @@ const KIND_LABEL: Record<Slot['kind'], string> = {
 
 const WEEKDAYS_FR = ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam', 'Dim'];
 
+// ✅ limite d’édition
+const YONNI_ID = '9d5c4afd-e92b-4063-a244-298915092c68';
+const YONNI_EMAIL = 'yonnibibas@gmail.com';
+
 export default function AgendaPage() {
   const router = useRouter();
 
@@ -44,14 +57,26 @@ export default function AgendaPage() {
   const [periodId, setPeriodId] = useState<string>('');
   const [slots, setSlots] = useState<Slot[]>([]);
   const [assignBySlot, setAssignBySlot] = useState<Record<string, string>>({}); // slot_id -> user_id
+  const [allProfiles, setAllProfiles] = useState<Profile[]>([]);
   const [nameMap, setNameMap] = useState<Record<string, string>>({}); // user_id -> "Prénom Nom"
+  const [availBySlot, setAvailBySlot] = useState<Record<string, string[]>>({}); // slot_id -> [user_id...]
   const [msg, setMsg] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   const [viewMonth, setViewMonth] = useState<Date | null>(null);
 
-  // 👤 id de l'utilisateur connecté
+  // Auth
   const [meId, setMeId] = useState<string | null>(null);
+  const [meEmail, setMeEmail] = useState<string | null>(null);
+
+  // UI édition : slot actuellement ouvert en <select>
+  const [editingSlotId, setEditingSlotId] = useState<string | null>(null);
+
+  // Seul Yonni peut éditer
+  const isEditor = useMemo(
+    () => (meId === YONNI_ID) || (meEmail?.toLowerCase() === YONNI_EMAIL.toLowerCase()),
+    [meId, meEmail]
+  );
 
   useEffect(() => {
     (async () => {
@@ -61,6 +86,7 @@ export default function AgendaPage() {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) { router.replace('/login'); return; }
       setMeId(user.id);
+      setMeEmail((user.email ?? user.user_metadata?.email ?? null) as string | null);
 
       // Périodes
       const { data: periodsData, error: pErr } = await supabase
@@ -73,12 +99,42 @@ export default function AgendaPage() {
       const defId = periodsData?.[0]?.id || '';
       setPeriodId(defId);
       if (defId) await loadData(defId);
+
+      // Profils (tous) pour liste « forcer l’attribution »
+      const { data: profs, error: profErr } = await supabase
+        .from('profiles')
+        .select('user_id, first_name, last_name, full_name, email');
+      if (profErr) {
+        setMsg(`Erreur profils: ${profErr.message}`);
+      } else {
+        setAllProfiles((profs || []) as Profile[]);
+      }
+
       setLoading(false);
     })();
   }, [router]);
 
+  // Construit un nameMap complet (assignés + tous profs)
+  useEffect(() => {
+    const nmap: Record<string, string> = {};
+    for (const p of allProfiles) {
+      const full =
+        (p.full_name?.trim()) ||
+        `${(p.first_name ?? '').trim()} ${(p.last_name ?? '').trim()}`.trim() ||
+        p.user_id;
+      nmap[p.user_id] = full;
+    }
+    // garde les noms existants au besoin
+    for (const [uid, n] of Object.entries(nameMap)) {
+      if (!nmap[uid]) nmap[uid] = n;
+    }
+    setNameMap(nmap);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allProfiles]);
+
   async function loadData(pid: string) {
     setMsg(null);
+    setEditingSlotId(null);
 
     // Slots
     const { data: slotsData, error: sErr } = await supabase
@@ -87,10 +143,11 @@ export default function AgendaPage() {
       .eq('period_id', pid)
       .order('start_ts', { ascending: true });
     if (sErr) { setMsg(`Erreur slots: ${sErr.message}`); return; }
-    setSlots((slotsData || []) as Slot[]);
+    const ss = (slotsData || []) as Slot[];
+    setSlots(ss);
 
-    if (!viewMonth && (slotsData?.length ?? 0) > 0) {
-      const d0 = new Date(slotsData![0].date + 'T00:00:00');
+    if (!viewMonth && (ss.length > 0)) {
+      const d0 = new Date(ss[0].date + 'T00:00:00');
       setViewMonth(new Date(d0.getFullYear(), d0.getMonth(), 1));
     }
 
@@ -105,30 +162,31 @@ export default function AgendaPage() {
     const uids = new Set<string>();
     for (const row of assigns || []) {
       if (row.slot_id && row.user_id) {
-        map[row.slot_id] = row.user_id;
-        uids.add(row.user_id);
+        map[row.slot_id as string] = row.user_id as string;
+        uids.add(row.user_id as string);
       }
     }
     setAssignBySlot(map);
 
-    // Profils
-    if (uids.size > 0) {
-      const { data: profs, error: profErr } = await supabase
-        .from('profiles')
-        .select('user_id, first_name, last_name')
-        .in('user_id', Array.from(uids));
-      if (profErr) { setMsg(`Erreur profils: ${profErr.message}`); return; }
-
-      const nmap: Record<string,string> = {};
-      for (const p of profs || []) {
-        const fn = (p.first_name ?? '').trim();
-        const ln = (p.last_name ?? '').trim();
-        const full = `${fn} ${ln}`.trim();
-        nmap[p.user_id as string] = full || (p.user_id as string);
+    // Dispos (availability)
+    if (ss.length > 0) {
+      const slotIds = ss.map(s => s.id);
+      const availMap: Record<string, string[]> = {};
+      // Chunk pour éviter 1000+ IN
+      const CHUNK = 200;
+      for (let i = 0; i < slotIds.length; i += CHUNK) {
+        const chunk = slotIds.slice(i, i + CHUNK);
+        const { data: rows, error: avErr } = await supabase
+          .from('availability')
+          .select('slot_id, user_id, available')
+          .in('slot_id', chunk);
+        if (avErr) { setMsg(`Erreur disponibilités: ${avErr.message}`); return; }
+        for (const r of (rows || []) as { slot_id: string; user_id: string; available: boolean }[]) {
+          if (!r.available) continue;
+          (availMap[r.slot_id] ||= []).push(r.user_id);
+        }
       }
-      setNameMap(nmap);
-    } else {
-      setNameMap({});
+      setAvailBySlot(availMap);
     }
   }
 
@@ -170,6 +228,50 @@ export default function AgendaPage() {
 
   const labelFor = (k: Slot['kind']) => KIND_LABEL[k];
 
+  // Helpers options de sélection (dispos d'abord, puis tous)
+  const optionsForSlot = (slotId: string) => {
+    const av = new Set(availBySlot[slotId] || []);
+    // disponibles
+    const first = allProfiles
+      .filter(p => av.has(p.user_id))
+      .sort((a, b) => (nameMap[a.user_id] || a.user_id).localeCompare(nameMap[b.user_id] || b.user_id, 'fr'));
+    // autres
+    const rest = allProfiles
+      .filter(p => !av.has(p.user_id))
+      .sort((a, b) => (nameMap[a.user_id] || a.user_id).localeCompare(nameMap[b.user_id] || b.user_id, 'fr'));
+    return { first, rest };
+  };
+
+  // Upsert assignment (sécurité : réservé à Yonni)
+  async function assignSlot(slot: Slot, userId: string | null) {
+    if (!isEditor) return;
+    try {
+      const payload: any = {
+        slot_id: slot.id,
+        period_id: slot.period_id,
+        decided_by: meId ?? null,
+        user_id: userId,             // peut être null pour vider
+        // state: laissé au DEFAULT 'draft'
+        // score: DEFAULT 0
+      };
+      const { error } = await supabase
+        .from('assignments')
+        .upsert(payload, { onConflict: 'slot_id' });
+      if (error) throw error;
+
+      // MAJ locale
+      setAssignBySlot(prev => {
+        const clone = { ...prev };
+        if (userId) clone[slot.id] = userId;
+        else delete clone[slot.id];
+        return clone;
+      });
+      setEditingSlotId(null);
+    } catch (e: any) {
+      setMsg(`Échec d'attribution: ${e?.message ?? e}`);
+    }
+  }
+
   // rendu d'une cellule de jour (compact = mobile)
   const renderDayCell = (d: Date | null, key: React.Key, compact = false): ReactNode => {
     if (!d) {
@@ -206,30 +308,47 @@ export default function AgendaPage() {
           ) : daySlots.map((s) => {
             const uid = assignBySlot[s.id];
             const name = uid ? (nameMap[uid] ?? uid) : null;
-            const isMine = !!(meId && uid && meId === uid); // ✅ créneau du médecin connecté ?
+            const isMine = !!(meId && uid && meId === uid);
+
+            const isEditing = editingSlotId === s.id && isEditor;
 
             return (
               <div
                 key={s.id}
                 className={`flex-1 text-[11px] md:text-xs px-2 border-t first:border-t-0 flex items-center justify-between
-                            ${isMine ? 'bg-amber-100 border-l-4 border-amber-500' : 'bg-white text-gray-700'}`}
+                            ${isMine ? 'bg-amber-100 border-l-4 border-amber-500' : 'bg-white text-gray-700'}
+                            ${isEditor ? 'cursor-pointer hover:bg-gray-50' : ''}`}
                 title={labelFor(s.kind)}
+                onClick={() => { if (isEditor) setEditingSlotId(prev => prev === s.id ? null : s.id); }}
               >
-                {/* Créneau toujours lisible sur fond ambré */}
                 <span className={`truncate ${isMine ? 'text-gray-800 font-medium' : ''}`}>
                   {labelFor(s.kind)}
                 </span>
 
-                {name ? (
-                  <span
-                    className={`truncate max-w-[55%] md:max-w-none ${
-                      isMine ? 'font-bold text-black' : 'font-semibold text-emerald-600'
-                    }`}
-                  >
-                    {name}{isMine ? ' (vous)' : ''}
-                  </span>
+                {/* Affichage nom OU sélecteur si édition */}
+                {!isEditing ? (
+                  name ? (
+                    <span
+                      className={`truncate max-w-[55%] md:max-w-none ${
+                        isMine ? 'font-bold text-black' : 'font-semibold text-emerald-600'
+                      }`}
+                    >
+                      {name}{isMine ? ' (vous)' : ''}
+                    </span>
+                  ) : (
+                    <span className="italic text-gray-400">—</span>
+                  )
                 ) : (
-                  <span className="italic text-gray-400">—</span>
+                  <div className="ml-2">
+                    <SlotEditor
+                      slot={s}
+                      currentUserId={uid ?? null}
+                      nameMap={nameMap}
+                      options={optionsForSlot(s.id)}
+                      onCancel={() => setEditingSlotId(null)}
+                      onSelect={async (newUserId) => { await assignSlot(s, newUserId); }}
+                    />
+                  </div>
                 )}
               </div>
             );
@@ -280,10 +399,16 @@ export default function AgendaPage() {
             ))}
           </div>
         </div>
+
+        {isEditor && (
+          <div className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-1 rounded">
+            Mode édition actif (réservé à Yonni)
+          </div>
+        )}
       </div>
 
       {msg && (
-        <div className={`p-3 rounded border ${msg?.startsWith('Erreur') ? 'bg-red-50 border-red-200 text-red-900' : 'bg-gray-50 border-gray-200 text-gray-800'}`}>
+        <div className={`p-3 rounded border ${msg?.startsWith('Erreur') || msg?.startsWith('Échec') ? 'bg-red-50 border-red-200 text-red-900' : 'bg-gray-50 border-gray-200 text-gray-800'}`}>
           {msg}
         </div>
       )}
@@ -306,6 +431,69 @@ export default function AgendaPage() {
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 md:hidden">
         {daysOfMonth.map((d, i) => renderDayCell(d, i, true))}
       </div>
+    </div>
+  );
+}
+
+/** Petit composant inline pour éditer un slot */
+function SlotEditor(props: {
+  slot: Slot;
+  currentUserId: string | null;
+  nameMap: Record<string, string>;
+  options: { first: Profile[]; rest: Profile[] };
+  onCancel: () => void;
+  onSelect: (userId: string | null) => Promise<void>;
+}) {
+  const { currentUserId, nameMap, options, onCancel, onSelect } = props;
+  const [value, setValue] = useState<string>(currentUserId ?? '');
+  const [saving, setSaving] = useState(false);
+
+  async function handleChange(e: React.ChangeEvent<HTMLSelectElement>) {
+    const v = e.target.value;
+    setValue(v);
+    setSaving(true);
+    try {
+      await onSelect(v === '' ? null : v);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="flex items-center gap-2">
+      <select
+        value={value}
+        onChange={handleChange}
+        className="border rounded px-2 py-1 text-xs bg-white"
+      >
+        <option value="">— Aucun / vider —</option>
+        {options.first.length > 0 && (
+          <optgroup label="Disponibles">
+            {options.first.map(p => (
+              <option key={p.user_id} value={p.user_id}>
+                {nameMap[p.user_id] || p.user_id}
+              </option>
+            ))}
+          </optgroup>
+        )}
+        {options.rest.length > 0 && (
+          <optgroup label="Autres (forcer)">
+            {options.rest.map(p => (
+              <option key={p.user_id} value={p.user_id}>
+                {nameMap[p.user_id] || p.user_id}
+              </option>
+            ))}
+          </optgroup>
+        )}
+      </select>
+      <button
+        type="button"
+        className="text-[11px] px-2 py-1 rounded border hover:bg-gray-50"
+        onClick={onCancel}
+        disabled={saving}
+      >
+        Annuler
+      </button>
     </div>
   );
 }
