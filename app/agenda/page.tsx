@@ -159,11 +159,9 @@ export default function AgendaPage() {
     if (aErr) { setMsg(`Erreur assignations: ${aErr.message}`); return; }
 
     const map: Record<string, string> = {};
-    const uids = new Set<string>();
     for (const row of assigns || []) {
       if (row.slot_id && row.user_id) {
         map[row.slot_id as string] = row.user_id as string;
-        uids.add(row.user_id as string);
       }
     }
     setAssignBySlot(map);
@@ -251,7 +249,7 @@ export default function AgendaPage() {
         period_id: slot.period_id,
         decided_by: meId ?? null,
         user_id: userId,             // peut être null pour vider
-        // state: laissé au DEFAULT 'draft'
+        // state: DEFAULT 'draft'
         // score: DEFAULT 0
       };
       const { error } = await supabase
@@ -278,7 +276,7 @@ export default function AgendaPage() {
       return (
         <div
           key={key}
-          className={`rounded-xl border border-dashed border-gray-200 bg-gray-50 ${compact ? 'h-24 sm:h-28' : 'h-32'}`}
+          className={`rounded-xl border border-dashed border-gray-200 bg-gray-50 ${compact ? 'h-28 sm:h-32' : 'h-36'}`}
         />
       );
     }
@@ -290,56 +288,60 @@ export default function AgendaPage() {
     const todayYmd = ymdLocal(new Date());
     const isToday = ymd === todayYmd;
 
+    const shellCls = `rounded-2xl border border-gray-200 overflow-hidden bg-white shadow-sm ${
+      compact ? 'h-28 sm:h-32' : 'h-36'
+    } ${isToday ? 'ring-1 ring-emerald-300' : ''}`;
+
     return (
-      <div
-        key={key}
-        className={`rounded-2xl border border-gray-200 overflow-hidden bg-white shadow-sm ${compact ? 'h-24 sm:h-28' : 'h-32'} ${isToday ? 'ring-1 ring-emerald-300' : ''}`}
-      >
+      <div key={key} className={shellCls}>
+        {/* header jour */}
         <div className="px-2 pt-2 pb-1 text-sm font-medium text-gray-700 flex items-center justify-between">
           <span>{dayNum}</span>
-          <span className="text-xs text-gray-400">
-            {d.toLocaleDateString('fr-FR', { weekday: 'short' })}
-          </span>
+          <span className="text-xs text-gray-400">{d.toLocaleDateString('fr-FR', { weekday: 'short' })}</span>
         </div>
 
-        <div className="flex flex-col h-[calc(100%-2rem)]">
-          {daySlots.length === 0 ? (
-            <div className="flex-1 text-[11px] px-2 text-gray-400 flex items-center justify-center">Aucun créneau</div>
-          ) : daySlots.map((s) => {
+        {/* contenu jour */}
+        {daySlots.length === 0 ? (
+          <div className="h-[calc(100%-2rem)] flex items-center justify-center text-[11px] text-gray-400">
+            Aucun créneau
+          </div>
+        ) : daySlots.length === 1 ? (
+          // === Cas 1 créneau : horaire centré haut + nom sur toute la hauteur ===
+          (() => {
+            const s = daySlots[0];
             const uid = assignBySlot[s.id];
             const name = uid ? (nameMap[uid] ?? uid) : null;
             const isMine = !!(meId && uid && meId === uid);
-
             const isEditing = editingSlotId === s.id && isEditor;
 
             return (
               <div
-                key={s.id}
-                className={`flex-1 text-[11px] md:text-xs px-2 border-t first:border-t-0 flex items-center justify-between
-                            ${isMine ? 'bg-amber-100 border-l-4 border-amber-500' : 'bg-white text-gray-700'}
-                            ${isEditor ? 'cursor-pointer hover:bg-gray-50' : ''}`}
+                className={`h-[calc(100%-2rem)] px-3 py-2 flex flex-col gap-2 ${
+                  isMine ? 'bg-amber-100' : 'bg-white'
+                } ${isEditor ? 'cursor-pointer hover:bg-gray-50' : ''}`}
+                onClick={() => { if (isEditor) setEditingSlotId(prev => (prev === s.id ? null : s.id)); }}
                 title={labelFor(s.kind)}
-                onClick={() => { if (isEditor) setEditingSlotId(prev => prev === s.id ? null : s.id); }}
               >
-                <span className={`truncate ${isMine ? 'text-gray-800 font-medium' : ''}`}>
+                <div className={`text-xs text-center tracking-wide ${isMine ? 'text-gray-800 font-semibold' : 'text-gray-600'}`}>
                   {labelFor(s.kind)}
-                </span>
+                </div>
 
-                {/* Affichage nom OU sélecteur si édition */}
                 {!isEditing ? (
-                  name ? (
-                    <span
-                      className={`truncate max-w-[55%] md:max-w-none ${
-                        isMine ? 'font-bold text-black' : 'font-semibold text-emerald-600'
-                      }`}
-                    >
-                      {name}{isMine ? ' (vous)' : ''}
-                    </span>
-                  ) : (
-                    <span className="italic text-gray-400">—</span>
-                  )
+                  <div
+                    className={[
+                      "flex-1 flex items-center justify-center text-center leading-snug whitespace-normal break-words",
+                      isMine ? "text-base md:text-lg font-bold text-black" : "text-base md:text-lg font-semibold text-emerald-700"
+                    ].join(' ')}
+                    style={{ wordBreak: 'break-word' }}
+                  >
+                    {name || <span className="italic text-gray-400">—</span>}
+                  </div>
                 ) : (
-                  <div className="ml-2">
+                  <div
+                    className="mt-1"
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={(e) => e.stopPropagation()}
+                  >
                     <SlotEditor
                       slot={s}
                       currentUserId={uid ?? null}
@@ -352,8 +354,66 @@ export default function AgendaPage() {
                 )}
               </div>
             );
-          })}
-        </div>
+          })()
+        ) : (
+          // === Cas plusieurs créneaux : petites cartes, wrap + scroll ===
+          <div className="h-[calc(100%-2rem)] px-2 pb-2 flex flex-col gap-1 overflow-y-auto">
+            {daySlots.map((s) => {
+              const uid = assignBySlot[s.id];
+              const name = uid ? (nameMap[uid] ?? uid) : null;
+              const isMine = !!(meId && uid && meId === uid);
+              const isEditing = editingSlotId === s.id && isEditor;
+
+              return (
+                <div
+                  key={s.id}
+                  className={[
+                    "rounded-md border px-2 py-1 text-[11px] md:text-xs",
+                    isMine ? "bg-amber-100 border-amber-300" : "bg-white border-gray-200",
+                    isEditor ? "cursor-pointer hover:bg-gray-50" : ""
+                  ].join(" ")}
+                  title={labelFor(s.kind)}
+                  onClick={() => { if (isEditor) setEditingSlotId(prev => prev === s.id ? null : s.id); }}
+                >
+                  <div className={`leading-snug ${isMine ? 'text-gray-800 font-medium' : 'text-gray-700'}`}>
+                    {labelFor(s.kind)}
+                  </div>
+
+                  {!isEditing ? (
+                    name ? (
+                      <div
+                        className={[
+                          "mt-0.5 leading-snug whitespace-normal break-words",
+                          isMine ? "font-bold text-black" : "font-semibold text-emerald-700"
+                        ].join(" ")}
+                        style={{ wordBreak: 'break-word' }}
+                      >
+                        {name}{isMine ? ' (vous)' : ''}
+                      </div>
+                    ) : (
+                      <div className="mt-0.5 italic text-gray-400">—</div>
+                    )
+                  ) : (
+                    <div
+                      className="mt-1"
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <SlotEditor
+                        slot={s}
+                        currentUserId={uid ?? null}
+                        nameMap={nameMap}
+                        options={optionsForSlot(s.id)}
+                        onCancel={() => setEditingSlotId(null)}
+                        onSelect={async (newUserId) => { await assignSlot(s, newUserId); }}
+                      />
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     );
   };
@@ -460,11 +520,17 @@ function SlotEditor(props: {
   }
 
   return (
-    <div className="flex items-center gap-2">
+    <div
+      className="flex items-center gap-2"
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+    >
       <select
         value={value}
         onChange={handleChange}
         className="border rounded px-2 py-1 text-xs bg-white"
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
       >
         <option value="">— Aucun / vider —</option>
         {options.first.length > 0 && (
@@ -489,7 +555,7 @@ function SlotEditor(props: {
       <button
         type="button"
         className="text-[11px] px-2 py-1 rounded border hover:bg-gray-50"
-        onClick={onCancel}
+        onClick={(e) => { e.stopPropagation(); onCancel(); }}
         disabled={saving}
       >
         Annuler
