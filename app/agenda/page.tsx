@@ -528,7 +528,7 @@ function SlotEditor(props: {
       <select
         value={value}
         onChange={handleChange}
-        className="border rounded px-2 py-1 text-xs bg-white"
+        className="border rounded px-2 py-1 text-xs bg-white text-gray-900"
         onMouseDown={(e) => e.stopPropagation()}
         onClick={(e) => e.stopPropagation()}
       >
